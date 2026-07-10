@@ -239,6 +239,14 @@ _ENTRIES = [
        "window. The single master flux routine every other flux measurement "
        "(and the core path) routes through.",
        "f = integrated_line_flux(rest_wave, flux, err)"),
+    _e("integrated_line_flux_per_bin", "measure", "measure", "Flux & asymmetry",
+       "integrated_line_flux looped over every radial bin of ONE restacked "
+       "(nrad, nwave) spectrum -- the fiducial stack or a single bootstrap "
+       "draw. bootstrap_all already has this per-bin loop shape internally "
+       "(its _measure_stack closure) but isn't exported and doesn't call "
+       "integrated_line_flux; this is the reusable version, e.g. for "
+       "optimize.py's line-S/N diagnostic.",
+       "flux_sum, err_sum = integrated_line_flux_per_bin(rest_wave, stack, bounds=cfg.line_window)"),
     _e("blue_red_side_ratio", "measure", "measure", "Flux & asymmetry",
        "Coarse blue/red asymmetry: continuum-subtracted flux summed on each "
        "side of line center, and their ratio. A quick asymmetry read; the "
@@ -806,19 +814,16 @@ _ENTRIES = [
        "keep_cube=True stacks dict, measure per-bin scatter in a line-masked "
        "sideband, and report noise_per_bin + height_per_bin (+ the per-pixel "
        "err/continuum spectra). The building block every scoring view consumes; "
-       "the line itself is never touched (no injection / no S-N-of-Lya tuning).",
+       "the RANKING never touches the line itself (no injection / no S-N-of-Lya "
+       "tuning) -- pass compute_line_snr=True for an opt-in, diagnostic-only "
+       "line-S/N bootstrap alongside it (see plot_line_snr_summary), which "
+       "stays out of the ranking on purpose.",
        "res = noise_from_stacks(stacks, cfg, nboot=200, reduce='rms', height_reduce='biweight')"),
     _e("run_combine_sweep", "optimize", "validation", "Method scoring",
-       "CHEAP tier: score several combine-level variants (stack_method / "
-       "sigma_clip_*) against ONE already-extracted cube -- no re-extraction. "
-       "Returns a Table, one row per variant, carrying noise_per_bin.",
+       "Score several combine-level variants (stack_method / sigma_clip_*) "
+       "against ONE already-extracted cube -- no re-extraction. Returns a "
+       "Table, one row per variant, carrying noise_per_bin.",
        "tbl = run_combine_sweep(cfg, stacks, [{'measure_stack_method': m} for m in ('biweight','median')])"),
-    _e("run_background_sweep", "optimize", "validation", "Method scoring",
-       "EXPENSIVE tier: score BACKGROUND/EXTRACTION-level variants, each "
-       "re-running Stage 1 (masking / bg aperture / smoothing live there). "
-       "Returns a Table with noise_per_bin plus each variant's written "
-       "galaxy_fits path so you can re-stack it without re-extracting.",
-       "tbl = run_background_sweep(cfg, [{'bg_inner_arcsec':55,'bg_outer_arcsec':65}])"),
     _e("rank_scores", "optimize", "validation", "Method scoring",
        "Collapse a {label: noise_from_stacks result} dict into two per-method "
        "numbers: noise_product (per-bin errors multiplied across ALL bins in "
@@ -845,6 +850,14 @@ _ENTRIES = [
        "method, the error (green=good) and the signed continuum height "
        "(diverging about zero, with a zero line). Returns the figure.",
        "fig = plot_bin_detail(scores, -1)    # outermost bin; also 0, 4, ..."),
+    _e("plot_line_snr_summary", "optimize", "validation", "Method scoring",
+       "DIAGNOSTIC companion to plot_score_summary, for scores built with "
+       "compute_line_snr=True: one bar per method for mean line S/N "
+       "(higher=better, RdYlGn not _r), plus line S/N vs radial bin, one "
+       "curve per method. Never consumed by rank_scores/score_table -- see "
+       "noise_from_stacks; this is 'does minimizing continuum noise raise "
+       "line S/N', plotted, not ranked.",
+       "fig, tbl = plot_line_snr_summary(scores)"),
 ]
 
 

@@ -1,0 +1,363 @@
+Links:
+- Dropbox for University of Texas Austin: 
+https://nam10.safelinks.protection.outlook.com/?url=https%3A%2F%2Futexas.box.com%2Fs%2Frgj23a3erxpcbln5ghnar4s9eufi4f8d&data=05%7C02%7Cats5917%40psu.edu%7Cf90548dbefb642d7f41408ddbff1aecd%7C7cf48d453ddb4389a9c1c115526eb52e%7C0%7C0%7C638877766925402070%7CUnknown%7CTWFpbGZsb3d8eyJFbXB0eU1hcGkiOnRydWUsIlYiOiIwLjAuMDAwMCIsIlAiOiJXaW4zMiIsIkFOIjoiTWFpbCIsIldUIjoyfQ%3D%3D%7C0%7C%7C%7C&sdata=TAfa0GyxOiBW6sReRRAmWCkuYTOK%2FIVkpCnQbx9Lqs8%3D&reserved=0
+
+Papers: 
+- https://ui.adsabs.harvard.edu/abs/2025ApJS..276...72L/abstract
+- https://ui.adsabs.harvard.edu/abs/2023ApJ...946...86D/abstract
+------------------------------------------------------------------------------------------------------------------
+AGN catalog:
+    Types:
+    - EL: Existence of another AGN line: Lyb, NV, SIV+OIV, CIV
+    - BL: v >= 1000km/s and SN > 10
+    - X-ray sources?
+    - Best sample will be best of all 3
+    
+    Data to include:
+    - ID
+    - RA, Dec
+    - Redshift
+    - Total flux in Lya and every other observed line
+    - Velocity (use mean if there are other lines)
+    - Broadband magnitude (from images)
+    - Comments (LBG, artifacts, etc...)
+    - Info if also seen in SDSS or HETDEX?
+------------------------------------------------------------------------------------------------------------------
+11/11/25:
+Spectral Resolution = 5.6A
+How to get EW:
+- Lineflux and continuum measurement
+- Measure the 1D lineflux from the highest SN peak
+- Each spaxel is a full source extraction of a point source
+------------------------------------------------------------------------------------------------------------------
+11/18/25:
+- I have obtained an idea of positional offsets of VDFI, xray, and HSC sources
+	- Most of the sources appear to have offsets of <0.1" in ra and in dec
+	- It seems as though the xray positions are the most offset from HSC and VDFI
+	- When matching HSC and VDFI, the positional offset was around 0.01" which is surprisingly good
+- It was noticed that for our sample of AGN, the magnitude derived from the CFHT image (subject to refinement) in 18% of sources have a variation > 1 magnitude from that obtained from the HSC counterpart
+	- After close inspection, it appears there is (generally) one of two resons behind this
+	- 1 - The counterpart match is of another source (that is technically closer) but is so faint or 	unresolved in CFHT that is simply looks as though it is part of the same AGN we are extracting
+	- 2 - There is a nearby star with + feature (due to the instrument's fixture) that is bleeding extra light 	into our flux extraction
+- I sorted out the objects in the xray catalog into 3 categories: emission line, broad feature, 'eh'
+	- This will allow us to further refine and classify additional AGN to our catalog
+- I found that the matching of HSC sources within 1" of an xray source went from ~60% to ~88% after cutting from 411 to 78 sources when I initially searched for any spectra with a noticeable feature
+------------------------------------------------------------------------------------------------------------------
+11/19/25:
+- I adjusted the xray contender spectra to correct for the positional offset of HSC
+- Goals:
+	- Get a more complete sample (of 3 categories) of AGN and be able to defend programmatically why a given 	AGN is included (line width, emission line, xray counterpart)
+	- Obtain continuum magnitudes to flux measurements to compute EW ratio
+	- Either use ML or previously made code to use EW to determine Lya vs Oii
+	- Separate real vs fake sources using specified cuts or ML
+- Now that Maya has backed off, there is LAE vs non-LAE as a project to look into
+- Investigate: for the set of xray object, why are they NOT a clear AGN
+	- Nothing there at all
+	- Continuum, no emission lines
+- When doing Spectral resolution = 5.6, that is OBSERVED frame
+- HETDEX obtains continuum measurements from HSC - possibly email Erin or Dustin about how to get that
+- After going and going and obtaining all of these AGN, it is important to backtrack and do it again
+- How did you select the AGN:
+	- xray source!
+	- Width of psf emission line
+	- Using other ways to uncover broad lines - Chen U paper
+		- Going through all of the spectra in HETDEX and finding broad lines
+------------------------------------------------------------------------------------------------------------------
+11/23/25:
+- Current plan with measuring galaxy continuums is to use HSC-SSP deep g and r photometry covering all of COSMOS as well as CFHT to get another source
+- Likely will do a similar process to ELiXer
+- Cut out a 9"x9" image over each detection from both CFHT and HSC-SSP
+- Run Source Extractor to obtain objects in the view and depending on proximity or geometry, use the magnitude given
+- If above criteria is not met, measure a continuum from slowly increasing circular apertures until it 'stabilizes'
+- If that still doesn't work, use a 3" aperture (maybe) or, if the flux is < 0, use it as a lower limit defined based on the catalog
+- Perhaps also compare that to a spectra transmission curve-based magnitude or whole spectra magnitude to determine if said nearby object makes sense to combine
+- Also possibly match with sources found in HST and use their magnitudes
+- Once magnitudes are determines and their respective errors, combine with a weighted average and weighted error to use for LAE/OII determination
+------------------------------------------------------------------------------------------------------------------
+1/3/26:
+- HSC g band seems to work the best for magnitude calculation
+- We attempt to match a given source to a source-extracted position in an HSC image, and then measure the magnitude at varying radii
+- We chose the 2" radius for all sources
+- To separate OII and LAEs, we use a decision plane in 3D. The plane is created by matching with HETDEX detections that have either LAE or OII classifications, calculating the HSC g-band flux, wave of emission line, and lineflux. We plot this in 3D and train a separator to best distinguish the two known clouds of data.
+- The plane is able to distinguish with a 98% success rate, with some of the 2% being detections that HETDEX misclassified
+- We ran ALL VDFI sources and determined if they are more like OIIs or LAEs.
+
+- We also plotted the spatial offset each source has when matching with a source found in the HSC images
+- For matched with HETDEX, most sources group towards being offset by +/- 1 arcsecond
+- In the total VDFI sample, however, the offset is more of a double gaussian, with many being similar to HETDEX matches, and many having much further match separation.
+- There are about 32.2% of sources that are part of the closer matched gaussian, and 67.8% are part of the wide, random match gaussian. This gives us a number hinting to the total number of real/false detections in our data.
+------------------------------------------------------------------------------------------------------------------
+1/11/26:
+Plan for AGN-LAE spatial correlation:
+- Pick 1000s of random positions all around the pre-processed VDFI data cube
+- At those positions, insert a lya profile (random strength/width)
+- If the position is inside one of the removed circles (when getting rid of continuum-bright sources), it is reported as a loss at that position
+- If it passes, use Greg's code to measure the SN of that detection
+- If the SN is > 5, it moves on. Otherwise, it fails and is reported as a loss at that given spaxel
+>>>
+- Now tally up all of the success/fails at each spaxel and determine how to compensate a given VDFI detection for what it really should be worth?
+- Somehow use that to determine the real correlation between AGN and LAEs
+------------------------------------------------------------------------------------------------------------------
+1/20/26:
+The Elimination of False Detections:
+- Obtain a catalog of positions of LAEs (...DESI? ...ODIN? ...JWST?) that is full coverage such that for the objects that DO NOT match, we can safely say they are false detections. Perhaps we should use two different catalogs, like DESI for spectroscopy of faint detections and HSC for the imaging of clearer ones?
+- Then, using this selection of sources, we can look at their different parameters and plot them. In this way, we selected our sample in a more, extrinsic manner, such that when we try to plot them in N-D and separate them with a hyperplane, the plane won't simply do it because of some selection choice early on (like a sn cut... which might need to be added anyway)
+------------------------------------------------------------------------------------------------------------------
+1/27/26:
+Maybe AGN: 150.38462780809533 2.222535889266212
+Current pipeline of classification:
+1. Take HETDEX detections with SN>5 and some other cuts, and match with VDFI in 2" and 4A radius = 1072 objects
+2. Use HETDEX detections and run clf to get preliminary classifications
+3. Look at incorrect or close-call classifications and visually inspect (54 inspected and many were changed)
+4. Re-make the classifier (giving 98.5% accuracy when doing 800 train 200 test for all 5 sample possibilities)
+5. Use the calibrated classifier to give P(LAE) for every object (not really needed here)
+6. Use the retrained classifier to give classifications for ALL VDFI objects (7200) and obtain P(LAE)
+
+Zoom Meeting:
+- Consider looking at negative spikes (SN that is negative < 5) and see if they have similar properties
+- Plot distribution of SN in all pixels in SN cube (get rid of ones between SN3 and SN-3)
+------------------------------------------------------------------------------------------------------------------
+2/12/26:
+Scientific Goals:
+- Do we want a pure sample or as many as possible?
+	- PURE SAMPLE - so keep that in mind when we get the additional COSMOS re-run
+- Go to UT Austin and learn about the HET data reduction pipeline to figure out the problem with the trough?
+
+------------------------------------------------------------------------------------------------------------------
+2/26/26:
+Image link: https://cosmos2025.iap.fr/hst.html
+Mosaic Viewer: https://cosmos2025.iap.fr/fitsmap/
+
+HSC g-band Full COSMOS Image:
+- 4050A - 5500A
+- 900A - 1960A
+- 27.4 mag depth
+
+HST F814W Full COSMOS Image:
+- 7000A to 9000A
+- 1560A - 3210A in rest-frame
+- 27.2 mag depth
+
+JWST F277W Full COSMOS Image:
+- 2.4um t- 3.1um
+- 5300A - 11070A in rest-frame
+- 27.7 to 28.3 mag depth
+
+Jaynes Line Classifier: https://github.com/grzeimann/JaynesLineClassifier
+------------------------------------------------------------------------------------------------------------------
+1818 - stronger OIII than OII
+
+Clustering Questions: 
+1. Is the full clustering algorithm needed or is it a problem? There are false emission lines that it groups with OIIs (as it should) but it can complicate things later on with the correlation functions. 
+
+2. Additionally, are the line combinations needed either? It generally fixes the problem of having an OII emitter with a bright Hg and Hb and OIII emission lines sticking out while being the same OII galaxy. But, as long as the lines are found at pixels near the center of the OII galaxy, we are in the clear because they will simply be dimmer emission lines (besides OIII which MAY be a problem but generally not)
+
+Potential Solution:
+- Get rid of p_linefinder (p_extra) as it could be very problematic in the future and solves a problem that generally doesn't need to be solved...?
+- Adjust the emission line combinations
+
+------------------------------------------------------------------------------------------------------------------
+3/31/26:
+Investigating LAE and AGN Properties:
+-------------------------------------
+- Statistically significant LAE properties, especially at the faint end — measuring how the faint Lyα population behaves and how it connects to continuum magnitude, stellar mass, and other multiwavelength counterparts in COSMOS. This includes understanding how Lyα strength scales with continuum and whether faint LAEs represent a distinct physical population or simply the low-luminosity extension of brighter systems.
+- AGN properties, with an emphasis on low-continuum and faint AGN — identifying emission-line–dominated or weak-continuum AGN that may be missed in traditional selections, and characterizing their luminosities, environments, and overlap with LAE-selected galaxies.
+- AGN–LAE cross-correlation — measuring how LAEs cluster around AGN (and vice versa) to understand environmental effects, relative halo masses, and whether AGN activity influences Lyα visibility.
+- AGN turnoff and mixed LAE/AGN systems — investigating galaxies that show properties of both populations, looking for transitional or composite objects, and exploring how black hole activity and Lyα emission coexist or evolve within the same systems.
+
+
+Given your dataset — deep spectroscopy, nearly full fill factor, COSMOS field, optimized for LAEs and [O II] — you’re in a very strong position. The key is to leverage **(1) completeness, (2) depth, and (3) multiwavelength overlap**. Here’s how each science goal is best executed with what you have.
+
+---
+Faint LAE Properties — Do This First (Low Hanging Fruit + High Impact)
+
+Your biggest advantage over HETDEX-like surveys is **depth + contiguous coverage**. That means:
+
+Best Strategy
+* Construct a **carefully completeness-corrected LAE catalog**.
+  * Injection–recovery simulations for line flux.
+  * Spatial completeness maps (since you’re nearly full fill factor, this is powerful).
+
+* Measure the **Lyα luminosity function in multiple redshift bins**.
+  * Push the faint end.
+  * Compare directly to HETDEX, MUSE, narrowband surveys.
+
+* Cross-match to COSMOS photometry.
+  * UV magnitude vs Lyα luminosity.
+  * EW distributions vs stellar mass.
+  * Look for trends in dust proxies.
+
+Why this works well for you:
+
+* You reduce sampling variance.
+* You probe below wide-field survey limits.
+* COSMOS gives stellar mass, SFR, morphology essentially “for free.”
+
+This should likely be your **first major paper**.
+---
+Identifying AGN — Use Multiwavelength Leverage
+
+Because you’re in COSMOS, you should not rely on spectra alone.
+
+Step-by-step:
+
+* Identify AGN spectroscopically:
+  * Broad lines (if any)
+  * High-ionization UV lines
+  * Line width measurements
+* Cross-match with:
+  * X-ray catalogs
+  * Radio
+  * IR AGN selections
+* Flag:
+  * Clear AGN
+  * Likely AGN
+  * Possible composite systems
+
+Then examine:
+* Fraction of LAEs hosting AGN.
+* How AGN fraction changes with Lyα luminosity.
+* Whether faint AGN are preferentially Lyα-selected.
+
+Your dataset is especially good for **emission-line–dominated AGN**, which broadband surveys can miss.
+---
+AGN–LAE Cross-Correlation — Requires Careful Statistics
+
+Because your area is roughly moon-sized (~0.2–0.3 deg²), this is feasible but must be done carefully.
+
+Best approach:
+* Compute 2D projected correlation functions.
+* Use Landy–Szalay estimator.
+* Generate realistic random catalogs including:
+  * Spatial completeness variations.
+  * Redshift selection function.
+
+What you can measure:
+* Relative bias between AGN and LAEs.
+* Whether LAEs are enhanced around AGN.
+* Environmental modulation of Lyα emission.
+
+This becomes stronger once your LAE catalog is robust.
+---
+Transitional LAE–AGN Systems — Needs Spectral Diagnostics
+
+This is more nuanced and comes after classification work.
+
+What to look for:
+* Moderate line widths.
+* High-ionization lines.
+* Elevated Lyα luminosity for given continuum.
+* X-ray weak but line-strong systems.
+
+You can:
+* Stack spectra of ambiguous systems.
+* Compare line ratios statistically.
+* Look at environmental dependence of composite systems.
+
+This is likely a **second- or third-paper topic**, once catalogs are stable.
+---
+What Is Most Powerful With Your Dataset?
+
+Ranked by feasibility + impact:
+1. **Faint-end LAE luminosity function (high confidence, high impact)**
+2. **Lyα–continuum–stellar mass scaling relations**
+3. **AGN fraction within LAEs**
+4. **AGN–LAE cross-correlation**
+5. **Transitional systems / AGN turnoff**
+---
+Critical Technical Things You Must Do Well
+* Precise line-flux calibration.
+* Accurate redshift classification (Lyα vs [O II] contamination).
+* Selection function modeling.
+* Cosmic variance estimation (your field size matters here).
+------------------------------------------------------------------------------------------------------------------
+6/28/26:
+Papers:
+- https://www.annualreviews.org/content/journals/10.1146/annurev-astro-052920-125203
+
+- https://iopscience.iop.org/article/10.1088/0004-637X/717/1/289/pdf
+- https://arxiv.org/pdf/1703.02593
+- https://iopscience.iop.org/article/10.3847/0004-637X/822/2/84/pdf
+- https://www.aanda.org/articles/aa/pdf/2017/12/aa31480-17.pdf
+- https://www.aanda.org/articles/aa/pdf/2016/03/aa27384-15.pdf
+- https://www.aanda.org/articles/aa/pdf/2022/10/aa42320-21.pdf
+- https://arxiv.org/pdf/1303.0006
+- https://arxiv.org/pdf/2006.11089
+------------------------------------------------------------------------------------------------------------------
+7/2/26-7/3/26:
+CFHTLS COSMOS + EGS image path:
+https://www.cadc-ccda.hia-iha.nrc-cnrc.gc.ca/en/search/?collection=CFHTTERAPIX&Observation.instrument.name=MegaPrime&noexec=true
+
+
+Old Galaxies:
+1940, 4058, 6500, 13673, 14627, 15446, 15871, 17632, 25062, 26009, 30032, 32124, 36741, 37664, 38767, 40738, 
+6283, 6889, 6803, 4837, 22044, 4065, 4081, 5814, 5252, 3121, 4441, 6018, 10567, 19642, 3284, 3117, 10066,
+11961, 18907, 15673, 16115, 4019, 19717, 22193, 4196, 12780, 19098, 2335, 1299, 24582, 2665, 1823, 25094, 
+25197, 26043, 24813, 18569, 23886, 12251, 21323, 23910
+
+
+Manual Segments to unmask:
+COSMOS:
+3117, 896, 13899, 12251, 10567, 20825, 19642, 16115, 6889, 6283, 5912, 22193, 22044, 27056, 1331, 4029, 10169, 6018, 6803, 11961, 4441
+
+star_circles = [
+    {"seg_id": 9419},
+    {"seg_id": 7930},
+    {"seg_id": 16018, "x": 5900, "y": 4945},
+    {"seg_id": 14910},
+    {"seg_id": 14205, "x": 6958, "y": 4334, "radius_arcsec": 2.5},
+    {"seg_id": 20705, "x": 7055, "y": 6216, "radius_arcsec": 2.5},
+    {"seg_id": 20220},
+    {"seg_id": 18120},
+    {"seg_id": 11619},
+    {"seg_id": 11702},
+    {"seg_id": 11190},
+    {"seg_id": 22385},
+    {"seg_id": 20546},
+    {"seg_id": 28992},
+    {"seg_id": 8171, "x": 5048, "y": 2585, "radius_arcsec": 1.2},
+    {"seg_id": 9991},
+    {"seg_id": 13906},
+    {"seg_id": 11665, "radius_arcsec": 3.5},
+    {"seg_id": 15147},
+    {"seg_id": 10242, "radius_arcsec": 2.0},
+]
+
+
+EGS:
+5814, 5761, 4530, 19719, 28655, 14627, 11250, 3094, 379, 9319, 15451, 26075, 20001
+
+star_circles = [
+    {"seg_id": 4362},
+    {"seg_id": 4375},
+    {"seg_id": 4452},
+    {"seg_id": 6399, "x": 4095, "y": 3024, "radius_arcsec": 1.0},
+    {"seg_id": 2607, "radius_arcsec": 1.5},
+    {"seg_id": 9802, "radius_arcsec": 2.0},
+    {"seg_id": 8375},
+    {"seg_id": 9285},
+    {"seg_id": 10541, "radius_arcsec": 8.0},
+    {"seg_id": 13206, "radius_arcsec": 2.8},
+    {"seg_id": 13285},
+    {"seg_id": 11851},
+    {"seg_id": 13799},
+    {"seg_id": 4922, "x": 5312, "y": 2255, "radius_arcsec": 11.0},
+    {"seg_id": 9783, "x": 3185, "y": 4576, "radius_arcsec": 1.2},
+    {"seg_id": 8611},
+]
+
+Bad core:
+20825
+
+------------------------------------------------------------------------------------------------------------------
+7/10/26: 
+SUBARU spectra possible sources:
+	- ~500/600 - MOSDEF/3DHST
+		- Cut to ~800 for sources we have data for
+	- ~1000 - HETDEX LAE and VDFI emission detection combined in COSMOS (not sure about EGS)
+	- ~6000/~4000? - VDFI preliminary LAEs in COSMOS/EGS?
+	- ~10000 HETDEX larger field(s)?
+	- ~100/100 - AGN/potential AGN
+
+-------------------------------------------------------------------------------------------------------------------
+

@@ -32,6 +32,8 @@ This module has three layers:
         line_moments               -- centroid + width + skewness (asymmetry)
         measure_centroid           -- dispatcher over the above (CENTROID_METHOD_SPECS)
         integrated_line_flux       -- canonical windowed continuum-subtracted flux
+        integrated_line_flux_per_bin -- integrated_line_flux looped over one stack's
+                                        radial bins (fiducial stack or one bootstrap draw)
         blue_red_side_ratio        -- coarse asymmetry proxy
 
   2. Stacking a resampled cube along the galaxy axis:
@@ -789,6 +791,52 @@ def integrated_line_flux(
             "flux_sum": float(fsum), "flux_integral": float(fsum * dw),
             "err_sum": esum, "err_integral": eint, "npix": int(m.sum()),
             "dwave": dw, "continuum": cont, "flux_contsub": y}
+
+
+def integrated_line_flux_per_bin(
+    wave, stack, err=None,
+    bounds=(LYA_REST - 4, LYA_REST + 4),
+    cont_bounds=DEFAULT_CONT_BOUNDS,
+    lya_center=LYA_REST,
+    cont_method=DEFAULT_CONT_METHOD, cont_order=DEFAULT_CONT_ORDER,
+    clip_negative=False,
+):
+    """
+    integrated_line_flux, looped over every radial bin of ONE stack.
+
+    Thin per-bin wrapper around the canonical integrator -- bootstrap_all already
+    has this exact shape internally (its local `_measure_stack` closure loops
+    over nrad calling measure_centroid + blue_red_side_ratio per bin) but that
+    closure isn't exported and doesn't call integrated_line_flux. This is the
+    reusable version, for any caller that has one restacked (nrad, nwave)
+    spectrum -- the fiducial stack, or a single bootstrap draw -- and wants
+    per-bin integrated flux without hand-rolling the loop. Used by
+    optimize.py's line-S/N diagnostic so line-flux integration goes through the
+    one convention (continuum-subtracted, config-driven window) everywhere.
+
+    stack : (nrad, nwave) -- one restacked spectrum.
+    err   : (nrad, nwave) or None -- propagated per-pixel error, if available.
+
+    Returns (flux_sum, err_sum), each (nrad,) -- NaN in bins where
+    integrated_line_flux reports success=False (e.g. empty window).
+    """
+    wave = np.asarray(wave, dtype=float)
+    stack = np.asarray(stack, dtype=float)
+    err = np.asarray(err, dtype=float) if err is not None else None
+    nrad = stack.shape[0]
+    flux_sum = np.full(nrad, np.nan)
+    err_sum = np.full(nrad, np.nan)
+    for r in range(nrad):
+        e_r = err[r] if err is not None else None
+        res = integrated_line_flux(
+            wave, stack[r], err=e_r, bounds=bounds, cont_bounds=cont_bounds,
+            lya_center=lya_center, cont_method=cont_method, cont_order=cont_order,
+            clip_negative=clip_negative,
+        )
+        if res["success"]:
+            flux_sum[r] = res["flux_sum"]
+            err_sum[r] = res["err_sum"]
+    return flux_sum, err_sum
 
 
 def blue_red_side_ratio(

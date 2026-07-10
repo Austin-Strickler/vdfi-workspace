@@ -1,40 +1,49 @@
 """
-optimize.py -- lightweight parameter-QUALITY scoring for VIRAL-Halos, NOT a
-tuner that hands you a "best" config automatically.
+optimize.py -- a HUB for scoring pipeline variants under whatever objective is
+currently in question, NOT a tuner that hands you a "best" config
+automatically, and NOT a single-purpose module. What's below is ONE
+sub-optimization living in this hub -- background/continuum noise -- written
+so a future, unrelated sub-optimization can sit alongside it without
+restructuring this one.
 
-Scope, deliberately narrow for now:
+THE CONTINUUM-NOISE SUB-OPTIMIZATION, scope deliberately narrow:
   - What this measures: the NOISE (scatter) of the continuum in a line-free
     part of the rest-frame spectrum, as a proxy for how noisy the background
     estimate feeding the Lya measurement itself is likely to be. It does NOT
     measure or optimize against the continuum's residual DC LEVEL (bias) --
     that's tracked elsewhere and is a separate question from noise.
-  - What this deliberately does NOT do: injection-recovery, random-position
-    null stacks, or anything that optimizes the S/N of the Lya line itself.
-    The line is never touched by this module. See the 2026-07 background-
-    optimization design discussion for why (numerator/denominator circularity
-    when optimizing on the thing you're about to report).
+  - What the RANKING deliberately does NOT do: injection-recovery,
+    random-position null stacks, or rank variants by the S/N of the Lya line
+    itself. Numerator/denominator circularity -- a variant could win by
+    coincidentally biasing/smoothing the line, not by a genuinely quieter
+    background, if you ranked on the thing you're about to report.
   - Why the sideband instead: if background subtraction is noisy, the
     continuum UNDER the line is presumably noisy too -- related, not
     identical, to line-measurement noise, but doesn't require optimizing the
     exact quantity being reported, and reuses the same bootstrap machinery
     (measure.stack_galaxies) the pipeline already trusts, on the real data,
     not a synthetic injected replica.
+  - The one place the line IS touched: continuum_noise_metric's optional
+    compute_line_snr diagnostic (default off) bootstraps an integrated
+    line-flux S/N alongside the noise metric, from the SAME bootstrap draws,
+    purely so the two can be plotted/compared -- "does minimizing continuum
+    noise actually raise line S/N, empirically, on real data." It is NEVER
+    fed into rank_scores / score_table / plot_score_summary's ranked fields;
+    those still read only noise_per_bin / height_per_bin. Circularity is
+    avoided because the line-S/N error comes from the line's OWN bootstrap
+    flux scatter, not from noise_per_bin.
 
-Two tiers, cheaper to more expensive:
-    run_combine_sweep    : CHEAP tier. Reuses ONE already-extracted cube and
-        only varies combine-level knobs (stack_method, sigma_clip_*) --
-        no re-extraction.
-    run_background_sweep : EXPENSIVE tier. Re-runs Stage 1 (run_extract) per
-        variant -- use this for background/masking/smoothing axes, which only
-        take effect at extraction.
+run_combine_sweep reuses ONE already-extracted cube and only varies
+combine-level knobs (stack_method, sigma_clip_*) -- no re-extraction. (There
+used to be a second, expensive tier here that re-ran Stage 1 extraction per
+variant; removed -- unused, extraction-level comparisons are done manually.)
 
-Both tiers score with the same continuum_noise_metric / noise_from_stacks, so
-results across tiers are directly comparable. For scoring galaxy FITS you
-ALREADY extracted (e.g. PRODUCT_PATHS_* dicts), do it inline in the notebook:
-load + finite-cut + (optionally match_products to anchor on a shared galaxy
-set) + stack.build_stacks + noise_from_stacks -- see the notebook cells that
-accompany this module. That path is deliberately NOT wrapped in a function
-here, so the anchoring/matching stays visible and under your control.
+For scoring galaxy FITS you ALREADY extracted (e.g. PRODUCT_PATHS_* dicts), do
+it inline in the notebook: load + finite-cut + (optionally match_products to
+anchor on a shared galaxy set) + stack.build_stacks + noise_from_stacks -- see
+the notebook cells that accompany this module. That path is deliberately NOT
+wrapped in a function here, so the anchoring/matching stays visible and under
+your control.
 """
 
 from __future__ import annotations
@@ -46,8 +55,15 @@ import numpy as np
 from astropy.table import Table
 from astropy.stats import biweight_scale, biweight_location
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # tqdm optional
+    def tqdm(x, **kwargs):
+        return x
+
 from . import pipeline
-from .measure import stack_galaxies
+from .measure import stack_galaxies, run_header, integrated_line_flux_per_bin, LYA_REST
+from .config import DEFAULT_CONT_BOUNDS, DEFAULT_CONT_METHOD, DEFAULT_CONT_ORDER
 from .validation import DEFAULT_UV_LINES, _line_window_mask
 
 if TYPE_CHECKING:
@@ -129,6 +145,8 @@ def continuum_noise_metric(
     stack_method: Optional[str] = None,
     nboot: int = 200, reduce: Union[str, Callable] = "rms",
     height_reduce: Union[str, Callable] = "biweight", seed: int = 1,
+    verbose: bool = True, announce: bool = True, label: Optional[str] = None,
+    compute_line_snr: bool = False, line_snr_robust: bool = True,
 ) -> dict:
     """
     Bootstrap the galaxy axis, restack, and measure the per-pixel scatter in a
@@ -153,6 +171,8 @@ def continuum_noise_metric(
         features (NV 1238.82/1242.80, SiII 1260.42, SiII* 1264.74) -- these are
         masked out via `lines`/`line_hw` below, not just Lya. Do not shrink
         `line_hw` to zero; that puts NV/SiII pixels back into the "noise".
+        Also, at typical usage (e.g. 1150-1350), this window already spans Lya
+        rest (1215.67) -- see compute_line_snr below, which relies on that.
     lines : (name, rest_wavelength_A, kind) tuples to exclude around, default
         validation.DEFAULT_UV_LINES (every cataloged UV line, not just Lya).
     line_hw : half-width (A) masked around each entry in `lines`.
@@ -166,6 +186,28 @@ def continuum_noise_metric(
         LOCATION estimator (measures signed level) -- NOT interchangeable with
         `reduce`; using an RMS reducer here would report |level| and lose the
         sign of an over-subtracted (negative) pedestal.
+    verbose : print a run_header banner and show a tqdm progress bar over the
+        nboot bootstrap draws -- this is the slow loop (a full stack_galaxies
+        restack per draw), same house pattern as measure.bootstrap_stack_error
+        / measure.bootstrap_all. announce/label forwarded to run_header.
+    compute_line_snr : DIAGNOSTIC, default off. Bootstraps an integrated Lya
+        line-flux S/N alongside the noise metric, from the SAME bootstrap
+        draws (no extra restack, no extra rng draws) -- see module docstring
+        "the one place the line IS touched." Window/continuum-model params
+        come from `config` (line_window, cont_bounds, cont_method, cont_order,
+        LYA_REST), matching measure.measure_all_bins' convention, not a second
+        independently-invented line-window definition. Requires `window`
+        (above) to already contain config.line_window and config.cont_bounds --
+        true at typical usage, checked below. Adds ~one measure.
+        integrated_line_flux_per_bin call per draw (cheap relative to the
+        restack, but not free -- time it before assuming it's negligible on a
+        large nboot).
+    line_snr_robust : for compute_line_snr, how the line-flux bootstrap spread
+        collapses to one error number per bin: True (default) -> 0.5*(p84-p16)
+        (matches bootstrap_stack_error's robust=True), False -> plain std.
+        This error comes from the line flux's OWN spread across draws, NOT
+        from noise_per_bin -- see module docstring; that's what keeps the
+        noise-vs-line-S/N comparison a real test instead of a tautology.
 
     Returns dict:
       noise_per_bin, height_per_bin, n_fib_per_bin  : (nrad,) each
@@ -175,6 +217,11 @@ def continuum_noise_metric(
            wiggle shape directly)
       window_wave (n_window_px,); n_window_px; stack_method; reduce (name);
       height_reduce (name); nboot.
+      If compute_line_snr: ALSO line_snr_per_bin, line_flux_per_bin,
+          line_flux_err_per_bin (each (nrad,)), line_bounds, line_snr_robust.
+          NOT consumed by rank_scores/score_table/plot_score_summary -- those
+          only ever read noise_per_bin/height_per_bin. Plot with
+          plot_line_snr_summary instead.
     """
     stack_method = stack_method or config.measure_stack_method
 
@@ -185,34 +232,65 @@ def continuum_noise_metric(
         raise ValueError(f"cube_flux must be (ngal, nrad, nwave), got shape {cube_flux.shape}")
     ngal, nrad, _ = cube_flux.shape
 
-    sel = (rest_wave >= window[0]) & (rest_wave <= window[1])
-    sel &= ~_line_window_mask(rest_wave, lines, line_hw)
-    if sel.sum() < 5:
+    # --- select the FULL window first (line pixels included), THEN derive the
+    #     line-masked sideband as a sub-selection of it. Old code selected the
+    #     sideband directly and threw the line pixels away before they ever
+    #     reached a numpy array; compute_line_snr needs them to survive one
+    #     step further so integrated_line_flux_per_bin has something to
+    #     integrate. When compute_line_snr=False this produces IDENTICAL
+    #     noise_per_bin/height_per_bin/... to before -- noise_sel plays
+    #     exactly the role the old `sel` did. ---
+    sel_win = (rest_wave >= window[0]) & (rest_wave <= window[1])
+    wv = rest_wave[sel_win]
+    noise_sel = ~_line_window_mask(wv, lines, line_hw)
+    if noise_sel.sum() < 5:
         raise ValueError(
-            f"only {int(sel.sum())} line-free pixels survive window={window}, "
+            f"only {int(noise_sel.sum())} line-free pixels survive window={window}, "
             f"line_hw={line_hw} -- widen the window, shrink line_hw, or check "
             "rest_wave coverage before trusting this metric"
         )
-    wv = rest_wave[sel]
 
-    fcube = cube_flux[:, :, sel]
-    ecube = cube_err[:, :, sel] if cube_err is not None else None
+    fcube = cube_flux[:, :, sel_win]
+    ecube = cube_err[:, :, sel_win] if cube_err is not None else None
     w_all = None if weights is None else np.asarray(weights, dtype=float)
 
     reducer = _resolve_reducer(reduce)
     height_reducer = _resolve_height_reducer(height_reduce)
 
+    if compute_line_snr:
+        line_bounds = tuple(getattr(config, "line_window", (LYA_REST - 4.0, LYA_REST + 4.0)))
+        cont_bounds = getattr(config, "cont_bounds", DEFAULT_CONT_BOUNDS)
+        cont_method = getattr(config, "cont_method", DEFAULT_CONT_METHOD)
+        cont_order = getattr(config, "cont_order", DEFAULT_CONT_ORDER)
+        lya_center = float(getattr(config, "LYA_REST", LYA_REST))
+        needed = list(line_bounds) + [b for side in cont_bounds for b in side]
+        if min(needed) < wv.min() or max(needed) > wv.max():
+            raise ValueError(
+                f"compute_line_snr needs window={window} to contain "
+                f"config.line_window={line_bounds} and config.cont_bounds="
+                f"{cont_bounds}, but the sliced grid only spans "
+                f"({wv.min():.1f}, {wv.max():.1f}) -- widen `window`."
+            )
+
     # --- fiducial (all-galaxy) stack -> continuum height (level), no bootstrap ---
     fid_stack, _ = stack_galaxies(
         fcube, ecube, method=stack_method, weights=w_all,
         sigma=config.sigma_clip_sigma, maxiters=config.sigma_clip_maxiters,
-    )                                                          # (nrad, npix)
-    height_per_bin = np.array([height_reducer(fid_stack[r]) for r in range(nrad)])
+    )                                                          # (nrad, n_window_px), FULL window
+    height_per_bin = np.array([height_reducer(fid_stack[r, noise_sel]) for r in range(nrad)])
 
-    # --- bootstrap the galaxy axis -> per-pixel scatter (noise) ---
+    # --- bootstrap the galaxy axis -> per-pixel scatter (noise), and
+    #     optionally line-flux S/N, from the SAME draws ---
     rng = np.random.default_rng(seed)
-    draws = np.empty((nboot, nrad, wv.size), dtype=np.float64)
-    for b in range(nboot):
+    draws = np.empty((nboot, nrad, int(noise_sel.sum())), dtype=np.float64)
+    line_flux_draws = np.full((nboot, nrad), np.nan) if compute_line_snr else None
+
+    desc = run_header(
+        label or "continuum noise bootstrap", verbose=verbose, announce=announce,
+        nboot=nboot, window=window, stack=stack_method,
+        compute_line_snr=compute_line_snr, seed=seed,
+    )
+    for b in tqdm(range(nboot), disable=not verbose, desc=desc):
         idx = rng.integers(0, ngal, ngal)
         flux_bs = fcube[idx]
         err_bs = ecube[idx] if ecube is not None else None
@@ -220,38 +298,70 @@ def continuum_noise_metric(
         stack_bs, _ = stack_galaxies(
             flux_bs, err_bs, method=stack_method, weights=w_bs,
             sigma=config.sigma_clip_sigma, maxiters=config.sigma_clip_maxiters,
-        )
-        draws[b] = stack_bs
+        )                                                       # (nrad, n_window_px), FULL window
+        draws[b] = stack_bs[:, noise_sel]
+        if compute_line_snr:
+            flux_sum, _ = integrated_line_flux_per_bin(
+                wv, stack_bs, bounds=line_bounds, cont_bounds=cont_bounds,
+                lya_center=lya_center, cont_method=cont_method, cont_order=cont_order,
+            )
+            line_flux_draws[b] = flux_sum
 
-    err_spectrum = np.nanstd(draws, axis=0)                     # (nrad, npix)
+    err_spectrum = np.nanstd(draws, axis=0)                     # (nrad, n_noise_px)
     noise_per_bin = np.array([reducer(err_spectrum[r]) for r in range(nrad)])
     n_fib_per_bin = None if w_all is None else np.nansum(w_all, axis=0)
 
-    return {
+    result = {
         "noise_per_bin": noise_per_bin,
         "height_per_bin": height_per_bin,
         "n_fib_per_bin": n_fib_per_bin,
         "err_spectrum": err_spectrum,
-        "continuum_spectrum": fid_stack,
-        "window_wave": wv,
-        "n_window_px": int(wv.size),
+        "continuum_spectrum": fid_stack[:, noise_sel],
+        "window_wave": wv[noise_sel],
+        "n_window_px": int(noise_sel.sum()),
         "stack_method": stack_method,
         "reduce": reduce if isinstance(reduce, str) else getattr(reduce, "__name__", "custom"),
         "height_reduce": height_reduce if isinstance(height_reduce, str) else getattr(height_reduce, "__name__", "custom"),
         "nboot": nboot,
     }
 
+    if compute_line_snr:
+        line_flux_med = np.nanmedian(line_flux_draws, axis=0)
+        if line_snr_robust:
+            p16 = np.nanpercentile(line_flux_draws, 16, axis=0)
+            p84 = np.nanpercentile(line_flux_draws, 84, axis=0)
+            line_flux_err = 0.5 * (p84 - p16)
+        else:
+            line_flux_err = np.nanstd(line_flux_draws, axis=0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            line_snr_per_bin = line_flux_med / line_flux_err
+        result.update({
+            "line_snr_per_bin": line_snr_per_bin,
+            "line_flux_per_bin": line_flux_med,
+            "line_flux_err_per_bin": line_flux_err,
+            "line_bounds": line_bounds,
+            "line_snr_robust": line_snr_robust,
+        })
+
+    return result
+
 
 def noise_from_stacks(stacks: dict, config: "PipelineConfig", **kwargs) -> dict:
     """
     Convenience wrapper: unpack a run_stack(..., keep_cube=True) output dict
-    straight into continuum_noise_metric.
+    straight into continuum_noise_metric. `verbose`, `compute_line_snr`, and
+    every other continuum_noise_metric keyword forward through **kwargs
+    unchanged -- no separate signature to keep in sync.
 
     Example
     -------
         stacks = pipeline.run_stack(config, galaxy_fits_path, keep_cube=True)
         result = optimize.noise_from_stacks(stacks, config)
         print(result["noise_per_bin"], result["n_fib_per_bin"])
+
+        # with the line-S/N diagnostic on:
+        result = optimize.noise_from_stacks(stacks, config, compute_line_snr=True)
+        print(result["line_snr_per_bin"])
     """
     missing = [k for k in ("cube_flux", "cube_weights", "rest_wave") if k not in stacks]
     if missing:
@@ -310,61 +420,7 @@ def run_combine_sweep(
 
 
 # =====================================================================
-# 3. EXPENSIVE TIER -- extraction-level sweep (re-runs Stage 1 per variant)
-# =====================================================================
-
-def run_background_sweep(
-    base_config: "PipelineConfig", variants: Sequence[dict],
-    table=None, use_cache: bool = True, verbose: bool = True, **metric_kwargs
-) -> Table:
-    """
-    Score several BACKGROUND/EXTRACTION-level variants, each requiring its own
-    Stage 1 re-extraction (run_extract is I/O-bound -- this is the expensive
-    outer loop; keep the variant list to axes that actually live in Stage 1).
-    Combine-level knobs (stack_method, sigma_clip_*) belong in
-    run_combine_sweep instead, which reuses one already-extracted cube.
-
-    variants : list of dicts of PipelineConfig field overrides, e.g.
-        [{"bg_inner_arcsec": 55, "bg_outer_arcsec": 65},
-         {"bg_inner_arcsec": 100, "bg_outer_arcsec": 105},
-         {"mask_method": "segmap+spec_local"}]
-    table : optionally an already-cut catalog, forwarded to run_extract.
-    use_cache : forwarded to run_extract (Stage 1's per-galaxy resumability
-        cache). Note the cache key includes mask_method / mask_percentile_* /
-        mask_protect_radius_arcsec / bg params (see extract._extract_signature),
-        so genuinely different variants will not collide in the cache.
-
-    Returns an astropy Table, one row per variant, with the override columns
-    plus noise_per_bin / n_fib_per_bin (each an (nrad,) array per row) and the
-    written galaxy_fits path for that variant (so you can re-run Stage 2/3 on
-    it directly without re-extracting).
-
-    Example
-    -------
-        variants = [{"bg_inner_arcsec": 55,  "bg_outer_arcsec": 65},
-                   {"bg_inner_arcsec": 100, "bg_outer_arcsec": 105}]
-        table = optimize.run_background_sweep(config, variants)
-        table.pprint_all()
-    """
-    rows = []
-    for i, variant in enumerate(variants):
-        cfg_v = replace(base_config, **variant)
-        if verbose:
-            print(f"[{i + 1}/{len(variants)}] extracting: {variant}")
-        galaxy_fits = pipeline.run_extract(cfg_v, table=table, use_cache=use_cache)
-        stacks = pipeline.run_stack(cfg_v, galaxy_fits, keep_cube=True, verbose=verbose)
-        result = noise_from_stacks(stacks, cfg_v, **metric_kwargs)
-        rows.append({
-            **variant,
-            "noise_per_bin": result["noise_per_bin"],
-            "n_fib_per_bin": result["n_fib_per_bin"],
-            "galaxy_fits": galaxy_fits,
-        })
-    return Table(rows=rows)
-
-
-# =====================================================================
-# 4. SCORING + HISTOGRAM VIEWS
+# 3. SCORING + HISTOGRAM VIEWS
 #    Turn a {label: metric-result} dict into (a) two summary bar charts --
 #    noise-product and mean-rank across ALL bins -- and (b) a per-bin drill-
 #    down showing the error and the continuum height for one chosen radius.
@@ -760,3 +816,99 @@ def plot_bin_detail(
     fig.suptitle(f"Per-bin detail: {bin_label}", fontsize=12)
     fig.tight_layout()
     return fig
+
+
+def plot_line_snr_summary(
+    scores: dict,
+    labels: Optional[Sequence[str]] = None,
+    sort_by: str = "mean_snr",
+    figsize: tuple = (12.0, 4.8),
+    snr_cmap: str = "RdYlGn",
+    snr_gamma: float = 1.0,
+    annotate: bool = True,
+    axes=None,
+):
+    """
+    Line-S/N companion to plot_score_summary -- DIAGNOSTIC, not ranked (see
+    module docstring: continuum-noise ranking deliberately never touches the
+    line; this plot is what "touching the line" looks like, kept separate on
+    purpose, never fed back into rank_scores/score_table).
+
+    LEFT  -- mean line S/N across bins, one bar per method. Higher = better
+        here (note the flip from plot_score_summary's noise/rank panels,
+        where lower is better) -- 'RdYlGn' (not '_r') puts green at the HIGH
+        end accordingly.
+    RIGHT -- line S/N vs radial bin, one curve per method, mirroring the
+        noise-vs-radius plot elsewhere in the notebook, so you can see WHERE
+        in radius a method's S/N (dis)advantage shows up, and eyeball it
+        against noise_per_bin's own per-bin curve for the same methods.
+
+    scores : {label: noise_from_stacks result}, each needing "line_snr_per_bin"
+        (i.e. built with compute_line_snr=True).
+    sort_by : "mean_snr" (default, best/highest first) | "none" (dict order).
+
+    Returns (fig, table) -- table: label, mean_snr, sorted to match the bars.
+
+    Example
+    -------
+        scores = {L: opt.noise_from_stacks(stacks[L], cfg_for[L],
+                                            compute_line_snr=True, nboot=1000)
+                  for L in stacks}
+        fig, tbl = opt.plot_line_snr_summary(scores)
+        tbl.pprint_all()
+    """
+    import matplotlib.pyplot as plt
+
+    labels = list(scores) if labels is None else list(labels)
+    missing = [L for L in labels if "line_snr_per_bin" not in scores[L]]
+    if missing:
+        raise ValueError(
+            f"{missing} missing 'line_snr_per_bin' -- built with "
+            "compute_line_snr=True?"
+        )
+
+    snr = np.array([np.asarray(scores[L]["line_snr_per_bin"], float) for L in labels])
+    mean_snr = np.nanmean(snr, axis=1)
+
+    order = np.argsort(-mean_snr) if sort_by == "mean_snr" else np.arange(len(labels))
+    lab = np.array(labels)[order]
+    m_snr = mean_snr[order]
+    snr_ord = snr[order]
+
+    if axes is None:
+        fig, (axL, axR) = plt.subplots(1, 2, figsize=figsize)
+    else:
+        axL, axR = axes
+        fig = axL.figure
+    x = np.arange(len(lab))
+
+    # LEFT: mean line S/N (higher = better -> RdYlGn, not the _r noise/rank cmaps)
+    cL = _bar_colors(m_snr, snr_cmap, gamma=snr_gamma)
+    axL.bar(x, m_snr, color=cL, edgecolor="k", linewidth=0.4)
+    axL.set_ylabel("mean line S/N across bins")
+    axL.set_title("LINE S/N  (higher = better; diagnostic, unranked)")
+    axL.set_xticks(x)
+    axL.set_xticklabels(lab, rotation=45, ha="right", fontsize=8)
+    axL.margins(x=0.01)
+    if annotate:
+        for xi, v in zip(x, m_snr):
+            if np.isfinite(v):
+                axL.annotate(f"{v:.2f}", (xi, v), ha="center", va="bottom",
+                            fontsize=7, xytext=(0, 1), textcoords="offset points")
+
+    # RIGHT: line S/N vs radial bin, one curve per method
+    nrad = snr.shape[1]
+    for L, row in zip(lab, snr_ord):
+        axR.plot(range(nrad), row, marker="o", label=L)
+    axR.set_xlabel("radial bin index")
+    axR.set_ylabel("line S/N")
+    axR.set_title("LINE S/N vs radius, one curve per method")
+    axR.legend(fontsize=7, ncol=2)
+    axR.margins(x=0.02)
+
+    fig.suptitle("Line S/N diagnostic -- NOT a ranking input (see module docstring)",
+                fontsize=11)
+    fig.tight_layout()
+
+    tbl = Table({"label": lab, "mean_snr": np.round(m_snr, 4)})
+    return fig, tbl
