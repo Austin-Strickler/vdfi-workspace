@@ -809,6 +809,22 @@ _ENTRIES = [
        "tab = compare_estimators(wr, fr, er)"),
 
     # ===================== METHOD SCORING (optimize.py) =====================
+    _e("load_products", "optimize", "validation", "Method scoring",
+       "{label: fits_path} + ONE PipelineConfig -> {label: GalaxyProduct}, each "
+       "already apply_finite_cut. Kills the products_testN boilerplate for "
+       "comparing several already-extracted galaxy FITS side by side -- one "
+       "shared config is enough since background/masking/smoothing are already "
+       "baked into each FITS (see specs/optimize.md). NOTE: multicat also has a "
+       "load_products (different signature -- a list of label/path/config "
+       "specs); this one is optimize.load_products specifically.",
+       "products = load_products({'100G': path1, 'im_200A': path2}, cfg_test)"),
+    _e("build_stacks_many", "optimize", "validation", "Method scoring",
+       "{label: GalaxyProduct} + ONE config -> {label: build_stacks(...) "
+       "result}. The batch call that follows load_products (or "
+       "match_products(...)['products']) and precedes noise_from_stacks. "
+       "config_for is an escape hatch -- {label: override_config} -- for the "
+       "rare label that needs different measure-phase settings.",
+       "stacks = build_stacks_many(products, cfg_test)"),
     _e("noise_from_stacks", "optimize", "validation", "Method scoring",
        "Score ONE product's continuum noise: bootstrap the galaxy axis of a "
        "keep_cube=True stacks dict, measure per-bin scatter in a line-masked "
@@ -916,7 +932,7 @@ _BACKEND["virial"].discard("virial_to_angular_bins")
 # =====================================================================
 # RETRO-TERMINAL DISPLAY
 # =====================================================================
-_W = 74                      # inner text width
+_W = 92                      # inner text width
 _ACCENT = "\033[92m"         # green phosphor
 _DIM = "\033[2m"
 _BOLD = "\033[1m"
@@ -960,12 +976,12 @@ def _main_menu(color=True):
     out.append(_box_line("", color))
     for i, (key, (blurb, _subs)) in enumerate(SECTIONS.items(), 1):
         n = sum(e["section"] == key for e in _ENTRIES)
-        head = f"  {_c('►', _ACCENT, color)} {i}  {key.upper():<11}({n:>2})  "
-        # blurb clipped to fit
-        room = _W - 22
-        line = head + blurb[:room]
-        # account for ANSI length in the ► when padding: build manually
-        raw = f"  ► {i}  {key.upper():<11}({n:>2})  " + blurb[:room]
+        # room computed from the ACTUAL plain-text prefix length (not a
+        # hardcoded guess) so the blurb is clipped exactly where the line
+        # itself gets clipped -- no extra mid-word chars lost to a mismatch.
+        prefix = f"  ► {i}  {key.upper():<11}({n:>2})  "
+        room = max(0, _W - len(prefix))
+        raw = prefix + blurb[:room]
         out.append(_c("║ ", _ACCENT, color) + f"{raw:<{_W}}"[:_W] + _c(" ║", _ACCENT, color))
     out.append(_box_line("", color))
     out.append(_box_line("  detail: guide(\"run_stack\")   search: guide(search=\"flux\")", color))

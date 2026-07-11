@@ -38,12 +38,14 @@ combine-level knobs (stack_method, sigma_clip_*) -- no re-extraction. (There
 used to be a second, expensive tier here that re-ran Stage 1 extraction per
 variant; removed -- unused, extraction-level comparisons are done manually.)
 
-For scoring galaxy FITS you ALREADY extracted (e.g. PRODUCT_PATHS_* dicts), do
-it inline in the notebook: load + finite-cut + (optionally match_products to
-anchor on a shared galaxy set) + stack.build_stacks + noise_from_stacks -- see
-the notebook cells that accompany this module. That path is deliberately NOT
-wrapped in a function here, so the anchoring/matching stays visible and under
-your control.
+For scoring galaxy FITS you ALREADY extracted (e.g. PRODUCT_PATHS_* dicts):
+load_products + (optionally match_products to anchor on a shared galaxy set)
++ build_stacks_many + noise_from_stacks -- see the notebook cells that
+accompany this module. load_products/build_stacks_many are thin loops with no
+judgment calls (one shared config is enough across differently-extracted
+products -- see specs/optimize.md "Planned change 3"); match_products and the
+noise_from_stacks call are deliberately NOT wrapped, so the anchoring/matching
+and the actual scoring stay visible and under your control.
 """
 
 from __future__ import annotations
@@ -61,13 +63,98 @@ except Exception:  # tqdm optional
     def tqdm(x, **kwargs):
         return x
 
-from . import pipeline
+from . import pipeline, stack
+from .io import GalaxyProduct, read_galaxy_fits, apply_finite_cut
 from .measure import stack_galaxies, run_header, integrated_line_flux_per_bin, LYA_REST
 from .config import DEFAULT_CONT_BOUNDS, DEFAULT_CONT_METHOD, DEFAULT_CONT_ORDER
 from .validation import DEFAULT_UV_LINES, _line_window_mask
 
 if TYPE_CHECKING:
     from .config import PipelineConfig
+
+
+# =====================================================================
+# 0. BULK GALAXY-PRODUCT LOADING -- pure boilerplate, no judgment calls.
+#    See specs/optimize.md "Planned change 3" for why one shared config is
+#    safe across products extracted with different background/masking/
+#    smoothing settings. match_products (anchoring choice) and the
+#    noise_from_stacks scoring call stay separate, explicit notebook calls --
+#    deliberately NOT wrapped here.
+# =====================================================================
+
+def load_products(
+    paths: dict[str, str], config: "PipelineConfig", verbose: bool = True
+) -> dict[str, GalaxyProduct]:
+    """
+    {label: fits_path} + ONE config -> {label: GalaxyProduct}, each already
+    run through apply_finite_cut(config.cut_radial_bin, config.min_good_wave).
+
+    `paths` should be keyed by the FINAL label you want in your results (e.g.
+    "100G", "im_200A") -- flatten your PRODUCT_PATHS_* dicts to one
+    {label: path} dict up front, rather than one dict per test. This directly
+    replaces the products_testN / product_testN = products_testN["COSMOS"]
+    boilerplate pattern.
+
+    Only config.cut_radial_bin and config.min_good_wave are consumed here --
+    background annulus, masking, and smoothing are already baked into each
+    FITS at Stage 1 extraction and are not re-applied on read. See
+    specs/optimize.md "Planned change 3" for the full argument; the one
+    caveat is that config.cut_radial_bin must stay a relative (e.g. default
+    -1) index if the input products don't all share the same nrad -- a fixed
+    positive index would silently pick a different physical radius per
+    product.
+
+    verbose : forwarded to apply_finite_cut's per-product "kept N/M galaxies"
+        print.
+
+    Example
+    -------
+        paths = {"100G": "./outputs/C50_100G_S_55-65.fits",
+                 "im_200A": "./outputs/C50_200A_I_55-65.fits"}
+        products = optimize.load_products(paths, cfg_test)
+    """
+    return {
+        label: apply_finite_cut(
+            read_galaxy_fits(path),
+            config.cut_radial_bin,
+            config.min_good_wave,
+            verbose,
+        )
+        for label, path in paths.items()
+    }
+
+
+def build_stacks_many(
+    products: dict[str, GalaxyProduct],
+    config: "PipelineConfig",
+    keep_cube: bool = True,
+    config_for: Optional[dict] = None,
+) -> dict:
+    """
+    {label: GalaxyProduct} + ONE config -> {label: stack.build_stacks(...)
+    result}. Typically called on the output of load_products, or on
+    match_products(...)["products"] once you've anchored on a shared galaxy
+    set.
+
+    config_for : escape hatch -- {label: override_config} for the rare label
+        that genuinely needs different measure-phase settings (e.g. its own
+        galaxy_combine_methods). Labels absent from config_for fall back to
+        `config`. Default None -> every label uses `config`.
+
+    Example
+    -------
+        stacks = optimize.build_stacks_many(products, cfg_test)
+        # or, after anchoring:
+        M = match_products(products, radius_arcsec=1.0)
+        stacks = optimize.build_stacks_many(M["products"], cfg_test)
+    """
+    config_for = config_for or {}
+    return {
+        label: stack.build_stacks(
+            config_for.get(label, config), product, keep_cube=keep_cube
+        )
+        for label, product in products.items()
+    }
 
 
 # =====================================================================

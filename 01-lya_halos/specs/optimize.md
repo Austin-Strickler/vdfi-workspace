@@ -185,3 +185,91 @@ way it already calls into `measure.stack_galaxies` for the restack. Keeps the li
 integration logic in one place instead of duplicated between `bootstrap_all` and optimize.py.
 
 Per-draw, per-bin: `flux_sum[b, r]` from `integrated_line_flux(...)["flux_sum"]`. **Errors come
+[-- note: doc appears to have been cut off here before this rework; not touching, out of scope.]
+
+### Planned change 3 — bulk galaxy-product load/stack helpers
+
+**Motivation:** `5_Testing_Background.ipynb`'s comparison cell repeats an identical 6-line
+`{label: apply_finite_cut(read_galaxy_fits(path), cfg.cut_radial_bin, cfg.min_good_wave) for
+label, path in paths.items()}` block once per `PRODUCT_PATHS_*` dict (8 in active use today,
+more commented out), then a near-identical comprehension to run `stack.build_stacks` per label.
+None of that repetition encodes a judgment call, unlike `match_products`'s anchor/radius choice
+— it's pure boilerplate and a good fit for this hub.
+
+**Confirmed (2026-07-11): one shared `PipelineConfig` is sufficient across differently-extracted
+galaxy FITS products**, for the read + finite-cut + build_stacks path this hub already sits on
+top of (checked against the code, not assumed):
+
+- `io.apply_finite_cut` consumes only `config.cut_radial_bin` and `config.min_good_wave` —
+  nothing about background annulus, masking, or smoothing.
+- `stack.build_stacks` consumes `config.flux_unit`, `flux_unit_scale`, `fiber_diam_arcsec`,
+  `rest_density`, `z_col`, `mass_col`, `galaxy_combine_methods`, and `rest_grid(config)`
+  (`rest_wave_min`/`rest_wave_max`/`rest_delta`) — again nothing about background annulus,
+  masking, or smoothing, and notably NOT `config.bins`/`bin_mode`: each product's radial binning
+  comes from its own `R_EDGES` array (`nrad = product.spec.shape[1]`), read back as-is.
+  `config.bins`/`bin_mode` only matter at Stage 1 extraction time, when a file is written.
+- `bg_inner_arcsec`, `bg_outer_arcsec`, `mask_method`, and the smoothing knobs are baked into
+  each product's arrays/header at Stage 1 extraction. At this (Stage 2/3) load+stack path they're
+  only read off `config` for provenance stamping / `descriptive_filename()` — never consumed by
+  `apply_finite_cut` or `build_stacks`.
+- **Caveat:** `config.cut_radial_bin` defaults to `-1` (relative to each product's own `nrad`),
+  which is exactly what makes one shared config safe across products extracted with different bin
+  counts (e.g. the notebook's old 8-bin scheme vs. the newer 10-bin `bins` list). This only holds
+  because it's a relative/negative index — if it's ever changed to a positive fixed index it would
+  silently pick a different physical radius per product, and the one-shared-config assumption
+  below would need re-checking.
+
+**New functions, both in `optimize.py`** (companions to `noise_from_stacks`, not replacements):
+
+```python
+def load_products(paths: dict[str, str], config: "PipelineConfig",
+                  verbose: bool = True) -> dict[str, "GalaxyProduct"]:
+    """{label: fits_path} + ONE config -> {label: GalaxyProduct}, each already
+    run through apply_finite_cut(config.cut_radial_bin, config.min_good_wave).
+    `paths` is keyed by the FINAL label you want (e.g. "100G", "im_200A"), so
+    this call directly replaces the products_testN / product_testN pattern --
+    flatten your PRODUCT_PATHS_* dicts to one {label: path} dict once, up front.
+    Thin loop over io.read_galaxy_fits + io.apply_finite_cut, no judgment calls
+    (see specs/optimize.md); match_products stays a separate, explicit notebook
+    call, same as today.
+    """
+
+def build_stacks_many(products: dict[str, "GalaxyProduct"],
+                      config: "PipelineConfig",
+                      keep_cube: bool = True,
+                      config_for: Optional[dict[str, "PipelineConfig"]] = None
+                      ) -> dict[str, dict]:
+    """{label: GalaxyProduct} + ONE config -> {label: stack.build_stacks(...)
+    result}. `config_for` is an escape hatch for the rare label that genuinely
+    needs different measure-phase settings (e.g. its own galaxy_combine_methods)
+    -- {label: override_config}; labels absent from config_for fall back to
+    `config`. Thin loop over stack.build_stacks, no judgment calls.
+    """
+```
+
+**Stays manual, on purpose:** `match_products` (the anchor/radius choice, and which labels get
+combined) and the `noise_from_stacks` scoring call itself. Wrapping either would hide a decision
+the module docstring already calls out as needing to "stay visible and under your control" --
+this change only removes the load/stack loop repetition sitting around them.
+
+**Module docstring update, once this lands:** the paragraph "For scoring galaxy FITS you ALREADY
+extracted... That path is deliberately NOT wrapped in a function..." needs a one-line amendment --
+load + finite-cut and build_stacks are now wrapped (`load_products` / `build_stacks_many`);
+`match_products` and the `noise_from_stacks` call remain the deliberately-unwrapped, visible part.
+
+**Success criteria:** the `5_Testing_Background.ipynb` comparison cell's per-`PRODUCT_PATHS_*`
+boilerplate (8 repeated read/cut blocks + 8 repeated single-label `build_stacks` calls) collapses
+to one `load_products` call over a flattened `{label: path}` dict and one `build_stacks_many`
+call, with `match_products` and the `noise_from_stacks` scoring loop unchanged. Before deleting
+the old boilerplate, re-run the cell with both versions side by side for at least one existing
+label and confirm `stacks[label]` is bit-identical (same `cube_flux`/`cube_err`/`rest_wave`
+arrays) between the old inline comprehension and the new helper.
+
+**Status: implemented (2026-07-11).** `load_products` and `build_stacks_many` are in
+`optimize.py`, in a new "0. BULK GALAXY-PRODUCT LOADING" section, plus the module-docstring
+amendment described above. Verified with a synthetic-FITS regression test (not real pipeline
+data, none was available in this environment): old inline pattern vs. the two new helpers produce
+bit-identical `GalaxyProduct` arrays and `stacks` dicts (cube_flux/cube_err/cube_weights/rest_wave/
+r_edges and every per-method stack), the finite cut drops the expected galaxy, and `config_for`
+correctly overrides per-label. Swap the notebook cell's boilerplate for these calls at your
+convenience -- old and new are confirmed equivalent, not just intended to be.
