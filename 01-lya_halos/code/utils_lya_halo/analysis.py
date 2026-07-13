@@ -529,7 +529,11 @@ def plot_line_panels(
     The most important per-run diagnostic: one spectral panel per radial bin
     zoomed to the Lyα region, showing:
 
-      • Bootstrap p16/p84 shaded band (grey; needs boot["stack_error"])
+      • Bootstrap 1-sigma shaded band, fid-centered (grey; needs boot["stack_error"]).
+        Width/asymmetry come from the bootstrap p16/p84 spread around the
+        bootstrap median, but the band is re-anchored onto the fiducial curve
+        below, so it is a per-pixel error ON the fiducial stack, not a raw
+        percentile band that can wander off-center for small-N bins.
       • Biweight (or chosen method) fiducial stack (black)
       • Polynomial continuum fit (red dashed; optional)
       • Line window shaded (yellow; optional)
@@ -556,11 +560,29 @@ def plot_line_panels(
     bounds = bounds if bounds is not None else (lya_center - 4, lya_center + 4)
     bm     = stacks.get("bin_mode", "")
 
-    # bootstrap error band
-    p16 = p84 = None
+    # bootstrap error band -- anchored on the fiducial curve, not on the
+    # bootstrap distribution's own median. Raw p16/p84 are percentiles of the
+    # RESAMPLED restacks and are centered on stack_med (the bootstrap
+    # distribution's own median), which is a different quantity from `fid`
+    # (the biweight of the actual, unresampled sample). The two normally sit
+    # close together, but for small-N / low-S/N bins (the outer bins) they
+    # can visibly diverge, so a raw p16-p84 fill_between shows a shaded band
+    # whose own midline does not track the solid fiducial curve.
+    #
+    # Fix: keep the bootstrap-derived WIDTH and ASYMMETRY (how far p16/p84
+    # sit below/above stack_med) but re-anchor that spread onto fid, so the
+    # black fiducial line is always exactly the midline of the shaded region
+    # by construction -- band_lo/band_hi are per-pixel 1-sigma errors ON fid,
+    # not an independent percentile band.
+    band_lo = band_hi = None
     if boot is not None and boot.get("stack_error") is not None:
-        p16 = np.asarray(boot["stack_error"]["p16"])   # (nrad, nwave)
-        p84 = np.asarray(boot["stack_error"]["p84"])
+        p16       = np.asarray(boot["stack_error"]["p16"])         # (nrad, nwave)
+        p84       = np.asarray(boot["stack_error"]["p84"])
+        stack_med = np.asarray(boot["stack_error"]["stack_med"])
+        err_lo    = stack_med - p16     # distance from the bootstrap median down to p16
+        err_hi    = p84 - stack_med     # distance from the bootstrap median up to p84
+        band_lo   = fid - err_lo
+        band_hi   = fid + err_hi
 
     fig, axes = plt.subplots(nrad, 1, figsize=(figwidth, panel_height * nrad),
                              sharex=True)
@@ -568,10 +590,10 @@ def plot_line_panels(
         axes = [axes]
 
     for r, ax in enumerate(axes):
-        # --- bootstrap band ---
-        if p16 is not None:
-            ax.fill_between(wave, p16[r], p84[r], color="0.82", lw=0,
-                            zorder=0, label="bootstrap 16–84%" if r == 0 else None)
+        # --- bootstrap band (fid-centered 1-sigma) ---
+        if band_lo is not None:
+            ax.fill_between(wave, band_lo[r], band_hi[r], color="0.82", lw=0,
+                            zorder=0, label="bootstrap 1$\\sigma$ (fid-centered)" if r == 0 else None)
 
         # --- sideband regions ---
         if show_sidebands:
@@ -625,9 +647,12 @@ def plot_line_panels(
         ax.set_xlim(xlim)
         ax.grid(alpha=0.12)
 
-        yvals = fid[r][(wave >= xlim[0]) & (wave <= xlim[1])]
-        if p16 is not None:
-            yvals = np.concatenate([yvals, p16[r][(wave >= xlim[0]) & (wave <= xlim[1])]])
+        in_xlim = (wave >= xlim[0]) & (wave <= xlim[1])
+        yvals = fid[r][in_xlim]
+        if band_lo is not None:
+            # both edges -- the old version only looked at the lower edge
+            # (p16), so the top of the band could silently clip out of view.
+            yvals = np.concatenate([yvals, band_lo[r][in_xlim], band_hi[r][in_xlim]])
         fin = yvals[np.isfinite(yvals)]
         if len(fin):
             lo_, hi_ = np.nanpercentile(fin, [1, 99])

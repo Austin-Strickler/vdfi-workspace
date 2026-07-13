@@ -1,0 +1,141 @@
+%% Your paper draft
+
+\documentclass[linenumbers,amsmath,trackchanges,preprint2]{aastex702}
+
+\input{macros.tex}
+
+\newcommand{\vdag}{(v)^\dagger}
+\newcommand\aastex{AAS\TeX}
+\newcommand\latex{La\TeX}
+
+\begin{document}
+
+\title{Spatially Resolved Ly$\alpha$ Halo Kinematics of Star-Forming Galaxies out to 2 Mpc}
+
+\author{Austin Strickler}
+\email{stricker.austin@yahoo.com}
+\affiliation{Department of Astronomy \& Astrophysics, The Pennsylvania State University, University Park, PA 16802, USA}
+\author{Gregory Zeimann}
+\email{gregz@astro.as.utexas.edu}
+\affiliation{Hobby Eberly Telescope, University of Texas, Austin, Austin, TX 78712, USA}
+\author{Gary Hill}
+\email{hill@astro.as.utexas.edu}
+\affiliation{Department of Astronomy, The University of Texas at Austin, 2515 Speedway Boulevard, Austin, TX 78712, USA; }
+\author{Robin Ciardullo}
+\email{rbc3@psu.edu}
+\affiliation{Department of Astronomy \& Astrophysics, The Pennsylvania State University, University Park, PA 16802, USA}
+
+\begin{abstract}
+Abstract!
+
+\end{abstract}
+
+\keywords{\uat{Galaxies}{573} --- 
+\uat{Circumgalactic medium}{1879} ---
+\uat{Intergalactic medium}{813} ---
+\uat{Cosmology}{343}}
+
+%% ============================================================
+%%% INTRODUCTION %%%
+\section{Introduction}
+\par The connection between the intergalactic medium (IGM) and the galaxy is at the forefront of galactic evolution. Gas in the IGM accretes onto a galaxy and eventually flows into its interstellar medium (ISM) to fuel star formation and drive supernovae (SNe). A combination of both SNe and strong radiation pressure contribute to generating outflowing winds on scales of 100-1000km/s (\cite{?}). This metal-rich gas expands out of the galaxy and back into its local environment and the IGM. The mediator of this process, known as the circumgalactic medium (CGM), is directly affected by both processes and key to understanding galaxy formation and the large-scale structure (LSS) of the universe.
+\par Measuring the properties of a galaxy's CGM and IGM is especially challenging as star formation is quiet and dark matter dominates. That being said, one of the most powerful tools that astronomers have been using is Ly$\alpha$. Since it was first proposed by (people), the emission line of Ly$\alpha$ has not only been used as a faithful tracer of high-redshift galaxies (\cite{?}), but also to detect diffuse, extended emission around galaxies, called Ly$\alpha$ Halos (LAH). Although this term lacks a unified and quantitative definition, it is typically defined as any extended Ly$\alpha$ emitting source that surrounds a galaxy and is observed to be many times larger than the underlying stellar continuum. Additionally, with recent deep IFU observations (\cite{?} - MUSE, KCWI, maybe even VDFI or HETDEX?), the ability to detect even the cosmic-web --- the theorized web of emission that traces dark matter and fuels galaxy formation --- has started becoming possible (\cite{tornotti2025}).
+\par Recent large-scale spectroscopic surveys (HETDEX, DESI...) have identified hundreds of thousands of Ly$\alpha$ emitters (LAEs) as well as the robust detection of Ly$\alpha$ nebulae (\cite{cooper2026}). Thanks to numerous spectroscopic surveys, the properties of LAEs, Lyman-break galaxies (LBGs), AGN, and the larger galaxy population (cite everyone), the physics of Ly$\alpha$ has become increasingly well-constrained. It is understood that in the majority of galaxies, the core-integrated spectrum is dominated by a red-peaked Ly$\alpha$ line which is indicative of high volume-fraction outflows (\cite{?} someone before blaziot). In addition, radiative-transfer simulations are now able to accurately simulate galaxy formation (FIRE), large-scale scattering and diffuse emission (\cite{lake2015}, \cite{byrohl2021}, \cite{byrohl2023}), and the unique spectral features emerging from both the ISM and the CGM (\cite{blaizot2023}). 
+\par Despite the vast amounts of literature that has been devoted to understanding these processes, the highly informative, \textit{spatially and spectroscopically resolved}, features emerging from galaxies in Ly$\alpha$ is still poorly understood. The unique measurement of both spatial and spectral variations enable the detection of gas geometry, column density, kinematics, clustering, and LSS. Ultimately, it can answer the questions of how galaxies accrete, evolve, cohabit, and influence their surroundings. This two-fold measurement has been carried out in individual galaxy case-studies like \cite{erb2018}, which found that the Lyman-$\alpha$ double-peak shifted closer to unity, while the blue-to-red ratio increased to 1 out to $\sim$20kpc. To obtain a more robust and higher signal-to-noise (SN) measurement, stacking analyses have been used to detect Lyman-$\alpha$ in emission (\cite{steidel2011}, \cite{niemeyer2022hetdex}, \cite{erb2023}, \cite{guo2024muse}, \cite{trainor2025} - MANY MORE), and absorption {\cite{rudie2012}, \cite{chen2020} - MORE}. According to \cite{leclercq2017}, SOMETHING...
+Additionally, in attempts to disentangle these emission mechanisms, sub-samples based on Lyman-$\alpha$ properties have been constructed (\cite{steidel2011}, \cite{trainor2025}), although the conclusions as to the specific source of LAH are highly contested. According to \cite{niemeyer2022hetdex} and \cite{byrohl2021}, LAH are dominated in the cores by photon scattering, while the large scale emission is produced from satellite halo contributions. In contrast, \cite{lake2015} argues that, due to the upper-limit on the UV-background, approximately $50\%$ of the extended flux could be due to gravitational cooling-radiation.
+\par Currently, only a handful of papers target the spectrally and spatially resolved Lyman-$\alpha$ profile. In a single case-study, \cite{erb2018}, and extending to a larger sample \cite{erb2023}, it was revealed that the B/R ratio increased from red-dominant ($\sim$0.2) to equal ($\sim$1), along with the blue-to-red peak separation decreasing from 600-700km/s to 300-400km/s. Using a stacking analysis, \cite{guo2024spec} identified a clear gradient in high-redshift LAEs in which the Lyman-$\alpha$ line shifted blue-ward by $\sim$250km/s. It is important to note, however, that their measurements were done in the observed redshift of the Lyman-$\alpha$ peak.
+\par In this study, we aim to measure and quantify the kinematic shift of the Lya line across vast galactic scales (ISM, CGM, IGM), and attempt to forward-model the intrinsic profile that produces the observed spectra. We also split our sample by various sub-samples to target the emission mechanisms at play, including redshift, mass, SFR, and various galaxy classifications...
+
+
+%%% DATA %%%
+\section{Data \& Observations}
+\subsection{VDFI Observations}
+\par The VIRUS spectrograph is a multi-unit integral field (IFU) spectrograph designed for the Hobby Eberly Telescope Dark Energy Experiement (HETDEX). It obtains low-resolution spectra (R$\sim$800) from 3500-5500\Ang to measure hundreds of thousands of LAEs at cosmic-noon...
+
+\subsection{MOSDEF Galaxy Sample}
+\par Precise rest-frame optical redshifts are needed to constrain the relative velocity of Ly$\alpha$ with respect to the galaxy's systemic redshift. The MOSFIRE Deep Evolution Field (MOSDEF) survey, which uses the MOSFIRE spectrograph on the Keck I telescope, obtains rest-frame optical spectra with moderate resolution R$\sim$3300. This survey consists of $\sim$1500 H-band selected galaxies from z=1.37-3.8 in three highly-studied CANDELS fields (COSMOS, AEGIS, and GOODS-N). Targets in our redshift windows of z$\sim$2.3 and z=$\sim$3.3 are selected down to a fixed F160W magnitude of 24.5, and 25 respectively from the 3D-HST survey (\cite{skelton2014}). It contains galaxies spanning a wide range of masses ($\sim$$10^9$-$10^{11.5}M_{\odot}$) and include a significant sample of AGN. For more details, see the MOSDEF survey paper (\cite{kriek2015}). In total, after applying several cuts and classifications, we are left with (X MOSDEF GALAXIES AND X AGN IN OUR SAMPLE). The methods as to how we create our sample are defined below.
+\subsubsection{Catalog Joining and Cuts}
+\par In our investigation, we cross-match several catalogs and apply various cuts to improve the overall quality of our sample. We start by joining the z-catalog, the slit-loss-corrected emission-line catalog, and the spectral energy distribution (SED) fit catalog from the public MOSDEF data (CITE???). We also match with the pre-existing 3D-HST catalogs from \cite{skelton2014} for photometry and from \cite{vanderWel2014} for GALFIT parameters. For later AGN removal, we cross-match all of our sources with the CHANDRA Source Catalog 2.1 (\cite{?}) to obtain any x-ray counterpart data available. To ensure we select the highest-confidence redshifts, we require the highest MOSDEF nebular redshift quality (z\_qual == 7) and require a SN$>3$ for H$\alpha$ and [OIII] as these are the strongest lines most commonly used to calculate the redshift.
+\subsubsection{Duplicate Removal}
+\par We remove any unresolvable duplicate detections in the catalog, based on their sky separation and proximity in redshift. Due to the poor seeing of the VIRUS spectrograph, resolving two different sources within 2$\arcsec$ of each other is challenging, as they will share many of the same fibers and thus have spectra that are correlated. However, for the purposes of this investigation, we only care about the nature of the Ly$\alpha$ line. Therefore, two galaxies within 2$\arcsec$ are only merged into one if their absolute redshift offset is $<500$km/s. To decide which galaxy to select, we pick the one with the greater H$\alpha$ or [OIII] SN and drop the other. A visual inspection of the spectra for these rare cases confirms that there is no clear distinction of separate galaxies. In addition to this merging, we also repeat the same merge-drop process for galaxies with any neighbor $<0.5\arcsec$. These galaxies are all ones that have been observed twice and have the exact same RA and DEC (thus, if we limited the radius to $<0.01\arcsec$ we would get the same result).
+\subsubsection{AGN Detection}
+\par We apply a combination of three techniques commonly used by the MOSDEF team to separate typical star-forming galaxies from AGN. The first of which is the CHANDRA x-ray catalog, which we cross-match for detections $<1.5\arcsec$ from any MOSDEF galaxy. The second check is based on IRAC colors from the four IRAC channels in 3D-HST, cut according to \cite{donley2012}. Lastly, we follow the definition of an optical AGN classified via the BPT diagram according to \cite{melendez2014} ($log([NII]/H\alpha) > -0.3$ OR above the Kewley+2013 redshift-dependent max-starburst line at z=2.3).
+
+
+%%% METHODS %%%
+\section{Methods}
+\subsection{Continuum Masking}
+\par We begin our full extraction process by first masking the continuum-bright sources in the field. For our continuum images, we obtain and use the 1-square-degree CFHT-LS r-band images (\cite{?}) in both the COSMOS and EGS fields so that we have identical products to segment from. To create our segmentation masking maps, we run Source Extractor to mask the bright sources in the field and save the segmentation maps. Since our galaxies are often continuum-bright, many of them have been masked by their own light. To fix this, we visually inspect every one of these cases and unmask those segments, ensuring we maintain our own galaxy light while preventing any contaminating sources from interfering. We conclude this by generating field-wide masks that are used to ignore these contaminating fibers in the later extraction process. The amount of fibers masked in each field totals to roughly 10\%. 
+
+\subsection{Fiber Extraction}
+\par Once the continuum-bright fibers are masked, we begin the fiber extraction process to generate our radial galaxy spectra. The process starts by computing distances from a galaxy's center to each fiber. These are each scaled to the desired units of choice (arcsec, kpc, or virial-radii). We then compute a per-galaxy background, which is described in the next section. The background is subtracted off the fibers and is followed by pooling them all into their respective annular bins. We co-add all the fibers per galaxy using a biweight, resulting in one spectrum per galaxy per radial bin.
+
+\subsection{Background Subtraction}
+\par The background is computed per-galaxy in a similar manner to how the spectra is made. It starts with an extraction of fibers from 100-110\arcsec. These fibers are once again co-added via a biweight, and then are smoothed to destroy any artificial features that simply add noise. The smoothing involves masking out the Ly$\alpha$ line, interpolating, and then smoothing using a 50\Ang Gaussian filter. This prevents a direct subtraction of faint, large-scale Ly$\alpha$ while preserving the continuum around and underlying the line. These background subtraction parameters were tested and optimized to obtain  resulting spectra with the lowest line-free continuum noise.
+
+\subsection{Stacking Procedure}
+\par We take the biweight of the galaxy spectra at each radial bin, producing one stacked galaxy spectrum per bin. This is done by shifting each galaxy's spectra into rest-frame, adjusting to the desired units, and then co-adding. We choose bin edges of [0, 10, 20, 30, 50, 80, 140, 300, 600, 1000, 2000] kpc, designed to give us a consistent S/N in the outer bins. Bootstrapped resampling of galaxies was used to measure the uncertainty of the final spectra. This uncertainty was compared with jackknifing and a scrambled redshift test (measuring the integrated flux in many pure-noise iterations), and bootstrapping was consistent with both.
+
+\subsection{Measurements}
+\subsubsection{Flux Profile}
+\par With the final stacked spectra, we compute an integrated, observed Ly$\alpha$ surface brightness (SB; \Farcsecsq) used for measuring 1$\sigma$ flux limits and comparing with the literature, and Ly$\alpha$ luminosity surface density (\Lkpcsq) for the intrinsic physical brightness of the halo. To reduce the effects of noise and obtain a robust measurement, we integrate the Ly$\alpha$ line between a $\pm3.5$\Ang ($\approx860km/s$) window centered on the rest wavelength of the line (1215.67\Ang). A median continuum measured in a line-free window ((1195, 1205), (1225, 1236)) is used to subtract off a residual flat continuum before line integration. The results are not affected by changing boundaries of the continuum window.
+
+\subsubsection{Centroid Profile}
+\par It is imperative that the centroid method used in this analysis is both resilient to noise and accurate at measuring the flux distribution. For this paper, we use a median centroid estimator with the negatives (after spectral continuum subtraction) clipped. This method was compared with several other estimators (flux-weighted, gaussian-fit, gaussian-weighted), and was in general agreement.
+
+
+%%% RESULTS %%%
+\section{Results}
+
+\subsection{Galaxy Radial Spectral Stacks}
+We present the biweight galaxy stacks of $\sim$500 galaxies in Figure \ref{fig:Galaxy Spectra vs Radius}. The line window used in all of our measurements is fixed for consistency, and is indicated in the purple shaded region. The continuum located in the core regions fades rapidly to zero by 30kpc due to the PSF, and the blocky scatter in the outer bin is due to high-fiber counts and its systematic flux sensitivity limits. Despite this, the Ly$\alpha$ line is incredibly strong
+
+The most striking thing to note is the significance of the flux persisting to such large radii.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.5\linewidth]{Figures/Halo Spectrum - 0 to 2000kpc - 6-11-26.png}
+    \caption{Galaxy spectra as a function of radius. 1$\sigma$ errors are indicated in the gray shaded regions}
+    \label{fig:Galaxy Spectra vs Radius}
+\end{figure}
+
+\subsection{Surface Brightness Profile}
+Figure \ref{fig:Surface brightness profile compared to PSF} shows the measured SB profile as a function of the angular distance in the sky. The PSF is measured empirically by stars in either field and is shown as a comparison. It is clear that the Ly$\alpha$ halos in our sample is significantly more extended than that produced by the PSF. Note, the flux in the outer regions of the star PSF is occasionally negative due to residual background subtraction.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.5\linewidth]{Figures/PSF_Comparison.png}
+    \caption{Surface brightness of $\approx500$ galaxies as a function of radius (arcsec). The PSF measured from 70? stars in COSMOS and 40? stars in EGS is shows in orange and blue, respectively. The bars represent the 1$\sigma$ errors. The bin sizes in the core are finer to better show the PSF drop-off.}
+    \label{fig:Surface brightness profile compared to PSF}
+\end{figure}
+
+\par The centroid of the Ly$\alpha$ emission line as a function of radius is shown in \ref{?}. The primary result is the clear shift from a red-dominated centroid out past the systemic velocity at $\approx90kpc$, or one virial-radius. Past this point, the centroid remains slightly negative with respect to the systematic, although the noise in these regions suggest it is plausibly consistent with zero.
+
+\section{Discussion}
+% TODO
+
+\section{Conclusions}
+% TODO
+
+%% ============================================================
+
+\begin{acknowledgments}
+% TODO
+\end{acknowledgments}
+
+\begin{contribution}
+% TODO: describe each author's role
+\end{contribution}
+
+\facilities{} % e.g. HST(STIS), VLT(MUSE)
+\software{}   % e.g. astropy, etc.
+
+\bibliographystyle{aasjournalv7.1}
+\bibliography{master}
+
+%% ============================================================
+\section{Appendix}
+% Figure of Niemeyer OIII sample compared to our measurements - shows that our results are consistent with theirs, despite different data reductions, background subtraction, and measurement methods.
+%% ============================================================s
+
+\end{document}

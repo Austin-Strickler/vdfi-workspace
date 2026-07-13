@@ -38,8 +38,10 @@ Relevant code: `smoothing.py` — `smooth_interp_then_gauss` (default: mask the 
 
 "Field-based anomalies" — open thread from the AGN/LAE side (`docs/VDFI Notes.txt`, 2026-02-12): a "trough" problem in the HET data reduction pipeline, flagged as something to chase down at UT Austin. Worth checking whether it has any bearing on background subtraction here (e.g. COSMOS vs. EGS field differences in the correlated outer-bin noise noted in `GOALS.md`), or whether it's unrelated and stays scoped to the AGN/LAE work.
 
-### YYYY-MM-DD
-- *(add findings here)*
+### 2026-07-13
+- The annulus radius used to define the background (`config.bg_inner_arcsec`/`bg_outer_arcsec` in `extract.py`) affects the height of the annular bins — the sky background itself changes as a function of radius, which it shouldn't: stars, and foreground objects generally, are not physically related to the galaxies we're stacking, so a real, physical background shouldn't have this kind of radial dependence. Suspect this is at least partly a boundary effect — some objects sit near the edges of the dataset/field — but the continuum level behaving like a function of distance needs to be chased down rather than assumed benign.
+- The smoothing window width (`config.bg_smooth_sigma_A`, fed to `smooth_interp_then_gauss` in `smoothing.py`) affects the noise in the outer radial bins. Smaller is generally better, up to roughly ~30 Å — haven't yet mapped out where it stops helping or starts hurting below/above that.
+- A full galaxy-level background (pooled across all exposures for a galaxy — `bg_gal` in `extract.py`) is superior to a per-exposure background. Mechanism: each exposure only gets its own background (`bg_per_exp`) if it has `>= config.min_bg_fibers` fibers in the annulus; otherwise it falls back to the galaxy-pooled `bg_gal`. Setting `min_bg_fibers` to something impossibly large (e.g. 99999999) forces every exposure to fail that check and fall back to the pooled galaxy background, which is less noisy than the individual per-exposure ones — effectively a deliberate way to force full galaxy-level pooling instead of exposure-level.
 
 ---
 

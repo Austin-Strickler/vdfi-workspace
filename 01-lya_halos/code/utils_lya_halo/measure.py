@@ -1334,7 +1334,7 @@ def bootstrap_all(
         "meta": {"nboot": nboot, "ngal": ngal, "stack_method": stack_method,
                  "cont_method": cont_method, "cont_order": cont_order,
                  "centroid_method": centroid_method, "clip_negative": clip_negative,
-                 "bounds": bounds, "cont_bounds": cont_bounds,
+                 "bounds": bounds, "cont_bounds": cont_bounds, "seed": seed,
                  "sliced_window": (float(wv[0]), float(wv[-1]))},
     }
     if compute_side_ratio:
@@ -1385,6 +1385,7 @@ def bootstrap_all(
             "error_wave": wave,             # full grid (matches padded arrays)
             "meta": {"nboot": nboot, "ngal": ngal,
                      "stack_method": stack_method, "robust": robust_stack_error,
+                     "seed": seed,
                      "sliced_window": (float(wv[0]), float(wv[-1]))},
         }
     else:
@@ -1394,7 +1395,7 @@ def bootstrap_all(
 
 def measure_all_bins(config: "PipelineConfig", stacks: dict,
                      stack_method: str = None, compute_stack_error: bool = True,
-                     verbose: bool = True) -> dict:
+                     seed: int = None, verbose: bool = True) -> dict:
     """
     Stage 3, config-driven, on the Stage-2 stacks dict.
 
@@ -1408,6 +1409,15 @@ def measure_all_bins(config: "PipelineConfig", stacks: dict,
     method (measure_stack_method) are all read from config, falling back to the
     module DEFAULT_* (imported from config) for older configs that predate those
     fields. stack_method, if passed, overrides config.measure_stack_method.
+
+    seed : bootstrap RNG seed. If not passed explicitly, falls back to
+        config.seed if the config carries one, else 1 (bootstrap_all's own
+        default). Previously this was NOT forwarded at all, so every call
+        silently reused bootstrap_all's hardcoded seed=1 regardless of what
+        the caller intended -- two "different" measure_all_bins runs (e.g.
+        different galaxy subsets) were drawing bootstrap resamples off the
+        exact same RNG stream, which is fine for reproducibility but breaks
+        any attempt to check draw-to-draw stability by varying the seed.
 
     Returns the bootstrap_measurements summary augmented with:
         stack_error  : the bootstrap_stack_error dict (per-pixel), or None
@@ -1438,6 +1448,8 @@ def measure_all_bins(config: "PipelineConfig", stacks: dict,
     cube_w = stacks.get("cube_weights")            # (ngal, nrad) or None
     use_w = cube_w if sm == "weighted_median" else None
 
+    seed = seed if seed is not None else getattr(config, "seed", 1)
+
     # Single merged, window-sliced bootstrap: centroid (+ side ratio) AND the
     # per-pixel stack error from ONE loop. Numerically identical to the former
     # two-loop path (bootstrap_measurements + bootstrap_stack_error) at the same
@@ -1449,7 +1461,7 @@ def measure_all_bins(config: "PipelineConfig", stacks: dict,
         cont_method=cont_method, cont_order=cont_order,
         centroid_method=centroid_method, clip_negative=clip_negative,
         compute_side_ratio=True, compute_stack_error=compute_stack_error,
-        verbose=verbose, weights=use_w,
+        seed=seed, verbose=verbose, weights=use_w,
         sigma_clip_sigma=sc_sigma, sigma_clip_maxiters=sc_maxiters,
     )
 

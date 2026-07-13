@@ -47,9 +47,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy import stats as _stats
 
 from .io import GalaxyProduct
 from .stack import build_stacks, coadd_galaxies
+from .extract import combine_fibers
 from .measure import (
     flux_weighted_centroid, measure_centroid, bootstrap_measurements,
     bootstrap_stack_error, bootstrap_all, stack_galaxies, get_continuum_model,
@@ -100,6 +102,8 @@ __all__ = [
     "plot_error_calibration",
     "windowed_flux_scan",
     "plot_windowed_scan",
+    "combined_bin_significance",
+    "pool_bins_and_bootstrap",
 ]
 
 
@@ -2189,6 +2193,315 @@ def _lya_int_sn(sn_result, lya_rest):
         return None
     li = int(np.argmin(np.abs(waves - lya_rest)))
     return np.abs(isn[:, li])
+
+
+def combined_bin_significance(
+    real_boot: dict,
+    r_min: float | None = None,
+    r_max: float | None = None,
+    bins=None,
+    verbose: bool = True,
+) -> dict:
+    """
+    Combine several radial bins into ONE significance test for "is the mean
+    centroid offset across this radius range really nonzero", using the
+    bootstrap draws ALREADY stored in real_boot['centroid_v_all'] (nboot, nrad).
+
+    Why not just eyeball the per-bin error bars: bootstrap_measurements draws
+    ONE resampled set of galaxies per iteration and reuses that SAME resample
+    for every radial bin (each galaxy has flux in every annulus around it), so
+    a galaxy with an unusual velocity offset pulls several bins in the same
+    direction on the same draw. That makes neighboring bins correlated --
+    treating them as independent (summing z-scores, multiplying p-values)
+    overstates how much independent evidence you actually have. This function
+    builds the full covariance matrix across the chosen bins directly from the
+    existing bootstrap draws (nothing is re-measured, so it's instant) and
+    combines them with the standard inverse-covariance-weighted estimator,
+    which automatically down-weights the shared/correlated component. For
+    comparison it also reports the naive "bins are independent" combination so
+    you can see how much the correlation actually matters.
+
+    Parameters
+    ----------
+    real_boot : bootstrap_measurements() output (needs 'centroid_v_all',
+                'centroid_v_fid', 'r_edges').
+    r_min, r_max : select every bin whose center falls in [r_min, r_max] (same
+                units as r_edges, typically kpc). Ignored if `bins` is given.
+    bins    : explicit iterable of bin indices to combine; overrides r_min/r_max.
+    verbose : print a summary table.
+
+    Returns
+    -------
+    dict with the selected bin geometry ('bins', 'centers'), the number of
+    finite bootstrap draws used, the per-bin vector 'v' (fiducial centroid,
+    km/s), the bin-to-bin 'covariance' and 'correlation' matrices, the
+    covariance-aware combined offset/error/z/p ('combined_offset',
+    'combined_err', 'z_combined', 'p_two_sided', 'p_one_sided_negative'), the
+    whole-vector Mahalanobis test against zero ('D2', 'p_chi2', 'dof'), and the
+    naive independent-bins comparison ('naive_offset', 'naive_err', 'naive_z',
+    'naive_p_two_sided').
+    """
+    v_all = np.asarray(real_boot["centroid_v_all"], dtype=float)
+    v_fid = np.asarray(real_boot["centroid_v_fid"], dtype=float)
+    r_edges, centers = _bin_centers_edges(real_boot["r_edges"])
+
+    if bins is not None:
+        idx = np.asarray(list(bins), dtype=int)
+    else:
+        lo = -np.inf if r_min is None else r_min
+        hi = np.inf if r_max is None else r_max
+        idx = np.where((centers >= lo) & (centers <= hi))[0]
+    if idx.size < 1:
+        raise ValueError(
+            "no bins selected -- check r_min/r_max/bins against "
+            f"real_boot['r_edges'] (bin centers are {np.round(centers, 1).tolist()})")
+    k = idx.size
+
+    X = v_all[:, idx]
+    good = np.all(np.isfinite(X), axis=1)
+    n_valid = int(good.sum())
+    if n_valid < 20 * k:
+        warnings.warn(
+            f"only {n_valid} finite bootstrap draws for {k} bins -- the "
+            "covariance estimate may be noisy; consider more nboot or fewer bins.")
+    X = X[good]
+    v = v_fid[idx]
+
+    Sigma = np.atleast_2d(np.cov(X, rowvar=False))
+    Dsig = np.sqrt(np.diag(Sigma))
+    Corr = Sigma / np.outer(Dsig, Dsig)
+
+    Sigma_inv = np.linalg.pinv(Sigma)
+    ones = np.ones(k)
+    combined_var = 1.0 / float(ones @ Sigma_inv @ ones)
+    combined_offset = combined_var * float(ones @ Sigma_inv @ v)
+    combined_err = np.sqrt(combined_var)
+    z_combined = combined_offset / combined_err
+    p_two = 2 * _stats.norm.sf(abs(z_combined))
+    p_one_neg = _stats.norm.cdf(z_combined)   # P(this negative or more, under H0: true=0)
+
+    D2 = float(v @ Sigma_inv @ v)
+    p_chi2 = float(_stats.chi2.sf(D2, df=k))
+
+    # naive comparison: pretend the bins are independent (diagonal-only)
+    var_i = Dsig ** 2
+    naive_var = 1.0 / np.sum(1.0 / var_i)
+    naive_offset = naive_var * np.sum(v / var_i)
+    naive_err = np.sqrt(naive_var)
+    naive_z = naive_offset / naive_err
+    naive_p_two = 2 * _stats.norm.sf(abs(naive_z))
+
+    result = {
+        "bins": idx, "centers": centers[idx],
+        "n_valid_draws": n_valid, "n_boot": v_all.shape[0],
+        "v": v, "covariance": Sigma, "correlation": Corr,
+        "combined_offset": combined_offset, "combined_err": combined_err,
+        "z_combined": z_combined, "p_two_sided": p_two,
+        "p_one_sided_negative": p_one_neg,
+        "D2": D2, "p_chi2": p_chi2, "dof": k,
+        "naive_offset": naive_offset, "naive_err": naive_err, "naive_z": naive_z,
+        "naive_p_two_sided": naive_p_two,
+    }
+
+    if verbose:
+        print(f"\nCombined significance over {k} bin(s), centers = "
+              f"{np.round(centers[idx], 1).tolist()} kpc "
+              f"({n_valid}/{v_all.shape[0]} bootstrap draws finite in all selected bins)")
+        print(f"{'bin center':>12}  {'v_fid':>8}  {'sqrt(Sigma_ii)':>14}")
+        for j, b in enumerate(idx):
+            print(f"{centers[b]:12.1f}  {v[j]:8.1f}  {Dsig[j]:14.1f}")
+        print("\ncorrelation matrix between selected bins (induced by shared "
+              "galaxies across radii in each bootstrap draw):")
+        print(np.array2string(Corr, precision=2, suppress_small=True))
+        print(f"\n{'method':<28}{'offset':>10}{'error':>10}{'z':>8}{'p (2-sided)':>14}")
+        print(f"{'naive (bins independent)':<28}{naive_offset:10.1f}{naive_err:10.1f}"
+              f"{naive_z:8.2f}{naive_p_two:14.2e}")
+        print(f"{'covariance-aware (correct)':<28}{combined_offset:10.1f}{combined_err:10.1f}"
+              f"{z_combined:8.2f}{p_two:14.2e}")
+        print(f"\nMahalanobis whole-vector test: D^2={D2:.2f}, dof={k}, p={p_chi2:.2e} "
+              "(is the FULL pattern across these bins consistent with all-zero, "
+              "regardless of sign)")
+        print(f"one-sided p (true combined offset < 0): {p_one_neg:.2e}")
+
+    return result
+
+
+def pool_bins_and_bootstrap(
+    stacks: dict,
+    bins=None,
+    r_min: float | None = None,
+    r_max: float | None = None,
+    weight_mode: str = "invvar",
+    real_boot: dict | None = None,
+    bin_weights=None,
+    nboot: int = 1000,
+    seed: int = 1,
+    compute_side_ratio: bool = False,
+    verbose: bool = True,
+    **bootstrap_kwargs,
+) -> dict:
+    """
+    Merge several radial bins into ONE wide bin at the FLUX level -- before any
+    centroid is measured or any bootstrap is run -- then bootstrap that single
+    pooled measurement directly. This is the flux-level counterpart to
+    combined_bin_significance, which instead combines already-measured,
+    already-bootstrapped PER-BIN centroids after the fact using their
+    covariance matrix. Pooling first gives one fresh bootstrap distribution on
+    one merged quantity (no covariance-matrix reconstruction needed), at the
+    cost of a different set of assumptions -- see `weight_mode` below. Treat
+    this as an independent cross-check, not a replacement.
+
+    Because every radial bin in this pipeline is already expressed in the
+    same "per average fiber" surface-brightness unit (nothing here rescales
+    by annulus area), a WEIGHTED combine across the merged bins is the
+    physically correct operation -- summing would produce a quantity with no
+    clean physical meaning. The merge reuses the exact same robust
+    weighted-median combine (extract.combine_fibers) the rest of the pipeline
+    already uses for combining fibers/galaxies; the two `weight_mode` options
+    only change what "weight" means per bin:
+
+      'nfib'   : weight bin j by THIS GALAXY's own fiber count in bin j
+                 (stacks['cube_weights'][i, j]). This is the same merge
+                 single.py's single_galaxy_spectra(merge_bins=...) already
+                 does for one galaxy, generalized here to the whole sample.
+                 Fiber count grows steeply with radius (bigger annulus, more
+                 fibers), so this weighting is dominated by whichever bin in
+                 the group has the most fibers -- for a wide outer group that
+                 is usually the single outermost bin by a large margin. It
+                 answers "what does the fiber-richest bin say", not "what is
+                 the combined signal across the whole range."
+
+      'invvar' : weight bin j by a FIXED, bin-level 1/Var(centroid) computed
+                 from that bin's OWN existing bootstrap (`real_boot` -- the
+                 normal per-bin bootstrap_measurements output you already
+                 have), the same weight for every galaxy regardless of how
+                 many fibers it has there. This answers "combine bins by how
+                 PRECISE their measurement already turned out to be", which is
+                 what you actually want for testing whether the whole range
+                 carries a consistent signal. Needs `real_boot` (or an
+                 explicit `bin_weights=` override) covering the SAME bins as
+                 `bins`/`r_min`/`r_max`. Because the weights are derived from
+                 the same data being re-analyzed, treat the result as an
+                 internal-consistency check on combined_bin_significance, not
+                 a fully independent confirmation.
+
+    Parameters
+    ----------
+    stacks       : build_stacks(..., keep_cube=True) output -- needs
+                   cube_flux, cube_err, cube_weights, rest_wave, r_edges.
+    bins         : explicit bin indices to merge; overrides r_min/r_max.
+    r_min, r_max : select bins by radius range (kpc) instead of explicit
+                   indices.
+    weight_mode  : 'nfib' or 'invvar' (see above).
+    real_boot    : required for weight_mode='invvar' unless bin_weights is
+                   given; supplies centroid_v_all for these same bins.
+    bin_weights  : explicit override for the invvar weight vector (length
+                   must match the number of selected bins); skips deriving it
+                   from real_boot.
+    nboot, seed, compute_side_ratio, verbose, **bootstrap_kwargs :
+                   forwarded to bootstrap_measurements (bounds, cont_method,
+                   centroid_method, stack_method, ...) for the ONE bootstrap
+                   run on the merged bin.
+
+    Returns
+    -------
+    The bootstrap_measurements() dict for the single merged bin (the usual
+    centroid_v_fid/_med/_lo/_hi/_all keys, length-1 along the radial axis),
+    plus 'bins_merged', 'weight_mode', 'bin_weights_used', and 'r_edges'
+    collapsed to [min edge, max edge] of the merged group. If verbose, also
+    prints a z/p summary directly comparable to combined_bin_significance's
+    headline numbers.
+    """
+    cube_flux = np.asarray(stacks["cube_flux"], dtype=float)
+    cube_err = np.asarray(stacks["cube_err"], dtype=float)
+    cube_weights = np.asarray(stacks["cube_weights"], dtype=float)
+    wave = np.asarray(stacks["rest_wave"], dtype=float)
+    r_edges, centers = _bin_centers_edges(stacks["r_edges"])
+
+    if bins is not None:
+        idx = np.sort(np.asarray(list(bins), dtype=int))
+    else:
+        lo = -np.inf if r_min is None else r_min
+        hi = np.inf if r_max is None else r_max
+        idx = np.where((centers >= lo) & (centers <= hi))[0]
+    if idx.size < 1:
+        raise ValueError(
+            "no bins selected -- check r_min/r_max/bins against "
+            f"stacks['r_edges'] (bin centers are {np.round(centers, 1).tolist()})")
+    k = idx.size
+
+    weight_mode = weight_mode.lower()
+    if weight_mode not in ("nfib", "invvar"):
+        raise ValueError("weight_mode must be 'nfib' or 'invvar'")
+
+    fixed_w = None
+    if weight_mode == "invvar":
+        if bin_weights is not None:
+            fixed_w = np.asarray(bin_weights, dtype=float)
+            if fixed_w.size != k:
+                raise ValueError(f"bin_weights has {fixed_w.size} entries, need {k}")
+        else:
+            if real_boot is None:
+                raise ValueError(
+                    "weight_mode='invvar' needs real_boot (the existing per-bin "
+                    "bootstrap_measurements output) or an explicit bin_weights= "
+                    "override to compute 1/variance weights per bin.")
+            rb_edges, rb_centers = _bin_centers_edges(real_boot["r_edges"])
+            if rb_centers.size != centers.size or not np.allclose(rb_centers[idx], centers[idx]):
+                warnings.warn(
+                    "real_boot's bin centers do not match stacks' bin centers "
+                    "for the selected bins -- check they come from the same "
+                    "radial binning before trusting the invvar weights.")
+            var_bin = np.nanvar(np.asarray(real_boot["centroid_v_all"], float)[:, idx], axis=0)
+            var_bin = np.where(var_bin > 0, var_bin, np.nan)
+            fixed_w = 1.0 / var_bin
+            if not np.all(np.isfinite(fixed_w)):
+                raise ValueError(
+                    "one or more selected bins have zero/invalid bootstrap "
+                    "variance in real_boot -- can't form invvar weights.")
+
+    # ---- merge the selected bins into ONE bin, per galaxy ----
+    ngal, _, nwave = cube_flux.shape
+    merged_f = np.full((ngal, nwave), np.nan)
+    merged_e = np.full((ngal, nwave), np.nan)
+    for i in range(ngal):
+        w = cube_weights[i, idx] if weight_mode == "nfib" else fixed_w
+        merged_f[i], merged_e[i] = combine_fibers(
+            cube_flux[i, idx, :], cube_err[i, idx, :],
+            method="weighted_median", weights=w)
+
+    flux_rf = merged_f[:, None, :]     # (ngal, 1, nwave)
+    err_rf = merged_e[:, None, :]
+
+    label = bootstrap_kwargs.pop(
+        "label",
+        f"pooled bin [{weight_mode}] {centers[idx[0]]:.0f}-{centers[idx[-1]]:.0f} kpc")
+    boot = bootstrap_measurements(
+        flux_rf, err_rf, wave, nboot=nboot, seed=seed, verbose=verbose,
+        compute_side_ratio=compute_side_ratio, label=label, **bootstrap_kwargs)
+
+    boot["bins_merged"] = idx
+    boot["weight_mode"] = weight_mode
+    boot["bin_weights_used"] = fixed_w if weight_mode == "invvar" else "nfib (per-galaxy)"
+    boot["r_edges"] = np.array([r_edges[idx.min()], r_edges[idx.max() + 1]])
+    boot["bin_mode"] = stacks.get("bin_mode")
+
+    if verbose:
+        v = float(np.asarray(boot["centroid_v_fid"])[0])
+        lo = float(np.asarray(boot["centroid_v_lo"])[0])
+        hi = float(np.asarray(boot["centroid_v_hi"])[0])
+        err = 0.5 * (hi - lo)
+        z = v / err if err > 0 else np.nan
+        p_two = 2 * _stats.norm.sf(abs(z)) if np.isfinite(z) else np.nan
+        p_one_neg = _stats.norm.cdf(z) if np.isfinite(z) else np.nan
+        print(f"\nPooled bin ({weight_mode}) over centers "
+              f"{np.round(centers[idx], 1).tolist()} kpc -> "
+              f"merged range [{boot['r_edges'][0]:.0f}, {boot['r_edges'][1]:.0f}] kpc")
+        print(f"v_fid = {v:.1f} km/s, bootstrap 16/84 half-width = {err:.1f} km/s, "
+              f"z = {z:.2f}, p(2-sided) = {p_two:.2e}, "
+              f"p(one-sided, true<0) = {p_one_neg:.2e}")
+
+    return boot
 
 
 def summarize_validation(

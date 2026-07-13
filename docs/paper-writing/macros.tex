@@ -1,0 +1,103 @@
+% ============================================================
+%  macros.tex — VDFI paper-writing shortcuts
+% ------------------------------------------------------------
+%  Right after \documentclass{...}, add:
+%     \input{macros.tex}
+%  (Rename to macros.sty and swap in \usepackage{macros} if you
+%  prefer treating it as a package — behaves the same either way.)
+% ============================================================
+
+\usepackage{xspace}
+\usepackage{amsmath}
+
+% ---- optional: robust unit handling, see latex-tips.md ----
+% \usepackage{siunitx}
+% \sisetup{per-mode=symbol}
+
+% ------------------------------------------------------------
+% Ions & emission lines
+% ------------------------------------------------------------
+% \ion is built into AASTeX (aastex63/aastex7). If you are NOT
+% using an AASTeX class, uncomment this fallback definition:
+% \providecommand{\ion}[2]{#1$\;$\textsc{\lowercase{#2}}}
+
+\newcommand{\lya}{Ly$\alpha$\xspace}
+\newcommand{\lyb}{Ly$\beta$\xspace}
+\newcommand{\Ha}{H$\alpha$\xspace}
+\newcommand{\Hb}{H$\beta$\xspace}
+\newcommand{\Hg}{H$\gamma$\xspace}
+\newcommand{\OIII}{[\ion{O}{3}] $\lambda 5007$\xspace}
+\newcommand{\OII}{[\ion{O}{2}] $\lambda 3727$\xspace}
+\newcommand{\NII}{[\ion{N}{2}]\xspace}
+\newcommand{\CIV}{\ion{C}{4} $\lambda 1549$\xspace}
+\newcommand{\HI}{\ion{H}{1}\xspace}
+
+% ------------------------------------------------------------
+% Angstrom — works outside math mode, spaces itself correctly
+% ------------------------------------------------------------
+% \AA is LaTeX's built-in Angstrom symbol, but it's a control
+% WORD, so TeX silently swallows the space that follows it:
+%   "5007\AA emission"   typesets as   "5007Åemission"  (no space!)
+% \xspace fixes this by inserting a space unless the next token
+% is punctuation or another space, so you never have to remember
+% a trailing "\ " or "{}" yourself.
+%
+% Two versions:
+%   \AAns  — raw symbol, NO auto-space. Use when compounding
+%            (e.g. building a unit like erg/s/cm^2/Angstrom).
+%   \Ang   — auto-spacing version for standalone use in text.
+% Named \Ang (capital A) rather than \ang so it doesn't collide
+% with siunitx's \ang{} command, which means "degrees".
+\newcommand{\AAns}{\AA}
+\newcommand{\Ang}{\AAns\xspace}
+
+% ------------------------------------------------------------
+% Approximate / order-of-magnitude symbols
+% ------------------------------------------------------------
+% \ensuremath lets these drop straight into running text with no
+% manual $ $, and won't error if you happen to use them inside an
+% existing math environment. See latex-tips.md for \sim vs \approx
+% vs \simeq conventions.
+\newcommand{\sm}{\ensuremath{\sim}\xspace}          % order-of-magnitude / "roughly": z\sm2
+\newcommand{\ap}{\ensuremath{\approx}\xspace}        % numeric approx equality: x\ap3.14
+\newcommand{\simeqsym}{\ensuremath{\simeq}\xspace}   % "approximately equal to" / similarity
+
+% ------------------------------------------------------------
+% Common astro quantities & units
+% ------------------------------------------------------------
+\newcommand{\Msun}{M$_{\odot}$\xspace}
+\newcommand{\Lsun}{L$_{\odot}$\xspace}
+\newcommand{\kpc}{kpc\xspace}
+\newcommand{\Mpc}{Mpc\xspace}
+\newcommand{\kms}{km\,s$^{-1}$\xspace}
+\newcommand{\ergs}{erg\,s$^{-1}$\xspace}
+\newcommand{\ergscmsq}{erg\,s$^{-1}$\,cm$^{-2}$\xspace}
+\newcommand{\ergscmsqA}{erg\,s$^{-1}$\,cm$^{-2}$\,\AAns$^{-1}$\xspace}
+\newcommand{\SFR}{SFR\xspace}
+\newcommand{\zsys}{$z_{\rm sys}$\xspace}
+
+% ------------------------------------------------------------
+% Area / surface-brightness units
+% ------------------------------------------------------------
+% Macro names can't contain digits (LaTeX control words are
+% letters-only) -- "kpc^2" etc. become \kpcsq / \arcsecsq rather
+% than \kpc2. (\ergscmsq / \ergscmsqA above are named this way for
+% the same reason -- \ergscm2 would NOT be a valid macro name and
+% will corrupt the rest of the preamble parse if you try it.)
+% Composed units are spelled out in full rather than nesting other
+% \xspace macros, so spacing stays predictable.
+\newcommand{\kpcsq}{kpc$^{2}$\xspace}
+\newcommand{\arcsecsq}{arcsec$^{2}$\xspace}
+\newcommand{\Lkpcsq}{erg\,s$^{-1}$\,kpc$^{-2}$\xspace}          % L / kpc^2 -- physical (deprojected) luminosity surface density
+\newcommand{\Farcsecsq}{erg\,s$^{-1}$\,cm$^{-2}$\,arcsec$^{-2}$\xspace}  % F / arcsec^2 -- observed surface brightness
+
+% ------------------------------------------------------------
+% Usage, once inside \begin{document}:
+%
+%   The object is bright in \lya, but faint in \Hb and \OIII.
+%   The line sits at 5007\Ang, right next to the doublet.
+%   The sample spans z\sm2 to z\sm3.
+%   The measured flux is 3.2\ap3.4 $\times$ 10$^{-17}$ \ergscmsq.
+%   The halo covers $\sm$40 \kpcsq (14 \arcsecsq at this redshift).
+%   Central SB: $10^{40}$ \Lkpcsq; observed SB limit: $10^{-18}$ \Farcsecsq.
+% ------------------------------------------------------------
