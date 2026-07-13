@@ -665,6 +665,45 @@ def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
     return r_mid, xerr
 
 
+def _safe_yerr(center, lo, hi):
+    """
+    Asymmetric errorbar lengths from a bootstrap 16/84 band, guarded against
+    the plotted center falling outside its own band.
+
+    matplotlib's errorbar raises ValueError on a negative yerr length. That
+    happens whenever `center` is NOT itself a statistic of the [lo, hi]
+    percentile distribution -- e.g. plotting the FIDUCIAL (full-sample) point
+    estimate against BOOTSTRAP percentiles. The two are only guaranteed
+    consistent when center is the bootstrap median (p16 <= p50 <= p84 always
+    holds for percentiles of the same array); a fiducial point estimate has no
+    such guarantee and can land outside its own band, especially for a
+    ratio-type statistic (e.g. blue/(blue+red)) in a faint bin where the
+    denominator is near zero. Same guard convention as validation.py's
+    injection-recovery plot (`np.clip(rec - lo, 0, None)`), centralized here
+    and paired with a mask so the offending points can be flagged rather than
+    silently clipped.
+
+    Returns
+    -------
+    yerr     : (2, N) array [center-lo, hi-center], each floored at 0 -- safe
+               to pass straight to ax.errorbar(..., yerr=yerr).
+    unstable : (N,) bool -- True where center was outside [lo, hi] (before
+               flooring) at a finite point, i.e. where flooring actually did
+               something. Caller should mark these (e.g. hollow marker) so the
+               instability stays visible instead of vanishing into a clipped
+               bar. NaN entries (missing/failed bins) are never flagged.
+    """
+    center = np.asarray(center, dtype=float)
+    lo = np.asarray(lo, dtype=float)
+    hi = np.asarray(hi, dtype=float)
+    lo_err = center - lo
+    hi_err = hi - center
+    finite = np.isfinite(lo_err) & np.isfinite(hi_err)
+    unstable = finite & ((lo_err < 0) | (hi_err < 0))
+    yerr = np.vstack([np.clip(lo_err, 0, None), np.clip(hi_err, 0, None)])
+    return yerr, unstable
+
+
 def plot_centroid_vs_radius(
     boot, radial_bins, VR_biweight_v=None, VR_biweight=None,
     stacks_result=None, bin_mode=None,
@@ -701,13 +740,17 @@ def plot_centroid_vs_radius(
     v_med = np.asarray(boot["centroid_v_med"])
     v_lo = np.asarray(boot["centroid_v_lo"])
     v_hi = np.asarray(boot["centroid_v_hi"])
-    yerr = np.vstack([v_med - v_lo, v_hi - v_med])
+    yerr, unstable = _safe_yerr(v_med, v_lo, v_hi)
 
     fig, ax = plt.subplots(figsize=figsize)
     r_mid, xerr = _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v,
                                      VR_biweight, vr_ticks, xlims)
-    ax.errorbar(r_mid, v_med, xerr=xerr, yerr=yerr, fmt="o",
-                capsize=3.5, ms=6, lw=1.5, label=label)
+    eb = ax.errorbar(r_mid, v_med, xerr=xerr, yerr=yerr, fmt="o",
+                     capsize=3.5, ms=6, lw=1.5, label=label)
+    if np.any(unstable):
+        ax.scatter(r_mid[unstable], v_med[unstable], s=70, facecolors="none",
+                   edgecolors=eb[0].get_color(), linewidths=1.3, zorder=5,
+                   label="fiducial outside 16–84 band")
 
     if add_point is not None:
         for i in range(add_point.shape[0]):
@@ -807,10 +850,18 @@ def plot_blue_red_vs_radius(
         red_hi = np.where(np.isfinite(red_hi) & (red_hi > fl), red_hi, fl)
         ax.set_yscale("log")
 
-    ax.errorbar(r_mid, blue, xerr=xerr, yerr=np.vstack([blue - blue_lo, blue_hi - blue]),
+    blue_yerr, blue_unstable = _safe_yerr(blue, blue_lo, blue_hi)
+    red_yerr, red_unstable = _safe_yerr(red, red_lo, red_hi)
+    ax.errorbar(r_mid, blue, xerr=xerr, yerr=blue_yerr,
                 fmt="o-", color="tab:blue", capsize=3.5, ms=6, lw=1.5, label="Blue-side flux")
-    ax.errorbar(r_mid, red, xerr=xerr, yerr=np.vstack([red - red_lo, red_hi - red]),
+    ax.errorbar(r_mid, red, xerr=xerr, yerr=red_yerr,
                 fmt="s-", color="tab:red", capsize=3.5, ms=6, lw=1.5, label="Red-side flux")
+    if np.any(blue_unstable):
+        ax.scatter(r_mid[blue_unstable], blue[blue_unstable], s=70, facecolors="none",
+                   edgecolors="tab:blue", linewidths=1.3, zorder=5)
+    if np.any(red_unstable):
+        ax.scatter(r_mid[red_unstable], red[red_unstable], s=70, facecolors="none",
+                   edgecolors="tab:red", linewidths=1.3, zorder=5)
     if not logy:
         ax.axhline(0, color="0.5", lw=1, alpha=0.7)
 
@@ -826,9 +877,13 @@ def plot_blue_red_vs_radius(
         ratio = np.asarray(boot["blue_over_red" + suff])
         r_lo = np.asarray(boot["blue_over_red_lo"]); r_hi = np.asarray(boot["blue_over_red_hi"])
         ax_ratio = ax.twinx()
-        ax_ratio.errorbar(r_mid, ratio, yerr=np.vstack([ratio - r_lo, r_hi - ratio]),
+        ratio_yerr, ratio_unstable = _safe_yerr(ratio, r_lo, r_hi)
+        ax_ratio.errorbar(r_mid, ratio, yerr=ratio_yerr,
                           fmt="D:", color="0.35", ms=4, lw=1, capsize=2.5, alpha=0.8,
                           label="blue / red")
+        if np.any(ratio_unstable):
+            ax_ratio.scatter(r_mid[ratio_unstable], ratio[ratio_unstable], s=50,
+                             facecolors="none", edgecolors="0.35", linewidths=1.2, zorder=5)
         ax_ratio.axhline(1.0, color="0.6", ls=":", lw=1, alpha=0.7)
         ax_ratio.set_ylabel("blue / red", color="0.35")
         ax_ratio.tick_params(axis="y", labelcolor="0.35")
@@ -883,8 +938,12 @@ def plot_centroid_comparison(
         v = np.asarray(b["centroid_v_med"])
         lo = np.asarray(b["centroid_v_lo"]); hi = np.asarray(b["centroid_v_hi"])
         jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
-        ax.errorbar(jit, v, yerr=np.vstack([v - lo, hi - v]), fmt="o-",
-                    capsize=3, ms=5, lw=1.3, label=lab)
+        yerr, unstable = _safe_yerr(v, lo, hi)
+        eb = ax.errorbar(jit, v, yerr=yerr, fmt="o-",
+                         capsize=3, ms=5, lw=1.3, label=lab)
+        if np.any(unstable):
+            ax.scatter(jit[unstable], v[unstable], s=70, facecolors="none",
+                       edgecolors=eb[0].get_color(), linewidths=1.3, zorder=5)
     ax.axhline(0, color="tomato", alpha=0.4, lw=1)
     ax.set_ylim(ylims)
     ax.set_ylabel(r"Ly$\alpha$ centroid velocity [km s$^{-1}$]")
@@ -925,8 +984,12 @@ def plot_radial_overlay(
         lo, hi = s.get("lo"), s.get("hi")
         if lo is not None and hi is not None:
             lo = np.asarray(lo, dtype=float); hi = np.asarray(hi, dtype=float)
-            ax.errorbar(jit, y, yerr=np.vstack([y - lo, hi - y]), fmt=s.get("fmt", "o-"),
-                        capsize=3, ms=5, lw=1.3, label=s["label"])
+            yerr, unstable = _safe_yerr(y, lo, hi)
+            eb = ax.errorbar(jit, y, yerr=yerr, fmt=s.get("fmt", "o-"),
+                             capsize=3, ms=5, lw=1.3, label=s["label"])
+            if np.any(unstable):
+                ax.scatter(jit[unstable], y[unstable], s=70, facecolors="none",
+                          edgecolors=eb[0].get_color(), linewidths=1.3, zorder=5)
         else:
             ax.errorbar(jit, y, fmt=s.get("fmt", "o-"), ms=5, lw=1.3, label=s["label"])
     if zero_line is not None and not logy:

@@ -19,7 +19,7 @@ needs higher S/N and spectral resolution than the binned stacks have. Instead
 a cheap, robust "side ratio" (summed continuum-subtracted flux blue vs red of
 line center) is provided as a coarse asymmetry proxy.
 
-This module has three layers:
+This module has four layers:
 
   1. Per-spectrum measurement (operate on one (nwave,) stacked spectrum):
         fit_local_poly_continuum   -- robust sigma-clipped sideband polynomial
@@ -43,12 +43,23 @@ This module has three layers:
         bootstrap_measurements     -- centroid (+ side ratio) per bin, with 16/84
         bootstrap_stack_error      -- per-pixel 1-sigma flux error per bin
 
+  4. Derived radial diagnostics -- operate on a measure_all_bins / bootstrap_all
+     SUMMARY dict (not raw arrays), so they run AFTER Stage 3, not inside it:
+        flux_curve_of_growth      -- cumulative Lya luminosity and flux fraction
+                                      vs radius, built from total_flux_fid/_all
+                                      (the already-bootstrapped windowed flux)
+                                      times a representative per-galaxy fiber
+                                      footprint (fiber_area_kpc2, from the L_kpc2
+                                      unit conversion), cumulatively summed out to
+                                      a configurable r_max.
+
 All functions take plain arrays (no PipelineConfig required) so they drop
 straight into a notebook. LYA_REST defaults to 1215.67 (== PipelineConfig.LYA_REST).
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -1493,3 +1504,206 @@ def measure_single_galaxy(sg: dict, *, method=DEFAULT_CENTROID_METHOD,
 
     return {"r_edges": r_edges, "centroid_v": cen_v, "flux": fx,
            "flux_err": fxe, "sn": np.asarray(sg["sn"]), "method": method}
+
+
+# =====================================================================
+# 4. DERIVED RADIAL DIAGNOSTICS (post-bootstrap)
+# =====================================================================
+
+def flux_curve_of_growth(
+    boot: dict,
+    stacks: dict | None = None,
+    r_max_kpc: float | None = None,
+    drop_last_bin: bool = True,
+    area_combine: str = "biweight",
+    verbose: bool = True,
+) -> dict:
+    """
+    Cumulative Lya luminosity and flux fraction vs radius ("curve of growth"),
+    built on top of a measure_all_bins / bootstrap_all summary dict.
+
+    Converts the already-bootstrapped windowed flux per bin (total_flux_fid =
+    blue_flux_fid + red_flux_fid, in whatever y_unit the stack is in -- L_kpc2
+    by default, i.e. a Lya surface-density) back into a luminosity by
+    multiplying by a representative fiber footprint area (fiber_area_kpc2, a
+    per-galaxy (ngal,) array stashed in unit_info by stack.convert_avg_fiber_bin
+    -- it depends only on each galaxy's redshift, not on the radial bin, so ONE
+    representative value applies at every radius), then cumulatively sums bins
+    from the center outward.
+
+    total_flux_fid * area = the luminosity an average fiber would capture at
+    that radius, NOT a true annulus-integrated (2*pi*r*dr) total -- this is a
+    fiber-footprint curve of growth, consistent with how every other radial
+    quantity in this pipeline is defined (one average-fiber measurement per
+    bin), not a full azimuthally-integrated light profile.
+
+    Parameters
+    ----------
+    boot : dict
+        Output of measure_all_bins / bootstrap_all / bootstrap_measurements.
+        Needs total_flux_fid (and, for error bands, total_flux_all) plus
+        r_edges and unit_info -- measure_all_bins already carries all three
+        through from `stacks`, so passing `stacks` again is usually optional.
+    stacks : dict, optional
+        Falls back here for r_edges / unit_info if not present on `boot`
+        (e.g. boot came from the lower-level bootstrap_measurements/bootstrap_all
+        instead of measure_all_bins).
+    r_max_kpc : float or None
+        Outer radius (kpc) to sum out to. Must land exactly on a bin edge in
+        r_edges (bins are discrete; a fractional bin isn't well-defined here).
+        None (default) -> governed by `drop_last_bin` instead.
+    drop_last_bin : bool
+        When r_max_kpc is None, True (default) sums out to r_edges[-2],
+        i.e. EXCLUDES the outermost bin (its bootstrap errors and area both
+        blow up fastest, so it's a poor default contributor to a cumulative
+        total). False includes every bin out to r_edges[-1].
+    area_combine : {'biweight', 'median', 'mean'}
+        How the per-galaxy fiber_area_kpc2 array is reduced to the single
+        representative area multiplied into every bin. Default 'biweight'
+        matches stack_galaxies' default galaxy-combine method, so the area is
+        consistent with how the flux itself was stacked.
+    verbose : bool
+        Emit warnings (see below). Set False to silence them (the values
+        returned are identical either way).
+
+    Bad bins (warn, then propagate as measured -- this IS the measurement, not
+    hidden): a NaN total_flux_fid bin makes every cumulative bin from that
+    point outward NaN (plain np.cumsum, not nan-safe, by design); a negative
+    net-flux bin (noise-driven, most often the faint outer bins) makes the
+    cumulative curve locally non-monotonic. Both are warned about but left in
+    the output uncorrected.
+
+    Returns
+    -------
+    dict
+        r_edges_used         (n_bins+1,)  bin edges actually summed over
+        flux_bin_fid          (n_bins,)    per-bin luminosity (total_flux_fid * area)
+        flux_cumulative_fid   (n_bins,)    running total, center -> r_max
+        flux_cumulative_lo/_hi (n_bins,)   16/84 bootstrap band (NaN if
+                                            total_flux_all unavailable)
+        flux_cumulative_all   (nboot, n_bins) or None
+        flux_fraction_fid      (n_bins,)   flux_cumulative_fid / its last value
+        flux_fraction_lo/_hi   (n_bins,)   16/84 band, computed PER DRAW
+                                            (cum_draw / cum_draw[-1]) then
+                                            percentiled -- NOT a ratio of the
+                                            cumulative percentiles
+        flux_fraction_all      (nboot, n_bins) or None
+        fiber_area_kpc2_used   float        the representative area applied
+        unit_info              dict         passed through, for the y-unit label
+        meta                   dict         area_combine, n_bins, r_max_kpc,
+                                             drop_last_bin, n_nan_bins,
+                                             n_negative_bins
+    """
+    if "total_flux_fid" not in boot:
+        raise KeyError("boot does not contain total_flux_fid; re-run the bootstrap with "
+                       "compute_side_ratio=True (the default).")
+
+    r_edges = np.asarray(
+        boot.get("r_edges", (stacks or {}).get("r_edges")), dtype=float)
+    if r_edges.size == 0:
+        raise KeyError("no r_edges found on boot or stacks.")
+
+    unit_info = boot.get("unit_info") or (stacks or {}).get("unit_info") or {}
+    fiber_area_kpc2 = unit_info.get("fiber_area_kpc2")
+    if fiber_area_kpc2 is None:
+        raise KeyError(
+            "unit_info has no fiber_area_kpc2 -- flux_curve_of_growth needs the "
+            "stack built with flux_unit='L_kpc2' (the default), which is the "
+            "only output mode that records the per-galaxy fiber footprint.")
+    fiber_area_kpc2 = np.asarray(fiber_area_kpc2, dtype=float)
+
+    if area_combine == "biweight":
+        area = float(biweight_location(fiber_area_kpc2, ignore_nan=True))
+    elif area_combine == "median":
+        area = float(np.nanmedian(fiber_area_kpc2))
+    elif area_combine == "mean":
+        area = float(np.nanmean(fiber_area_kpc2))
+    else:
+        raise ValueError("area_combine must be 'biweight', 'median', or 'mean'")
+
+    total_flux_fid = np.asarray(boot["total_flux_fid"], dtype=float)
+    nrad = total_flux_fid.size
+    flux_bin_fid_full = total_flux_fid * area
+
+    # --- resolve how many bins to sum ---
+    if r_max_kpc is not None:
+        idx = np.where(np.isclose(r_edges, r_max_kpc, rtol=1e-3, atol=1e-6))[0]
+        if idx.size == 0:
+            raise ValueError(
+                f"r_max_kpc={r_max_kpc!r} does not match any edge in r_edges="
+                f"{r_edges.tolist()}; pass an exact bin edge, or leave "
+                f"r_max_kpc=None and use drop_last_bin instead.")
+        n_bins = int(idx[0])
+    else:
+        n_bins = (nrad - 1) if drop_last_bin else nrad
+    if n_bins < 1:
+        raise ValueError(
+            f"n_bins resolved to {n_bins} (<1); check r_max_kpc/drop_last_bin "
+            f"against r_edges={r_edges.tolist()}.")
+
+    sl = slice(0, n_bins)
+    r_edges_used = r_edges[: n_bins + 1]
+    flux_bin_fid = flux_bin_fid_full[sl]
+
+    # --- warn (not hide) on bad bins within the summed range ---
+    n_nan = int(np.sum(~np.isfinite(flux_bin_fid)))
+    n_neg = int(np.sum(np.isfinite(flux_bin_fid) & (flux_bin_fid < 0)))
+    if verbose and n_nan:
+        warnings.warn(
+            f"flux_curve_of_growth: {n_nan} bin(s) within r_max have a NaN "
+            f"total_flux_fid; the cumulative curve is NaN from that bin outward "
+            f"(propagated, not masked).")
+    if verbose and n_neg:
+        warnings.warn(
+            f"flux_curve_of_growth: {n_neg} bin(s) within r_max have negative "
+            f"net flux (noise-driven, typically the faint outer bins); the "
+            f"cumulative curve may be locally non-monotonic -- this reflects "
+            f"the actual measurement and is left uncorrected.")
+
+    flux_cumulative_fid = np.cumsum(flux_bin_fid)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        flux_fraction_fid = flux_cumulative_fid / flux_cumulative_fid[-1]
+
+    # --- bootstrap bands: cumsum/fraction PER DRAW, then percentile ---
+    flux_cumulative_all = flux_fraction_all = None
+    flux_cumulative_lo = np.full(n_bins, np.nan)
+    flux_cumulative_hi = np.full(n_bins, np.nan)
+    flux_fraction_lo = np.full(n_bins, np.nan)
+    flux_fraction_hi = np.full(n_bins, np.nan)
+    if "total_flux_all" in boot:
+        total_flux_all = np.asarray(boot["total_flux_all"], dtype=float)  # (nboot, nrad)
+        flux_bin_all = total_flux_all[:, sl] * area
+        flux_cumulative_all = np.cumsum(flux_bin_all, axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            flux_fraction_all = flux_cumulative_all / flux_cumulative_all[:, -1][:, None]
+        flux_cumulative_lo = np.nanpercentile(flux_cumulative_all, 16, axis=0)
+        flux_cumulative_hi = np.nanpercentile(flux_cumulative_all, 84, axis=0)
+        flux_fraction_lo = np.nanpercentile(flux_fraction_all, 16, axis=0)
+        flux_fraction_hi = np.nanpercentile(flux_fraction_all, 84, axis=0)
+    elif verbose:
+        warnings.warn(
+            "flux_curve_of_growth: boot has no total_flux_all; returning the "
+            "fiducial curve only (no bootstrap error bands).")
+
+    return {
+        "r_edges_used": r_edges_used,
+        "flux_bin_fid": flux_bin_fid,
+        "flux_cumulative_fid": flux_cumulative_fid,
+        "flux_cumulative_lo": flux_cumulative_lo,
+        "flux_cumulative_hi": flux_cumulative_hi,
+        "flux_cumulative_all": flux_cumulative_all,
+        "flux_fraction_fid": flux_fraction_fid,
+        "flux_fraction_lo": flux_fraction_lo,
+        "flux_fraction_hi": flux_fraction_hi,
+        "flux_fraction_all": flux_fraction_all,
+        "fiber_area_kpc2_used": area,
+        "unit_info": unit_info,
+        "meta": {
+            "area_combine": area_combine,
+            "n_bins": n_bins,
+            "r_max_kpc": float(r_edges_used[-1]),
+            "drop_last_bin": drop_last_bin,
+            "n_nan_bins": n_nan,
+            "n_negative_bins": n_neg,
+        },
+    }

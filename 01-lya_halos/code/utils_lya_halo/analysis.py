@@ -27,6 +27,12 @@ setup:
     analysis.plot_asymmetry_profile(boot, stacks)
     analysis.plot_moments_profile(stacks)
 
+    # Curve of growth (cumulative flux / flux fraction vs radius; drops the
+    # outermost bin by default -- see measure.flux_curve_of_growth)
+    from utils_lya_halo import measure
+    cog = measure.flux_curve_of_growth(boot, stacks)
+    analysis.plot_flux_curve_of_growth(cog, stacks)
+
     # Bootstrap health checks
     analysis.plot_success_frac(boot, stacks)
     analysis.plot_bootstrap_draws(boot, radial_index=0)
@@ -80,7 +86,7 @@ from .measure import (
     LYA_REST, C_KMS,
 )
 from .plotting import (
-    _setup_radius_axis, _resolve_bin_mode, _get_vr_biweight_v,
+    _setup_radius_axis, _resolve_bin_mode, _get_vr_biweight_v, _safe_yerr,
     plot_centroid_vs_radius, plot_blue_red_vs_radius,
     plot_centroid_comparison, plot_radial_overlay,
     _mark_lines,
@@ -477,9 +483,13 @@ def plot_centroid_methods(
         v = np.asarray(b["centroid_v" + suff])
         lo = np.asarray(b["centroid_v_lo"]); hi = np.asarray(b["centroid_v_hi"])
         jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
-        ax.errorbar(jit, v, yerr=np.vstack([v - lo, hi - v]), fmt="o-",
-                    capsize=3, ms=5, lw=1.3,
-                    label=CENTROID_METHOD_LABELS.get(lab, lab))
+        yerr, unstable = _safe_yerr(v, lo, hi)
+        eb = ax.errorbar(jit, v, yerr=yerr, fmt="o-",
+                         capsize=3, ms=5, lw=1.3,
+                         label=CENTROID_METHOD_LABELS.get(lab, lab))
+        if np.any(unstable):
+            ax.scatter(jit[unstable], v[unstable], s=70, facecolors="none",
+                       edgecolors=eb[0].get_color(), linewidths=1.3, zorder=5)
     ax.axhline(0, color="tomato", alpha=0.4, lw=1)
     ax.set_ylim(ylims)
     ax.set_ylabel(r"Ly$\alpha$ centroid velocity [km s$^{-1}$]")
@@ -721,9 +731,14 @@ def plot_flux_profile(
 
     fig, ax = plt.subplots(figsize=figsize)
     r_mid, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims)
-    ax.errorbar(r_mid, y, xerr=xerr, yerr=np.vstack([y - y_lo, y_hi - y]),
+    yerr, unstable = _safe_yerr(y, y_lo, y_hi)
+    ax.errorbar(r_mid, y, xerr=xerr, yerr=yerr,
                 fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:blue",
                 label="integrated flux (bootstrap 16–84)")
+    if np.any(unstable):
+        ax.scatter(r_mid[unstable], y[unstable], s=70, facecolors="none",
+                   edgecolors="tab:blue", linewidths=1.3, zorder=5,
+                   label="fiducial outside 16–84 band")
     ax.axhline(0, color="0.7", lw=0.7)
     if logy:
         pos = y[y > 0]
@@ -742,6 +757,103 @@ def plot_flux_profile(
         plt.savefig(savename, dpi=300, bbox_inches="tight")
     plt.show()
     return fig, ax
+
+
+def plot_flux_curve_of_growth(
+    cog: dict,
+    stacks: dict | None = None,
+    r_edges=None,
+    bin_mode=None,
+    VR_biweight_v=None,
+    vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    logy: bool = True,
+    xlims=None,
+    figsize=(7.2, 8.0),
+    save_fig: bool = False,
+    savename: str = "Figure_flux_curve_of_growth.png",
+):
+    """
+    Two-panel Lyα curve of growth: (top) cumulative luminosity vs radius,
+    center outward; (bottom) the same, normalized to a flux FRACTION of the
+    total summed out to r_max. Both panels show the bootstrap 16-84 band.
+
+    Takes `cog`, the dict returned by measure.flux_curve_of_growth -- this
+    function only DRAWS it (measure.py computes, analysis.py draws, same split
+    as every other profile here). `stacks` is optional and only used as a
+    fallback for bin_mode / VR_biweight_v (cog itself does not carry them):
+
+        cog = measure.flux_curve_of_growth(boot, stacks)   # r_max_kpc=None ->
+                                                             # drops the last bin
+        analysis.plot_flux_curve_of_growth(cog, stacks)
+
+    The top panel's y-unit is derived from cog['unit_info']['y_unit'] with the
+    '/kpc^2' stripped (multiplying by the fiber area cancels it) -- same
+    fiber-footprint convention as plot_flux_profile's total_flux_fid, not a
+    true annulus-integrated luminosity (see measure.flux_curve_of_growth).
+    """
+    for key in ("flux_cumulative_fid", "flux_fraction_fid"):
+        if key not in cog:
+            raise KeyError(f"cog missing {key!r}; pass the dict returned by "
+                           "measure.flux_curve_of_growth.")
+
+    radial_bins = np.asarray(r_edges if r_edges is not None else cog["r_edges_used"])
+    bm  = _resolve_bin_mode(bin_mode, stacks)
+    vr  = _get_vr_biweight_v(VR_biweight_v, stacks)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+
+    # panel 1: cumulative luminosity
+    r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims)
+    y    = np.asarray(cog["flux_cumulative_fid"])
+    y_lo = np.asarray(cog["flux_cumulative_lo"])
+    y_hi = np.asarray(cog["flux_cumulative_hi"])
+    yerr, unstable = _safe_yerr(y, y_lo, y_hi)
+    ax1.errorbar(r_mid, y, xerr=xerr, yerr=yerr,
+                fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:green",
+                label="cumulative flux (bootstrap 16–84)")
+    if np.any(unstable):
+        ax1.scatter(r_mid[unstable], y[unstable], s=70, facecolors="none",
+                   edgecolors="tab:green", linewidths=1.3, zorder=5,
+                   label="fiducial outside 16–84 band")
+    ax1.axhline(0, color="0.7", lw=0.7)
+    if logy:
+        pos = y[y > 0]
+        if len(pos):
+            ax1.set_yscale("log")
+            ax1.set_ylim(pos.min() * 0.3, y.max() * 3)
+    base_unit = (cog.get("unit_info") or {}).get("y_unit", "")
+    lum_unit = base_unit.replace("/kpc^2", "") if "kpc^2" in base_unit else base_unit
+    ax1.set_ylabel(f"Cumulative Lyα luminosity [{lum_unit}]" if lum_unit
+                   else "Cumulative Lyα luminosity")
+    ax1.set_title(f"Lyα curve of growth (r_max = {cog['meta']['r_max_kpc']:g} kpc)")
+    ax1.legend(frameon=False, fontsize=9)
+    ax1.grid(alpha=0.15)
+
+    # panel 2: flux fraction
+    r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims)
+    fy    = np.asarray(cog["flux_fraction_fid"])
+    fy_lo = np.asarray(cog["flux_fraction_lo"])
+    fy_hi = np.asarray(cog["flux_fraction_hi"])
+    fyerr, funstable = _safe_yerr(fy, fy_lo, fy_hi)
+    ax2.errorbar(r_mid2, fy, xerr=xerr2, yerr=fyerr,
+                fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:orange",
+                label="flux fraction (bootstrap 16–84)")
+    if np.any(funstable):
+        ax2.scatter(r_mid2[funstable], fy[funstable], s=70, facecolors="none",
+                   edgecolors="tab:orange", linewidths=1.3, zorder=5)
+    ax2.axhline(0.5, color="0.5", lw=0.8, ls="--", label="half-light radius")
+    ax2.axhline(1.0, color="0.7", lw=0.6)
+    ax2.set_ylim(0, 1.1)
+    ax2.set_ylabel(r"Flux fraction  $L(<r) / L(<r_{\rm max})$")
+    ax2.set_title("Lyα flux fraction vs. radius")
+    ax2.legend(frameon=False, fontsize=9)
+    ax2.grid(alpha=0.15)
+
+    plt.tight_layout()
+    if save_fig:
+        plt.savefig(savename, dpi=300, bbox_inches="tight")
+    plt.show()
+    return fig, (ax1, ax2)
 
 
 def plot_asymmetry_profile(
@@ -804,9 +916,13 @@ def plot_asymmetry_profile(
 
     # panel 1: blue fraction
     r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims)
-    ax1.errorbar(r_mid, bfrac_fid, xerr=xerr,
-                 yerr=np.vstack([bfrac_fid - bfrac_lo, bfrac_hi - bfrac_fid]),
+    yerr1, unstable1 = _safe_yerr(bfrac_fid, bfrac_lo, bfrac_hi)
+    ax1.errorbar(r_mid, bfrac_fid, xerr=xerr, yerr=yerr1,
                  fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:purple")
+    if np.any(unstable1):
+        ax1.scatter(r_mid[unstable1], bfrac_fid[unstable1], s=70, facecolors="none",
+                    edgecolors="tab:purple", linewidths=1.3, zorder=5,
+                    label="fiducial outside 16–84 band")
     ax1.axhline(0.5, color="0.5", lw=0.8, ls="--", label="symmetric (B/total = 0.5)")
     ax1.set_ylim(0, 1)
     ax1.set_ylabel("Blue fraction  B / (B+R)")
@@ -821,12 +937,18 @@ def plot_asymmetry_profile(
     bf_lo = np.asarray(boot["blue_flux_lo"]);  bf_hi = np.asarray(boot["blue_flux_hi"])
     rf_lo = np.asarray(boot["red_flux_lo"]);   rf_hi = np.asarray(boot["red_flux_hi"])
     dx = (r_mid[1] - r_mid[0]) * 0.05 if len(r_mid) > 1 else 0
-    ax2.errorbar(r_mid - dx, bf, xerr=xerr2,
-                 yerr=np.vstack([bf - bf_lo, bf_hi - bf]),
+    bf_yerr, bf_unstable = _safe_yerr(bf, bf_lo, bf_hi)
+    rf_yerr, rf_unstable = _safe_yerr(rf, rf_lo, rf_hi)
+    ax2.errorbar(r_mid - dx, bf, xerr=xerr2, yerr=bf_yerr,
                  fmt="o", capsize=3, ms=5, lw=1.3, color="royalblue", label="blue flux")
-    ax2.errorbar(r_mid + dx, rf, xerr=xerr2,
-                 yerr=np.vstack([rf - rf_lo, rf_hi - rf]),
+    ax2.errorbar(r_mid + dx, rf, xerr=xerr2, yerr=rf_yerr,
                  fmt="s", capsize=3, ms=5, lw=1.3, color="tomato", label="red flux")
+    if np.any(bf_unstable):
+        ax2.scatter((r_mid - dx)[bf_unstable], bf[bf_unstable], s=60, facecolors="none",
+                    edgecolors="royalblue", linewidths=1.3, zorder=5)
+    if np.any(rf_unstable):
+        ax2.scatter((r_mid + dx)[rf_unstable], rf[rf_unstable], s=60, facecolors="none",
+                    edgecolors="tomato", linewidths=1.3, zorder=5)
     ax2.axhline(0, color="0.7", lw=0.6)
     ax2.set_ylabel("Flux")
     ax2.set_title("Blue and red side flux vs. radius")
@@ -1011,11 +1133,15 @@ def plot_asymmetry_profile_two(
         bor_lo = np.asarray(b["blue_over_red_lo"])
         bor_hi = np.asarray(b["blue_over_red_hi"])
         jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
-        ax1.errorbar(jit, bor, yerr=np.vstack([bor - bor_lo, bor_hi - bor]),
+        bor_yerr, bor_unstable = _safe_yerr(bor, bor_lo, bor_hi)
+        ax1.errorbar(jit, bor, yerr=bor_yerr,
                      fmt=fmts[k], capsize=3.5, ms=6, lw=1.5,
                      color="tab:purple", alpha=1.0 if k == 0 else 0.65,
                      markerfacecolor=("tab:purple" if k == 0 else "none"),
                      label=f"{lab}  (B/R)")
+        if np.any(bor_unstable):
+            ax1.scatter(jit[bor_unstable], bor[bor_unstable], s=70, facecolors="none",
+                        edgecolors="tab:purple", linewidths=1.3, zorder=5)
     ax1.axhline(1.0, color="0.5", lw=0.8, ls="--", label="symmetric (B/R = 1)")
     ax1.set_ylabel("Blue / Red flux ratio")
     ax1.set_title("Lyα asymmetry: blue/red side ratio (half-sample comparison)")
@@ -1032,12 +1158,20 @@ def plot_asymmetry_profile_two(
         rf_lo = np.asarray(b["red_flux_lo"]);  rf_hi = np.asarray(b["red_flux_hi"])
         mfc_b = "royalblue" if k == 0 else "none"
         mfc_r = "tomato"    if k == 0 else "none"
-        ax2.errorbar(jit - dx, bf, yerr=np.vstack([bf - bf_lo, bf_hi - bf]),
+        bf_yerr, bf_unstable = _safe_yerr(bf, bf_lo, bf_hi)
+        rf_yerr, rf_unstable = _safe_yerr(rf, rf_lo, rf_hi)
+        ax2.errorbar(jit - dx, bf, yerr=bf_yerr,
                      fmt=fmts[k], capsize=3, ms=5, lw=1.3, color="royalblue",
                      markerfacecolor=mfc_b, label=f"{lab} blue")
-        ax2.errorbar(jit + dx, rf, yerr=np.vstack([rf - rf_lo, rf_hi - rf]),
+        ax2.errorbar(jit + dx, rf, yerr=rf_yerr,
                      fmt=fmts[k], capsize=3, ms=5, lw=1.3, color="tomato",
                      markerfacecolor=mfc_r, label=f"{lab} red")
+        if np.any(bf_unstable):
+            ax2.scatter((jit - dx)[bf_unstable], bf[bf_unstable], s=60, facecolors="none",
+                        edgecolors="royalblue", linewidths=1.3, zorder=5)
+        if np.any(rf_unstable):
+            ax2.scatter((jit + dx)[rf_unstable], rf[rf_unstable], s=60, facecolors="none",
+                        edgecolors="tomato", linewidths=1.3, zorder=5)
     ax2.axhline(0, color="0.7", lw=0.6)
     ax2.set_ylabel("Flux")
     ax2.set_title("Blue and red side flux vs. radius")

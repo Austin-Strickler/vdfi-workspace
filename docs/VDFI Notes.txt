@@ -360,4 +360,11 @@ SUBARU spectra possible sources:
 	- ~100/100 - AGN/potential AGN
 
 -------------------------------------------------------------------------------------------------------------------
-
+7/13/26:
+More Papers:
+- https://iopscience.iop.org/article/10.1088/0004-637X/717/1/289/pdf
+- https://iopscience.iop.org/article/10.3847/0004-637X/822/2/84/pdf
+- https://www.aanda.org/articles/aa/pdf/2022/10/aa42320-21.pdf
+- https://arxiv.org/pdf/1308.6578
+- https://arxiv.org/pdf/1303.0006
+- 

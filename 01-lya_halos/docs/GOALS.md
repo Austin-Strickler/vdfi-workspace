@@ -65,5 +65,6 @@ These need to land in a final, publication-ready figure/summary before the centr
 - `docs/vdfi-background.md` (workspace root) — HETDEX/VDFI dataset context
 - `01-lya_halos/README.md` — pipeline stages and usage
 - `01-lya_halos/specs/` — per-analysis design docs (write one before a new stacking/measurement approach)
+- `01-lya_halos/docs/research-notes.md` — continually-updating log of non-headline research along the way (virial/kpc, SMHM, background subtraction, systematics inventory, core-template noise question)
 - `TODO.md` (workspace root) — near-term working items
 - `presentations/Lya_halos/6-16-26 - VIRAL-Halos Overview.pptx` — source for much of this doc; note per Austin (2026-07-10) that some of its content is outdated relative to what's written here

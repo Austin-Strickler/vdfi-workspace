@@ -252,6 +252,15 @@ _ENTRIES = [
        "side of line center, and their ratio. A quick asymmetry read; the "
        "bootstrap computes this per bin when compute_side_ratio=True.",
        "br = blue_red_side_ratio(rest_wave, flux)"),
+    _e("flux_curve_of_growth", "measure", "measure", "Flux & asymmetry",
+       "Cumulative Lya luminosity and flux fraction vs radius, built on a "
+       "measure_all_bins/bootstrap_all summary: multiplies the per-bin "
+       "total_flux_fid by a representative fiber footprint area "
+       "(fiber_area_kpc2) and cumsums outward, dropping the noisy outermost "
+       "bin by default. Bootstrap bands are computed per-draw, not as a ratio "
+       "of percentiles. Bad (NaN/negative) bins warn and propagate rather "
+       "than being hidden.",
+       "cog = flux_curve_of_growth(boot, stacks)"),
     _e("get_continuum_model", "measure", "measure", "Continuum",
        "The continuum model over the full grid from the sideband windows "
        "(median level or low-order poly). The one place the continuum is "
@@ -317,6 +326,12 @@ _ENTRIES = [
        "Integrated Lya flux +/- bootstrap 16/84 vs radius (log-y by default, to "
        "see the faint outer bins). The radial surface-brightness profile.",
        "plot_flux_profile(boot, stacks)"),
+    _e("plot_flux_curve_of_growth", "analysis", "plotting", "Radial profiles",
+       "Two-panel curve of growth: cumulative Lya luminosity (top, log-y) and "
+       "flux fraction L(<r)/L(<r_max) (bottom) vs radius, with bootstrap "
+       "bands. Draws a measure.flux_curve_of_growth result -- the "
+       "curve-of-growth companion to plot_flux_profile.",
+       "plot_flux_curve_of_growth(cog, stacks)"),
     _e("plot_asymmetry_profile", "analysis", "plotting", "Radial profiles",
        "Two-panel asymmetry: blue fraction B/(B+R) vs radius (top) and absolute "
        "blue/red flux (bottom), with bootstrap bands. Where the line goes "
