@@ -86,7 +86,8 @@ from .measure import (
     LYA_REST, C_KMS,
 )
 from .plotting import (
-    _setup_radius_axis, _resolve_bin_mode, _get_vr_biweight_v, _safe_yerr,
+    _setup_radius_axis, _resolve_bin_mode, _get_vr_biweight_v, _get_vr_biweight_e,
+    _safe_yerr,
     plot_centroid_vs_radius, plot_blue_red_vs_radius,
     plot_centroid_comparison, plot_radial_overlay,
     _mark_lines,
@@ -116,6 +117,23 @@ def _resolve_measure_defaults(config=None, *, bounds=None, cont_bounds=None,
     cont_order  = DEFAULT_CONT_ORDER  if cont_order  is None else cont_order
     bounds      = (lya_center - 4, lya_center + 4) if bounds is None else tuple(bounds)
     return bounds, cont_bounds, cont_method, cont_order, lya_center
+
+
+# sentinel distinguishing "use the auto-generated title" (default) from
+# "no title at all" (title=None, an explicit user choice)
+_AUTO = object()
+
+
+def _resolve_savename(save_name: str | None, default: str) -> str:
+    """
+    Turn a user-supplied `save_name` (with or without an extension, e.g.
+    'Flux_Profile' or 'Flux_Profile.png') into a concrete filename for
+    plt.savefig, falling back to `default` when save_name is None.
+    """
+    if not save_name:
+        return default
+    known_ext = (".png", ".pdf", ".jpg", ".jpeg", ".svg", ".eps", ".tif", ".tiff")
+    return save_name if save_name.lower().endswith(known_ext) else save_name + ".png"
 
 
 # =====================================================================
@@ -516,12 +534,43 @@ def plot_line_panels(
     cont_order: int = 1,
     lya_center: float = LYA_REST,
     xlim: tuple = (1208.0, 1226.0),
+    xunit: str = "wavelength",
     panel_height: float = 2.6,
     figwidth: float = 8.0,
+    ncols: int = 1,
+    fill_order: str = "row",
     show_cont: bool = True,
     show_window: bool = True,
     show_sidebands: bool = True,
     show_centroid: bool = True,
+    stack_color: str = "k",
+    band_color: str = "0.82",
+    band_alpha: float = 1.0,
+    cont_color: str = "tomato",
+    window_color: str = "magenta",
+    window_alpha: float = 0.15,
+    sideband_color: str = "0.55",
+    sideband_alpha: float = 0.25,
+    centroid_color: str = "magenta",
+    lya_line_color: str = "0.7",
+    zero_color: str = "0.7",
+    label_fontsize: float = 9.5,
+    legend_fontsize: float = 9,
+    tick_fontsize: float = 10,
+    xlabel_fontsize: float = 12,
+    ylabel_fontsize: float = 11,
+    title_fontsize: float = 13,
+    xlabel_text: str | None = None,
+    ylabel_text: str = "Flux",
+    title_text: str | None = None,
+    xlabel_y: float = 0.01,
+    ylabel_x: float = 0.01,
+    title_y: float | None = None,
+    legend_y: float = 0.95,
+    top_margin: float = 0.87,
+    band_label: str = "bootstrap 1$\\sigma$ (fid-centered)",
+    stack_label: str | None = None,
+    cont_label: str = "continuum",
     save_fig: bool = False,
     savename: str = "Figure_line_panels.png",
 ):
@@ -536,10 +585,13 @@ def plot_line_panels(
         percentile band that can wander off-center for small-N bins.
       • Biweight (or chosen method) fiducial stack (black)
       • Polynomial continuum fit (red dashed; optional)
-      • Line window shaded (yellow; optional)
-      • Sideband regions shaded (light blue; optional)
+      • Line window shaded (magenta by default; optional)
+      • Sideband regions shaded (grey by default; optional)
       • Centroid marker: vertical dashed line at v_fid, with a short horizontal
         bar at the top spanning the 16/84 interval (optional; needs boot)
+
+    Every color and font size above is a keyword argument (see below), so the
+    whole figure is restylable without touching the function body.
 
     This is the visual check that the centroid is landing on the line peak, that
     the continuum is flat in the sidebands, and that the window captures the
@@ -551,14 +603,109 @@ def plot_line_panels(
     boot         : Stage-3 bootstrap result; None -> no error band / centroid marker
     stack_method : which stacks[method] to display
     bounds       : line window (lo, hi) Å; None -> (lya_center-4, lya_center+4)
-    xlim         : wavelength range shown in each panel
+    xlim         : x-axis range shown in each panel. ALWAYS given in
+                   Angstroms regardless of xunit (same for bounds/cont_bounds/
+                   lya_center) -- these stay the physical, science-facing
+                   inputs; xunit only changes what's DISPLAYED. e.g. the
+                   default xlim=(1208, 1226) Å auto-converts to roughly
+                   (-1890, +2550) km/s when xunit="velocity".
+    xunit        : "wavelength" (default, Å, rest-frame) or "velocity" (km/s
+                   relative to lya_center, via v = c*(wave-lya_center)/lya_center
+                   -- the same convention already used for the centroid). The
+                   vertical dotted rest-frame marker line sits at v=0 in
+                   velocity mode. The x-axis label switches automatically too
+                   ("Velocity [km s$^{-1}$]") unless you set xlabel_text.
+    ncols        : number of grid columns (default 1 = the original single tall
+                   column). For a paper figure with many radial bins, ncols=2
+                   (or more) arranges the panels in a grid instead of one very
+                   tall column. x-axis tick labels are only drawn on the
+                   bottom-most used panel of each column. Try e.g.
+                   ncols=2, figwidth=11, panel_height=2.6, show_centroid=False
+                   for a compact 2x5 print figure with the centroid marker
+                   left out (since that belongs on the separate centroid-vs-
+                   radius plot).
+    fill_order   : "row" (default) -- panels fill left-to-right, then wrap to
+                   the next row (bin 0 top-left, bin 1 top-right, ...).
+                   "col" -- panels fill top-to-bottom within a column, then
+                   continue into the next column (the original grid ordering).
+                   No effect when ncols=1.
+    stack_color, band_color, cont_color, window_color, sideband_color,
+    centroid_color, lya_line_color, zero_color : per-element colors, all
+                   independently overridable. window_color/sideband_color
+                   default to magenta/grey; band_alpha, window_alpha,
+                   sideband_alpha control their fill opacity.
+    label_fontsize, legend_fontsize, tick_fontsize, xlabel_fontsize,
+    ylabel_fontsize, title_fontsize : text sizes for the per-panel bin label,
+                   the legend, the tick labels, the shared x/y axis labels,
+                   and the figure suptitle, respectively.
+    xlabel_text, ylabel_text, title_text : override the shared x-axis label,
+                   shared y-axis label, and suptitle strings. xlabel_text=None
+                   picks the wavelength/velocity default based on xunit;
+                   title_text=None keeps the auto-generated "Lyα line panels
+                   -- {method} stack". The x-axis label is drawn ONCE for the
+                   whole figure (like the y-axis "Flux" label) via
+                   fig.supxlabel, not repeated under every column.
+    band_label, stack_label, cont_label : legend text for the bootstrap 1σ
+                   band, the fiducial stack line, and the continuum line.
+                   stack_label=None defaults to f"{stack_method} stack" (so
+                   it tracks whichever method you're plotting); the other two
+                   default to "bootstrap 1$\\sigma$ (fid-centered)" and
+                   "continuum".
+    xlabel_y, ylabel_x : figure-fraction position of the shared x-/y-axis
+                   label (passed straight to fig.supxlabel(y=...) /
+                   fig.supylabel(x=...)); nudge these if the label sits too
+                   close to or far from the tick numbers.
+    title_y      : figure-fraction y position of the suptitle. None -> auto
+                   (near the very top for ncols=1, or above the reserved
+                   legend strip for a grid).
+    legend_y     : figure-fraction y position (bbox_to_anchor) of the shared
+                   legend drawn above the grid when ncols>1. No effect when
+                   ncols=1 (legend sits inside the first panel instead).
+    top_margin   : fraction of the figure height given to the panel grid
+                   when ncols>1 (the rest, above it, is reserved for the
+                   legend + title). Lower this (e.g. 0.80) if the legend is
+                   crowding the top row -- this is the fix for a squeezed
+                   legend with many columns or with axes that show a
+                   scientific-notation exponent (e.g. "1e38") above them.
     """
+    if xunit not in ("wavelength", "velocity"):
+        raise ValueError("xunit must be 'wavelength' or 'velocity'")
+
     wave   = np.asarray(stacks["rest_wave"])
     fid    = np.asarray(stacks["stacks"][stack_method]["flux"])   # (nrad, nwave)
     edges  = np.round(np.asarray(stacks["r_edges"]), 3)
     nrad   = fid.shape[0]
     bounds = bounds if bounds is not None else (lya_center - 4, lya_center + 4)
     bm     = stacks.get("bin_mode", "")
+    stack_label_final = stack_label if stack_label is not None else f"{stack_method} stack"
+
+    # xunit only changes what's DISPLAYED -- bounds/cont_bounds/xlim/lya_center
+    # stay in Angstroms as the science-facing inputs (and the continuum fit
+    # below is always computed in wavelength space); here we just derive the
+    # x-COORDINATES actually handed to the plotting calls, converting to km/s
+    # (same convention as the centroid: v = c*(wave-lya_center)/lya_center)
+    # when xunit="velocity".
+    def _to_velocity(wl):
+        return C_KMS * (np.asarray(wl, dtype=float) - lya_center) / lya_center
+
+    if xunit == "velocity":
+        x_plot      = _to_velocity(wave)
+        bounds_x    = tuple(_to_velocity(bounds))
+        cont_bounds_x = [tuple(_to_velocity(cb)) for cb in cont_bounds]
+        xlim_x      = tuple(_to_velocity(xlim))
+        lya_line_x  = 0.0
+    else:
+        x_plot      = wave
+        bounds_x    = bounds
+        cont_bounds_x = cont_bounds
+        xlim_x      = xlim
+        lya_line_x  = lya_center
+
+    if xlabel_text is None:
+        xlabel_text_final = (r"Velocity [km s$^{-1}$]" if xunit == "velocity"
+                             else r"Rest-frame wavelength [$\AA$]")
+    else:
+        xlabel_text_final = xlabel_text
 
     # bootstrap error band -- anchored on the fiducial curve, not on the
     # bootstrap distribution's own median. Raw p16/p84 are percentiles of the
@@ -584,70 +731,95 @@ def plot_line_panels(
         band_lo   = fid - err_lo
         band_hi   = fid + err_hi
 
-    fig, axes = plt.subplots(nrad, 1, figsize=(figwidth, panel_height * nrad),
-                             sharex=True)
-    if nrad == 1:
-        axes = [axes]
+    ncols = max(1, int(ncols))
+    nrows = int(np.ceil(nrad / ncols))
+    fig, axes_grid = plt.subplots(nrows, ncols,
+                                  figsize=(figwidth, panel_height * nrows),
+                                  sharex=True, squeeze=False)
+
+    # bin index r -> (row, col). "row" fill_order goes left-to-right then
+    # wraps to the next row (bin 0 top-left, bin 1 top-right, ...); "col"
+    # fill_order goes top-to-bottom within a column, then continues into the
+    # next column. With ncols=1 both reduce to the original single-column order.
+    if fill_order == "row":
+        grid_pos = [(r // ncols, r % ncols) for r in range(nrad)]
+    else:
+        grid_pos = [(r % nrows, r // nrows) for r in range(nrad)]
+    axes = [axes_grid[row, col] for row, col in grid_pos]
+
+    # hide any grid cells left empty because nrad doesn't evenly fill nrows*ncols
+    used = set(grid_pos)
+    for row in range(nrows):
+        for col in range(ncols):
+            if (row, col) not in used:
+                axes_grid[row, col].axis("off")
 
     for r, ax in enumerate(axes):
         # --- bootstrap band (fid-centered 1-sigma) ---
         if band_lo is not None:
-            ax.fill_between(wave, band_lo[r], band_hi[r], color="0.82", lw=0,
-                            zorder=0, label="bootstrap 1$\\sigma$ (fid-centered)" if r == 0 else None)
+            ax.fill_between(x_plot, band_lo[r], band_hi[r], color=band_color, lw=0,
+                            alpha=band_alpha, zorder=0,
+                            label=band_label if r == 0 else None)
 
         # --- sideband regions ---
         if show_sidebands:
-            for (lo, hi) in cont_bounds:
-                ax.axvspan(lo, hi, color="steelblue", alpha=0.08, lw=0)
+            for (lo, hi) in cont_bounds_x:
+                ax.axvspan(lo, hi, color=sideband_color, alpha=sideband_alpha, lw=0)
 
         # --- line window ---
         if show_window:
-            ax.axvspan(bounds[0], bounds[1], color="gold", alpha=0.13, lw=0)
+            ax.axvspan(bounds_x[0], bounds_x[1], color=window_color, alpha=window_alpha, lw=0)
 
         # --- fiducial stack ---
-        ax.plot(wave, fid[r], color="k", lw=1.1, zorder=3,
-                label="biweight stack" if r == 0 else None)
+        ax.plot(x_plot, fid[r], color=stack_color, lw=1.1, zorder=3,
+                label=stack_label_final if r == 0 else None)
 
-        # --- continuum ---
+        # --- continuum (always fit in wavelength space; only the DRAWN curve
+        # is shown on the x_plot axis, whichever unit that is) ---
         if show_cont:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 cont = get_continuum_model(wave, fid[r], cont_bounds=cont_bounds,
                                            cont_method=cont_method, cont_order=cont_order)
-            ax.plot(wave, cont, color="tomato", lw=1.0, ls="--", zorder=2,
-                    label="continuum" if r == 0 else None)
+            ax.plot(x_plot, cont, color=cont_color, lw=1.0, ls="--", zorder=2,
+                    label=cont_label if r == 0 else None)
 
         # --- centroid marker ---
         if show_centroid and boot is not None:
             v_f  = boot["centroid_v_fid"][r]
             v_lo = boot["centroid_v_lo"][r]
             v_hi = boot["centroid_v_hi"][r]
-            lam_c  = lya_center * (1 + v_f  / C_KMS)
-            lam_lo = lya_center * (1 + v_lo / C_KMS)
-            lam_hi = lya_center * (1 + v_hi / C_KMS)
+            if xunit == "velocity":
+                # already in km/s -- no need to round-trip through wavelength
+                x_c, x_lo, x_hi = v_f, v_lo, v_hi
+            else:
+                x_c  = lya_center * (1 + v_f  / C_KMS)
+                x_lo = lya_center * (1 + v_lo / C_KMS)
+                x_hi = lya_center * (1 + v_hi / C_KMS)
             # vertical dashed line
-            ax.axvline(lam_c, color="magenta", lw=1.1, ls="--", zorder=4,
+            ax.axvline(x_c, color=centroid_color, lw=1.1, ls="--", zorder=4,
                        label=f"centroid {v_f:+.0f} km/s" if r == 0 else None)
             # 16/84 bar at top of panel (0.92 in axes coords)
             y_bar = ax.get_ylim()[1] * 0.0   # will be set after ylim below; use transform
-            ax.annotate("", xy=(lam_hi, 1.0), xytext=(lam_lo, 1.0),
+            ax.annotate("", xy=(x_hi, 1.0), xytext=(x_lo, 1.0),
                         xycoords=("data", "axes fraction"),
                         textcoords=("data", "axes fraction"),
-                        arrowprops=dict(arrowstyle="|-|", color="magenta",
+                        arrowprops=dict(arrowstyle="|-|", color=centroid_color,
                                         lw=1.1, mutation_scale=4))
 
         # axes / labels
         lbl = f"{edges[r]:g}–{edges[r+1]:g} {bm}"
-        ax.text(0.02, 0.88, lbl, transform=ax.transAxes, fontsize=9.5,
+        ax.text(0.02, 0.88, lbl, transform=ax.transAxes, fontsize=label_fontsize,
                 color="0.3",
                 bbox=dict(facecolor="white", alpha=0.7, edgecolor="none",
                           boxstyle="round,pad=0.15"))
-        ax.axhline(0, color="0.7", lw=0.6)
-        ax.axvline(lya_center, color="0.7", lw=0.6, ls=":")
-        ax.set_xlim(xlim)
+        ax.axhline(0, color=zero_color, lw=0.6)
+        ax.axvline(lya_line_x, color=lya_line_color, lw=0.6, ls=":")
+        ax.set_xlim(xlim_x)
         ax.grid(alpha=0.12)
+        ax.tick_params(axis="both", which="major", labelsize=tick_fontsize)
 
-        in_xlim = (wave >= xlim[0]) & (wave <= xlim[1])
+        in_xlim = (x_plot >= xlim_x[0]) & (x_plot <= xlim_x[1])
         yvals = fid[r][in_xlim]
         if band_lo is not None:
             # both edges -- the old version only looked at the lower edge
@@ -659,11 +831,53 @@ def plot_line_panels(
             pad = 0.25 * (hi_ - lo_)
             ax.set_ylim(min(lo_ - pad, 0), hi_ + pad)
 
-    axes[0].legend(frameon=False, fontsize=8, ncol=3, loc="upper right")
-    axes[-1].set_xlabel(r"Rest-frame wavelength [$\AA$]", fontsize=12)
-    fig.supylabel("Flux", fontsize=11, x=0.01)
-    fig.suptitle(f"Lyα line panels — {stack_method} stack", fontsize=13, y=1.005)
+    if ncols == 1:
+        # single narrow column -- a full-width in-panel legend fits fine,
+        # matches the original look exactly.
+        axes[0].legend(frameon=False, fontsize=legend_fontsize, ncol=3, loc="upper right")
+        title_y_final = title_y if title_y is not None else 1.005
+        reserve_top = None
+    else:
+        # grid mode -- panels are narrower, so an in-panel legend collides
+        # with the bin-range label in the corner. Pull the handles off the
+        # first panel and draw ONE shared legend in a reserved strip above
+        # the panel grid instead. Reserving the strip via subplots_adjust
+        # AFTER tight_layout guarantees the axes grid is pushed down out of
+        # the legend/title's way (tight_layout's own rect= doesn't reliably
+        # leave room for manually-placed fig.legend/suptitle artists).
+        # top_margin/legend_y control how much room that strip gets -- widen
+        # the gap (lower top_margin and/or raise legend_y) if the legend
+        # crowds the top row, which happens easily with many columns or with
+        # axes that draw a scientific-notation exponent (e.g. "1e38") just
+        # above their top spine.
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, frameon=False, fontsize=legend_fontsize,
+                      ncol=len(labels), loc="upper center",
+                      bbox_to_anchor=(0.5, legend_y))
+        title_y_final = title_y if title_y is not None else min(legend_y + 0.04, 0.995)
+        reserve_top = top_margin
+
+    # x-axis tick labels only on the bottom-most USED panel of each column;
+    # hide tick labels on the panels above it so a multi-column grid doesn't
+    # repeat the wavelength axis tick numbers down every row. The x-axis
+    # TITLE itself is drawn once for the whole figure below (fig.supxlabel),
+    # not repeated per column.
+    last_row_in_col = {}
+    for row, col in grid_pos:
+        last_row_in_col[col] = max(last_row_in_col.get(col, -1), row)
+    for row, col in grid_pos:
+        if row != last_row_in_col[col]:
+            axes_grid[row, col].tick_params(labelbottom=False)
+
+    fig.supxlabel(xlabel_text_final, fontsize=xlabel_fontsize, y=xlabel_y)
+    fig.supylabel(ylabel_text, fontsize=ylabel_fontsize, x=ylabel_x)
+    fig.suptitle(title_text if title_text is not None
+                else f"Lyα line panels — {stack_method} stack",
+                fontsize=title_fontsize, y=title_y_final)
     plt.tight_layout()
+    if reserve_top is not None:
+        fig.subplots_adjust(top=reserve_top)
     if save_fig:
         plt.savefig(savename, dpi=300, bbox_inches="tight")
     plt.show()
@@ -690,10 +904,13 @@ def plot_centroid_profile(
     ylims=(-250, 250),
     xlims=None,
     z_err_kms: float = 0,
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
     plot_literature: bool = False,
     figsize=(7.2, 4.7),
-    title=r"Bootstrapped Ly$\alpha$ centroid vs. radius",
+    title: str | None = r"Bootstrapped Ly$\alpha$ centroid vs. radius",
     save_fig: bool = False,
+    save_name: str | None = None,
 ):
     """
     The headline figure: centroid velocity ± bootstrap 16/84 per radial bin.
@@ -703,18 +920,30 @@ def plot_centroid_profile(
     r_edges, VR_biweight_v, etc.), so you just call:
 
         analysis.plot_centroid_profile(boot, stacks)
+
+    title     : axis title; pass None to omit the title entirely.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_centroid_profile.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks['VR_biweight_e'] (set by stack.sample_virial_radius_kpc)
+                if present.
     """
     radial_bins = np.asarray(r_edges if r_edges is not None
                              else boot.get("r_edges",
                              stacks["r_edges"] if stacks else []))
+    savename = _resolve_savename(save_name, "Figure_centroid_profile.png")
     return plot_centroid_vs_radius(
         boot, radial_bins, VR_biweight_v=VR_biweight_v,
         stacks_result=stacks or boot,
         bin_mode=bin_mode, z_err_kms=z_err_kms,
         vr_ticks=vr_ticks, figsize=figsize, title=title,
         ylims=ylims, xlims=xlims,
+        show_vr=show_vr, VR_biweight_error=VR_biweight_error,
         plot_literature=plot_literature,
         save_fig=save_fig,
+        savename=savename,
     )
 
 
@@ -728,9 +957,12 @@ def plot_flux_profile(
     logy: bool = True,
     ylims=None,
     xlims=None,
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
     figsize=(7.2, 4.7),
+    title: str | None = "Integrated Lyα flux vs. radius",
     save_fig: bool = False,
-    savename: str = "Figure_flux_profile.png",
+    save_name: str | None = None,
 ):
     """
     Integrated Lyα flux (total_flux_fid) ± bootstrap 16/84 vs radius.
@@ -739,6 +971,15 @@ def plot_flux_profile(
 
     Requires compute_side_ratio=True in the bootstrap (the default), which
     provides total_flux_fid = blue_flux_fid + red_flux_fid.
+
+    title     : axis title; pass None to omit the title entirely.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_flux_profile.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks['VR_biweight_e'] (set by stack.sample_virial_radius_kpc)
+                if present.
     """
     if "total_flux_fid" not in boot:
         raise KeyError("boot does not contain total_flux_fid; re-run with "
@@ -749,13 +990,15 @@ def plot_flux_profile(
                              stacks["r_edges"] if stacks else []))
     bm  = _resolve_bin_mode(bin_mode, stacks or boot)
     vr  = _get_vr_biweight_v(VR_biweight_v, stacks or boot)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks or boot)
 
     y    = np.asarray(boot["total_flux_fid"])
     y_lo = np.asarray(boot["total_flux_lo"])
     y_hi = np.asarray(boot["total_flux_hi"])
 
     fig, ax = plt.subplots(figsize=figsize)
-    r_mid, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims)
+    r_mid, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                     show_vr=show_vr, VR_biweight_error=vr_e)
     yerr, unstable = _safe_yerr(y, y_lo, y_hi)
     ax.errorbar(r_mid, y, xerr=xerr, yerr=yerr,
                 fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:blue",
@@ -774,12 +1017,14 @@ def plot_flux_profile(
         ax.set_ylim(ylims)
     unit = (boot.get("unit_info") or {}).get("y_unit", "")
     ax.set_ylabel(f"Integrated Lyα flux [{unit}]" if unit else "Integrated Lyα flux")
-    ax.set_title("Integrated Lyα flux vs. radius")
+    if title:
+        ax.set_title(title)
     ax.legend(frameon=False, fontsize=9)
     ax.grid(alpha=0.15)
     plt.tight_layout()
     if save_fig:
-        plt.savefig(savename, dpi=300, bbox_inches="tight")
+        plt.savefig(_resolve_savename(save_name, "Figure_flux_profile.png"),
+                    dpi=300, bbox_inches="tight")
     plt.show()
     return fig, ax
 
@@ -793,14 +1038,19 @@ def plot_flux_curve_of_growth(
     vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
     logy: bool = True,
     xlims=None,
-    figsize=(7.2, 8.0),
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
+    figsize=None,
+    panels: str = "both",
+    title1: str | None = _AUTO,
+    title2: str | None = "Lyα flux fraction vs. radius",
     save_fig: bool = False,
-    savename: str = "Figure_flux_curve_of_growth.png",
+    save_name: str | None = None,
 ):
     """
-    Two-panel Lyα curve of growth: (top) cumulative luminosity vs radius,
-    center outward; (bottom) the same, normalized to a flux FRACTION of the
-    total summed out to r_max. Both panels show the bootstrap 16-84 band.
+    Lyα curve of growth: cumulative luminosity vs radius (center outward), and
+    the same normalized to a flux FRACTION of the total summed out to r_max.
+    Both panels show the bootstrap 16-84 band.
 
     Takes `cog`, the dict returned by measure.flux_curve_of_growth -- this
     function only DRAWS it (measure.py computes, analysis.py draws, same split
@@ -815,70 +1065,115 @@ def plot_flux_curve_of_growth(
     '/kpc^2' stripped (multiplying by the fiber area cancels it) -- same
     fiber-footprint convention as plot_flux_profile's total_flux_fid, not a
     true annulus-integrated luminosity (see measure.flux_curve_of_growth).
+
+    panels    : "both" (default, two stacked panels) | "cumulative" (top panel
+                only) | "fraction" (bottom panel only). Use the single-panel
+                modes to grab just one of the two images, e.g. to save it on
+                its own with a distinct save_name.
+    title1    : cumulative-luminosity panel title; omitted (_AUTO, the
+                default) auto-generates "Lyα curve of growth (r_max = ... kpc)";
+                pass a string to override, or None for no title.
+    title2    : flux-fraction panel title; pass None for no title.
+    figsize   : None -> (7.2, 8.0) for panels="both", (7.2, 4.5) for a single
+                panel.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_flux_curve_of_growth.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks['VR_biweight_e'] (set by stack.sample_virial_radius_kpc)
+                if present. (cog itself does not carry this -- it comes from
+                `stacks`, same fallback as VR_biweight_v.)
+
+    Returns (fig, (ax1, ax2)) for panels="both", else (fig, ax).
     """
     for key in ("flux_cumulative_fid", "flux_fraction_fid"):
         if key not in cog:
             raise KeyError(f"cog missing {key!r}; pass the dict returned by "
                            "measure.flux_curve_of_growth.")
+    if panels not in ("both", "cumulative", "fraction"):
+        raise ValueError("panels must be 'both', 'cumulative', or 'fraction'")
 
     radial_bins = np.asarray(r_edges if r_edges is not None else cog["r_edges_used"])
     bm  = _resolve_bin_mode(bin_mode, stacks)
     vr  = _get_vr_biweight_v(VR_biweight_v, stacks)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    if figsize is None:
+        figsize = (7.2, 8.0) if panels == "both" else (7.2, 4.5)
+
+    if panels == "both":
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    elif panels == "cumulative":
+        fig, ax1 = plt.subplots(figsize=figsize)
+        ax2 = None
+    else:
+        fig, ax2 = plt.subplots(figsize=figsize)
+        ax1 = None
 
     # panel 1: cumulative luminosity
-    r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims)
-    y    = np.asarray(cog["flux_cumulative_fid"])
-    y_lo = np.asarray(cog["flux_cumulative_lo"])
-    y_hi = np.asarray(cog["flux_cumulative_hi"])
-    yerr, unstable = _safe_yerr(y, y_lo, y_hi)
-    ax1.errorbar(r_mid, y, xerr=xerr, yerr=yerr,
-                fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:green",
-                label="cumulative flux (bootstrap 16–84)")
-    if np.any(unstable):
-        ax1.scatter(r_mid[unstable], y[unstable], s=70, facecolors="none",
-                   edgecolors="tab:green", linewidths=1.3, zorder=5,
-                   label="fiducial outside 16–84 band")
-    ax1.axhline(0, color="0.7", lw=0.7)
-    if logy:
-        pos = y[y > 0]
-        if len(pos):
-            ax1.set_yscale("log")
-            ax1.set_ylim(pos.min() * 0.3, y.max() * 3)
-    base_unit = (cog.get("unit_info") or {}).get("y_unit", "")
-    lum_unit = base_unit.replace("/kpc^2", "") if "kpc^2" in base_unit else base_unit
-    ax1.set_ylabel(f"Cumulative Lyα luminosity [{lum_unit}]" if lum_unit
-                   else "Cumulative Lyα luminosity")
-    ax1.set_title(f"Lyα curve of growth (r_max = {cog['meta']['r_max_kpc']:g} kpc)")
-    ax1.legend(frameon=False, fontsize=9)
-    ax1.grid(alpha=0.15)
+    if ax1 is not None:
+        r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                         show_vr=show_vr, VR_biweight_error=vr_e)
+        y    = np.asarray(cog["flux_cumulative_fid"])
+        y_lo = np.asarray(cog["flux_cumulative_lo"])
+        y_hi = np.asarray(cog["flux_cumulative_hi"])
+        yerr, unstable = _safe_yerr(y, y_lo, y_hi)
+        ax1.errorbar(r_mid, y, xerr=xerr, yerr=yerr,
+                    fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:green",
+                    label="cumulative flux (bootstrap 16–84)")
+        if np.any(unstable):
+            ax1.scatter(r_mid[unstable], y[unstable], s=70, facecolors="none",
+                       edgecolors="tab:green", linewidths=1.3, zorder=5,
+                       label="fiducial outside 16–84 band")
+        ax1.axhline(0, color="0.7", lw=0.7)
+        if logy:
+            pos = y[y > 0]
+            if len(pos):
+                ax1.set_yscale("log")
+                ax1.set_ylim(pos.min() * 0.3, y.max() * 3)
+        base_unit = (cog.get("unit_info") or {}).get("y_unit", "")
+        lum_unit = base_unit.replace("/kpc^2", "") if "kpc^2" in base_unit else base_unit
+        ax1.set_ylabel(f"Cumulative Lyα luminosity [{lum_unit}]" if lum_unit
+                       else "Cumulative Lyα luminosity")
+        if title1 is _AUTO:
+            ax1.set_title(f"Lyα curve of growth (r_max = {cog['meta']['r_max_kpc']:g} kpc)")
+        elif title1:
+            ax1.set_title(title1)
+        ax1.legend(frameon=False, fontsize=9)
+        ax1.grid(alpha=0.15)
 
     # panel 2: flux fraction
-    r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims)
-    fy    = np.asarray(cog["flux_fraction_fid"])
-    fy_lo = np.asarray(cog["flux_fraction_lo"])
-    fy_hi = np.asarray(cog["flux_fraction_hi"])
-    fyerr, funstable = _safe_yerr(fy, fy_lo, fy_hi)
-    ax2.errorbar(r_mid2, fy, xerr=xerr2, yerr=fyerr,
-                fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:orange",
-                label="flux fraction (bootstrap 16–84)")
-    if np.any(funstable):
-        ax2.scatter(r_mid2[funstable], fy[funstable], s=70, facecolors="none",
-                   edgecolors="tab:orange", linewidths=1.3, zorder=5)
-    ax2.axhline(0.5, color="0.5", lw=0.8, ls="--", label="half-light radius")
-    ax2.axhline(1.0, color="0.7", lw=0.6)
-    ax2.set_ylim(0, 1.1)
-    ax2.set_ylabel(r"Flux fraction  $L(<r) / L(<r_{\rm max})$")
-    ax2.set_title("Lyα flux fraction vs. radius")
-    ax2.legend(frameon=False, fontsize=9)
-    ax2.grid(alpha=0.15)
+    if ax2 is not None:
+        r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                           show_vr=show_vr, VR_biweight_error=vr_e)
+        fy    = np.asarray(cog["flux_fraction_fid"])
+        fy_lo = np.asarray(cog["flux_fraction_lo"])
+        fy_hi = np.asarray(cog["flux_fraction_hi"])
+        fyerr, funstable = _safe_yerr(fy, fy_lo, fy_hi)
+        ax2.errorbar(r_mid2, fy, xerr=xerr2, yerr=fyerr,
+                    fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:orange",
+                    label="flux fraction (bootstrap 16–84)")
+        if np.any(funstable):
+            ax2.scatter(r_mid2[funstable], fy[funstable], s=70, facecolors="none",
+                       edgecolors="tab:orange", linewidths=1.3, zorder=5)
+        ax2.axhline(0.5, color="0.5", lw=0.8, ls="--", label="half-light radius")
+        ax2.axhline(1.0, color="0.7", lw=0.6)
+        ax2.set_ylim(0, 1.1)
+        ax2.set_ylabel(r"Flux fraction  $L(<r) / L(<r_{\rm max})$")
+        if title2:
+            ax2.set_title(title2)
+        ax2.legend(frameon=False, fontsize=9)
+        ax2.grid(alpha=0.15)
 
     plt.tight_layout()
     if save_fig:
-        plt.savefig(savename, dpi=300, bbox_inches="tight")
+        plt.savefig(_resolve_savename(save_name, "Figure_flux_curve_of_growth.png"),
+                    dpi=300, bbox_inches="tight")
     plt.show()
-    return fig, (ax1, ax2)
+    if panels == "both":
+        return fig, (ax1, ax2)
+    return fig, (ax1 if ax1 is not None else ax2)
 
 
 def plot_asymmetry_profile(
@@ -889,14 +1184,19 @@ def plot_asymmetry_profile(
     VR_biweight_v=None,
     vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
     xlims=None,
-    figsize=(7.2, 8.0),
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
+    figsize=None,
+    panels: str = "both",
+    title1: str | None = "Lyα asymmetry: blue flux fraction",
+    title2: str | None = "Blue and red side flux vs. radius",
     save_fig: bool = False,
-    savename: str = "Figure_asymmetry_profile.png",
+    save_name: str | None = None,
 ):
     """
-    Two-panel asymmetry diagnostic: (top) blue fraction B/(B+R) vs radius with
-    the 16/84 bootstrap band; (bottom) absolute blue and red flux vs radius on
-    the same axis, so you can see which side is driving the asymmetry.
+    Asymmetry diagnostic: blue fraction B/(B+R) vs radius with the 16/84
+    bootstrap band, and absolute blue and red flux vs radius on the same axis
+    so you can see which side is driving the asymmetry.
 
     fraction = blue_flux / (blue_flux + red_flux), bounded to [0, 1]:
     = 0.5 → symmetric line.
@@ -906,15 +1206,35 @@ def plot_asymmetry_profile(
     Replaces the old blue/red ratio (which ran 0→∞ and put the symmetric point
     at 1). The fraction is computed PER bootstrap draw from blue_flux_all /
     red_flux_all so the 16/84 band is correct (you cannot divide percentiles).
+
+    panels    : "both" (default, two stacked panels) | "fraction" (blue-fraction
+                panel only) | "flux" (blue/red flux panel only). Use the
+                single-panel modes to grab just one of the two images.
+    title1    : blue-fraction panel title; None for no title.
+    title2    : blue/red-flux panel title; None for no title.
+    figsize   : None -> (7.2, 8.0) for panels="both", (7.2, 4.5) for a single
+                panel.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_asymmetry_profile.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks['VR_biweight_e'] (set by stack.sample_virial_radius_kpc)
+                if present.
+
+    Returns (fig, (ax1, ax2)) for panels="both", else (fig, ax).
     """
     if "blue_over_red_fid" not in boot:
         raise KeyError("boot missing blue/red keys; re-run with compute_side_ratio=True.")
+    if panels not in ("both", "fraction", "flux"):
+        raise ValueError("panels must be 'both', 'fraction', or 'flux'")
 
     radial_bins = np.asarray(r_edges if r_edges is not None
                              else boot.get("r_edges",
                              stacks["r_edges"] if stacks else []))
     bm  = _resolve_bin_mode(bin_mode, stacks or boot)
     vr  = _get_vr_biweight_v(VR_biweight_v, stacks or boot)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks or boot)
 
     # --- blue fraction per draw -> correct 16/84 (fall back to fid-only) ---
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -937,54 +1257,73 @@ def plot_asymmetry_profile(
             bfrac_lo = bl / (bl + rh)
             bfrac_hi = bh / (bh + rl)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    if figsize is None:
+        figsize = (7.2, 8.0) if panels == "both" else (7.2, 4.5)
+
+    if panels == "both":
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    elif panels == "fraction":
+        fig, ax1 = plt.subplots(figsize=figsize)
+        ax2 = None
+    else:
+        fig, ax2 = plt.subplots(figsize=figsize)
+        ax1 = None
 
     # panel 1: blue fraction
-    r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims)
-    yerr1, unstable1 = _safe_yerr(bfrac_fid, bfrac_lo, bfrac_hi)
-    ax1.errorbar(r_mid, bfrac_fid, xerr=xerr, yerr=yerr1,
-                 fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:purple")
-    if np.any(unstable1):
-        ax1.scatter(r_mid[unstable1], bfrac_fid[unstable1], s=70, facecolors="none",
-                    edgecolors="tab:purple", linewidths=1.3, zorder=5,
-                    label="fiducial outside 16–84 band")
-    ax1.axhline(0.5, color="0.5", lw=0.8, ls="--", label="symmetric (B/total = 0.5)")
-    ax1.set_ylim(0, 1)
-    ax1.set_ylabel("Blue fraction  B / (B+R)")
-    ax1.set_title("Lyα asymmetry: blue flux fraction")
-    ax1.legend(frameon=False, fontsize=9)
-    ax1.grid(alpha=0.15)
+    if ax1 is not None:
+        r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                         show_vr=show_vr, VR_biweight_error=vr_e)
+        yerr1, unstable1 = _safe_yerr(bfrac_fid, bfrac_lo, bfrac_hi)
+        ax1.errorbar(r_mid, bfrac_fid, xerr=xerr, yerr=yerr1,
+                     fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:purple")
+        if np.any(unstable1):
+            ax1.scatter(r_mid[unstable1], bfrac_fid[unstable1], s=70, facecolors="none",
+                        edgecolors="tab:purple", linewidths=1.3, zorder=5,
+                        label="fiducial outside 16–84 band")
+        ax1.axhline(0.5, color="0.5", lw=0.8, ls="--", label="symmetric (B/total = 0.5)")
+        ax1.set_ylim(0, 1)
+        ax1.set_ylabel("Blue fraction  B / (B+R)")
+        if title1:
+            ax1.set_title(title1)
+        ax1.legend(frameon=False, fontsize=9)
+        ax1.grid(alpha=0.15)
 
     # panel 2: absolute fluxes
-    r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims)
-    bf    = np.asarray(boot["blue_flux_fid"])
-    rf    = np.asarray(boot["red_flux_fid"])
-    bf_lo = np.asarray(boot["blue_flux_lo"]);  bf_hi = np.asarray(boot["blue_flux_hi"])
-    rf_lo = np.asarray(boot["red_flux_lo"]);   rf_hi = np.asarray(boot["red_flux_hi"])
-    dx = (r_mid[1] - r_mid[0]) * 0.05 if len(r_mid) > 1 else 0
-    bf_yerr, bf_unstable = _safe_yerr(bf, bf_lo, bf_hi)
-    rf_yerr, rf_unstable = _safe_yerr(rf, rf_lo, rf_hi)
-    ax2.errorbar(r_mid - dx, bf, xerr=xerr2, yerr=bf_yerr,
-                 fmt="o", capsize=3, ms=5, lw=1.3, color="royalblue", label="blue flux")
-    ax2.errorbar(r_mid + dx, rf, xerr=xerr2, yerr=rf_yerr,
-                 fmt="s", capsize=3, ms=5, lw=1.3, color="tomato", label="red flux")
-    if np.any(bf_unstable):
-        ax2.scatter((r_mid - dx)[bf_unstable], bf[bf_unstable], s=60, facecolors="none",
-                    edgecolors="royalblue", linewidths=1.3, zorder=5)
-    if np.any(rf_unstable):
-        ax2.scatter((r_mid + dx)[rf_unstable], rf[rf_unstable], s=60, facecolors="none",
-                    edgecolors="tomato", linewidths=1.3, zorder=5)
-    ax2.axhline(0, color="0.7", lw=0.6)
-    ax2.set_ylabel("Flux")
-    ax2.set_title("Blue and red side flux vs. radius")
-    ax2.legend(frameon=False, fontsize=9)
-    ax2.grid(alpha=0.15)
+    if ax2 is not None:
+        r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                           show_vr=show_vr, VR_biweight_error=vr_e)
+        bf    = np.asarray(boot["blue_flux_fid"])
+        rf    = np.asarray(boot["red_flux_fid"])
+        bf_lo = np.asarray(boot["blue_flux_lo"]);  bf_hi = np.asarray(boot["blue_flux_hi"])
+        rf_lo = np.asarray(boot["red_flux_lo"]);   rf_hi = np.asarray(boot["red_flux_hi"])
+        dx = (r_mid2[1] - r_mid2[0]) * 0.05 if len(r_mid2) > 1 else 0
+        bf_yerr, bf_unstable = _safe_yerr(bf, bf_lo, bf_hi)
+        rf_yerr, rf_unstable = _safe_yerr(rf, rf_lo, rf_hi)
+        ax2.errorbar(r_mid2 - dx, bf, xerr=xerr2, yerr=bf_yerr,
+                     fmt="o", capsize=3, ms=5, lw=1.3, color="royalblue", label="blue flux")
+        ax2.errorbar(r_mid2 + dx, rf, xerr=xerr2, yerr=rf_yerr,
+                     fmt="s", capsize=3, ms=5, lw=1.3, color="tomato", label="red flux")
+        if np.any(bf_unstable):
+            ax2.scatter((r_mid2 - dx)[bf_unstable], bf[bf_unstable], s=60, facecolors="none",
+                        edgecolors="royalblue", linewidths=1.3, zorder=5)
+        if np.any(rf_unstable):
+            ax2.scatter((r_mid2 + dx)[rf_unstable], rf[rf_unstable], s=60, facecolors="none",
+                        edgecolors="tomato", linewidths=1.3, zorder=5)
+        ax2.axhline(0, color="0.7", lw=0.6)
+        ax2.set_ylabel("Flux")
+        if title2:
+            ax2.set_title(title2)
+        ax2.legend(frameon=False, fontsize=9)
+        ax2.grid(alpha=0.15)
 
     plt.tight_layout()
     if save_fig:
-        plt.savefig(savename, dpi=300, bbox_inches="tight")
+        plt.savefig(_resolve_savename(save_name, "Figure_asymmetry_profile.png"),
+                    dpi=300, bbox_inches="tight")
     plt.show()
-    return fig, (ax1, ax2)
+    if panels == "both":
+        return fig, (ax1, ax2)
+    return fig, (ax1 if ax1 is not None else ax2)
 
 
 # =====================================================================

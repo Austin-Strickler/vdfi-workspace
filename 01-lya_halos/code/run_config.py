@@ -38,14 +38,14 @@ cfg = PipelineConfig(
 
     # ===== RADIAL BINNING ============================================
     bins      = [0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0],
-    #bins      = [0, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    #bins      = [0, 10, 20, 30, 50, 80, 140, 300, 600, 1000, 2000],
 
                                           # edges in the unit named by bin_mode
                                           #   virial -> R/Rvir edges (per-gal kpc derived in Stage 1)
-    bin_mode  = "virial",                    # 'virial' | 'kpc' | 'arcsec'
+    bin_mode  = "kpc",                    # 'virial' | 'kpc' | 'arcsec'
 
     # ===== FIBER MASKING (Stage 1.1) =================================
-    mask_method     = "segmap+spec_global",  # single method ('segmap') or '+'-joined composite
+    mask_method     = "segmap",  # single method ('segmap') or '+'-joined composite
                                           #   ('segmap+spec_local') -- components OR-combine (bad
                                           #   in ANY component -> bad overall). Components:
                                           #   'segmap' (baked mask) | 'image' (legacy percentile-
@@ -68,13 +68,13 @@ cfg = PipelineConfig(
                                           #   plotting.plot_fiber_mask_appendix / core.select_core_by_id).
 
     # ===== BACKGROUND (Stage 1.3) ====================================
-    bg_inner_arcsec = 57.0,               # float; annulus inner radius (arcsec)
-    bg_outer_arcsec = 63.0,               # float; annulus outer radius (arcsec)
-    min_bg_fibers   = 25,                 # int; below this, fall back to galaxy-level bg
+    bg_inner_arcsec = 80.0,               # float; annulus inner radius (arcsec)
+    bg_outer_arcsec = 90.0,               # float; annulus outer radius (arcsec)
+    min_bg_fibers   = 999999,             # int; below this, fall back to galaxy-level bg
     smooth_bg       = True,               # True | False  (False injects annulus shot-noise -- keep True)
     bg_smooth_method = "interp_gauss",    # 'interp_gauss' (DEFAULT, ~100x faster: mask Lya, interpolate,
                                           #   one uniform gaussian) | 'adaptive' (legacy ramped-sigma smoother)
-    bg_smooth_sigma_A      = 25.0,        # interp_gauss: uniform smoothing width (A)
+    bg_smooth_sigma_A      = 30.0,        # interp_gauss: uniform smoothing width (A)
     line_mask_halfwidth_A  = 10.0,        # interp_gauss: half-width (observed A) of the masked Lya gap
     smoothing_values = [200, 20, 300],    # LEGACY ('adaptive' only): [sigma_A, edge_sigma_A, edge_width_A]
 
@@ -98,7 +98,7 @@ cfg = PipelineConfig(
     # ===== STAGE 2 REST-FRAME STACKING ===============================
     rest_delta      = 0.2,                # rest-frame grid step (A); e.g. 0.2
     rest_wave_min   = 1100,               # rest-frame grid min (A)
-    rest_wave_max   = 1400,               # rest-frame grid max (A)
+    rest_wave_max   = 1700,               # rest-frame grid max (A)
     flux_unit       = "L_kpc2",           # 'raw' | 'flux_arcsec2' | 'L_fiber' | 'L_kpc2'
     flux_unit_scale = 1e-17,              # multiplies stored flux (erg/s/cm^2/A per count)
     fiber_diam_arcsec = 1.5,              # average-fiber aperture diameter (arcsec)
@@ -120,8 +120,8 @@ cfg = PipelineConfig(
 
 # ===== STAGE 3 LINE MEASUREMENT ==================================
     # NOTE: Lya rest wavelength is FIXED -> PipelineConfig.LYA_REST (1215.67 A, vacuum).
-    line_window = [LYA_REST-4, LYA_REST+4],     # [lo, hi] rest-frame A bracketing LYA_REST
-    n_bootstrap = 1000,                         # int; galaxy-resampling draws for the centroid error
+    line_window = [LYA_REST-3, LYA_REST+3],     # [lo, hi] rest-frame A bracketing LYA_REST
+    n_bootstrap = 2000,                         # int; galaxy-resampling draws for the centroid error
 
     # --- continuum subtraction (sideband-anchored) ---
     cont_method  = "median",              # 'median' (flat robust level; NEW default) | 'poly'

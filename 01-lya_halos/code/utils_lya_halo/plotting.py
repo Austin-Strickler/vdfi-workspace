@@ -571,6 +571,17 @@ def _get_vr_biweight_v(VR_biweight_v, stacks_result):
     return None
 
 
+def _get_vr_biweight_e(VR_biweight_error, stacks_result):
+    """1-sigma scatter (kpc) on the sample's biweight virial radius: explicit
+    arg wins, else stacks_result['VR_biweight_e'] (set by
+    stack.sample_virial_radius_kpc), else None (no error band drawn)."""
+    if VR_biweight_error is not None:
+        return float(VR_biweight_error)
+    if stacks_result is not None and stacks_result.get("VR_biweight_e") is not None:
+        return float(stacks_result["VR_biweight_e"])
+    return None
+
+
 def _resolve_bin_mode(bin_mode, stacks_result):
     """Native radial unit: explicit arg wins, else stacks_result['bin_mode'],
     else 'virial'."""
@@ -610,14 +621,27 @@ def _radius_points(radial_bins):
 
 
 def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
-                       vr_ticks, xlims):
+                       vr_ticks, xlims, show_vr=True, VR_biweight_error=None):
     """
     Put the NATIVE bin unit on the bottom axis and the comparison unit on top:
       virial -> bottom R/Rvir, top kpc (if VR_biweight_v known)
       kpc    -> bottom kpc,    top R/Rvir (if VR_biweight_v known)
       arcsec -> bottom arcsec, NO top axis (nothing to convert to)
-    Draws the Rvir reference line where it is meaningful. Returns (r_mid, xerr)
-    in native units.
+    Draws the Rvir reference line (and, if VR_biweight_error is given, a
+    shaded +/- error band around it) where it is meaningful. Returns
+    (r_mid, xerr) in native units.
+
+    show_vr           : master toggle for the Rvir line + error band (both
+                         off together when False). Does not affect the
+                         secondary (top) comparison axis.
+    VR_biweight_error  : 1-sigma scatter on the sample's biweight virial
+                         radius, ALWAYS in kpc (same unit as VR_biweight_v --
+                         see stack.sample_virial_radius_kpc's VR_biweight_e).
+                         None -> no band drawn. Converted internally to native
+                         units: divided by VR_biweight_v for bin_mode='virial'
+                         (R/Rvir-space width), used as-is for bin_mode='kpc'.
+                         No effect for bin_mode='arcsec' (no clean conversion,
+                         same limitation as the Rvir line/top axis there).
     """
     bins, r_mid, xerr = _radius_points(radial_bins)
 
@@ -638,10 +662,21 @@ def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
         ax.text(xpos, 0.95, r"$R_{\rm vir}$", transform=ax.get_xaxis_transform(),
                 ha="right", va="top", fontsize=15, color="0.25")
 
+    def _rvir_band(xpos, half_width):
+        if half_width is None or not np.isfinite(half_width) or half_width <= 0:
+            return
+        lo, hi = xpos - half_width, xpos + half_width
+        if lo <= 0:
+            lo = xpos * 1e-3   # keep positive for the log x-axis
+        ax.axvspan(lo, hi, color="0.35", alpha=0.12, lw=0, zorder=0)
+
     if bin_mode == "virial":
         ax.set_xticks(vr_ticks)
         ax.set_xticklabels([str(t) for t in vr_ticks])
-        _rvir_line(1.0)
+        if show_vr:
+            _rvir_line(1.0)
+            if VR_biweight_error is not None and VR_biweight_v:
+                _rvir_band(1.0, VR_biweight_error / VR_biweight_v)
         if VR_biweight_v is not None:
             secax = ax.secondary_xaxis(
                 "top", functions=(lambda r: r * VR_biweight_v,
@@ -650,8 +685,10 @@ def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
             secax.set_xscale("log")
     elif bin_mode == "kpc":
         rvir_kpc = VR_biweight if VR_biweight is not None else VR_biweight_v
-        if rvir_kpc is not None:
+        if show_vr and rvir_kpc is not None:
             _rvir_line(rvir_kpc)
+            if VR_biweight_error is not None:
+                _rvir_band(rvir_kpc, VR_biweight_error)
         if VR_biweight_v is not None:
             secax = ax.secondary_xaxis(
                 "top", functions=(lambda k: k / VR_biweight_v,
@@ -660,7 +697,7 @@ def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
             secax.set_xscale("log")
             secax.set_xticks(vr_ticks)
             secax.set_xticklabels([str(t) for t in vr_ticks])
-    # arcsec: native bottom only
+    # arcsec: native bottom only -- no Rvir line/band (no clean conversion)
 
     return r_mid, xerr
 
@@ -712,10 +749,13 @@ def plot_centroid_vs_radius(
     label="Bootstrapped centroid",
     ylims=(-200, 200),
     xlims=None,
+    show_vr=True,
+    VR_biweight_error=None,
     add_point=None,
     add_axhline=None,
     plot_literature=False,
     save_fig=False,
+    savename="Figure_centroid_profile.png",
 ):
     """
     Headline Stage-3 figure: centroid velocity per radial bin with its bootstrap
@@ -731,11 +771,18 @@ def plot_centroid_vs_radius(
                     and if still unknown the top axis is simply omitted.
     xlims         : in NATIVE units now (None -> auto from the bins).
     z_err_kms     : systemic-z band (km/s); off by default for a stack.
+    show_vr       : draw the dashed Rvir reference line (and its error band,
+                    if any). False hides both.
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                    radius; draws a shaded band around the Rvir line. None
+                    (default) -> read stacks_result['VR_biweight_e'] (set by
+                    stack.sample_virial_radius_kpc) if available, else no band.
 
     Returns (fig, ax).
     """
     bin_mode = _resolve_bin_mode(bin_mode, stacks_result)
     VR_biweight_v = _get_vr_biweight_v(VR_biweight_v, stacks_result)
+    VR_biweight_error = _get_vr_biweight_e(VR_biweight_error, stacks_result)
 
     v_med = np.asarray(boot["centroid_v_med"])
     v_lo = np.asarray(boot["centroid_v_lo"])
@@ -744,7 +791,8 @@ def plot_centroid_vs_radius(
 
     fig, ax = plt.subplots(figsize=figsize)
     r_mid, xerr = _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v,
-                                     VR_biweight, vr_ticks, xlims)
+                                     VR_biweight, vr_ticks, xlims,
+                                     show_vr=show_vr, VR_biweight_error=VR_biweight_error)
     eb = ax.errorbar(r_mid, v_med, xerr=xerr, yerr=yerr, fmt="o",
                      capsize=3.5, ms=6, lw=1.5, label=label)
     if np.any(unstable):
@@ -786,10 +834,11 @@ def plot_centroid_vs_radius(
 
     ax.set_ylim(ylims)
     ax.set_ylabel(r"Ly$\alpha$ centroid velocity [km s$^{-1}$]")
-    ax.set_title(title)
+    if title:
+        ax.set_title(title)
     ax.legend(frameon=False, fontsize=10)
     if save_fig:
-        plt.savefig("Figure.png", dpi=300)
+        plt.savefig(savename, dpi=300, bbox_inches="tight")
     plt.show()
     return fig, ax
 

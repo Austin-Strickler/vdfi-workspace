@@ -25,7 +25,7 @@ import astropy.units as u
 from astropy.table import vstack
 from scipy.interpolate import interp1d
 
-from .virial import cosmo                 # Planck18, single source
+from .virial import cosmo, estimate_M200c_R200c_from_Mstar   # Planck18 + Moster+2013 R200c chain
 from .config import PipelineConfig
 from .extract import combine_fibers, radial_bin_edges   # reused for galaxy-axis combine + Rvir
 
@@ -149,42 +149,67 @@ def coadd_galaxies(cube_flux, cube_err, methods, weights=None):
 # ---------------------------------------------------------------------
 # 2.0  Full assembly
 # ---------------------------------------------------------------------
-def sample_virial_radius_kpc(config: "PipelineConfig", mass, z):
+def sample_virial_radius_kpc(config: "PipelineConfig", mass, z,
+                             m_min: float = 7.0, m_max: float = 11.0):
     """
-    Biweight virial radius (kpc) of the sample -- the factor that converts the
-    R/Rvir bin edges to kpc for plotting/reporting (VR_biweight_v).
+    Biweight virial radius (kpc) of the sample -- the factor that converts
+    R/Rvir to kpc for plotting/reporting (VR_biweight_v), plus its biweight
+    scatter across the sample (VR_biweight_e).
 
-    Virial mode only: derives each galaxy's Rvir from its per-galaxy kpc edges
-    (radial_bin_edges, which already calls the virial relation) as
-    edge / (R/Rvir) at the first nonzero bin, then biweights over galaxies.
-    Returns None for non-virial bin modes or if it cannot be computed, so it is
-    purely informational and never affects the stacks themselves.
+    For EACH galaxy, derives its own R200c [kpc] directly from its stellar
+    mass + z via the Moster+2013 SHMR chain (estimate_M200c_R200c_from_Mstar --
+    the SAME relation virial_to_kpc_bins uses per galaxy when bin_mode='virial'),
+    with the same log-mass clipping (m_min/m_max) as virial_to_kpc_bins. Then
+    biweight-combines that per-galaxy R200c array over the sample.
+
+    R200c is a physical property of each galaxy (from its mass and z) -- it does
+    NOT depend on how the radial bins themselves are defined, so unlike the old
+    version this is computed the SAME way for every config.bin_mode ('virial',
+    'kpc', or 'arcsec'), not just 'virial'. This lets you ask "what's the
+    biweight virial radius of my sample?" even when you binned in kpc.
+
+    Returns
+    -------
+    (VR_biweight_v, VR_biweight_e) : (float | None, float | None)
+        Biweight-location and biweight-scale (~1-sigma scatter) of the
+        per-galaxy R200c [kpc] array. VR_biweight_e is None if it cannot be
+        estimated (e.g. fewer than 2 finite galaxies). Both are None if
+        VR_biweight_v itself cannot be computed. Purely informational -- never
+        affects the stacks themselves (build_stacks wraps this in try/except).
     """
-    from astropy.stats import biweight_location
+    from astropy.stats import biweight_location, biweight_scale
 
-    if config.bin_mode.lower() not in ("virial", "vr"):
-        return None
-    bins = np.asarray(config.bins, dtype=float)
-    nz = np.nonzero(bins)[0]
-    if nz.size == 0:
-        return None
-    j = int(nz[0])
     mass = np.asarray(mass, dtype=float)
     z = np.asarray(z, dtype=float)
 
     rvir = np.full(len(z), np.nan)
     for i in range(len(z)):
+        mi, zi = float(mass[i]), float(z[i])
+        if not np.isfinite(mi) or not np.isfinite(zi) or zi <= 0:
+            continue
         try:
-            edges = np.asarray(radial_bin_edges(config, float(mass[i]), float(z[i])),
-                               dtype=float)
-            rvir[i] = edges[j] / bins[j]
+            m_used = np.clip(mi, m_min, m_max)
+            _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, zi)
+            rvir[i] = r200c
         except Exception:
             rvir[i] = np.nan
 
-    if not np.any(np.isfinite(rvir)):
-        return None
+    finite = np.isfinite(rvir)
+    if not np.any(finite):
+        return None, None
     val = biweight_location(rvir, ignore_nan=True)
-    return float(val) if np.isfinite(val) else None
+    if not np.isfinite(val):
+        return None, None
+
+    err = None
+    if int(finite.sum()) > 1:
+        try:
+            e = biweight_scale(rvir, ignore_nan=True)
+            err = float(e) if np.isfinite(e) else None
+        except Exception:
+            err = None
+
+    return float(val), err
 
 
 def build_stacks(config: "PipelineConfig", product: "GalaxyProduct",
@@ -250,9 +275,10 @@ def build_stacks(config: "PipelineConfig", product: "GalaxyProduct",
         "unit_info": unit_info,
     }
     try:
-        result["VR_biweight_v"] = sample_virial_radius_kpc(config, m, z)
+        result["VR_biweight_v"], result["VR_biweight_e"] = sample_virial_radius_kpc(config, m, z)
     except Exception:
         result["VR_biweight_v"] = None   # never let a reporting helper break Stage 2
+        result["VR_biweight_e"] = None
     if keep_cube:
         result["cube_flux"] = cube_f
         result["cube_err"] = cube_e
@@ -302,21 +328,18 @@ def resolve_galaxy_index(product: "GalaxyProduct", *, gid=None, index=None,
     return int(hits[0])
 
 
-def _single_galaxy_rvir_kpc(config, mass, z):
-    """This galaxy's own kpc-per-(R/Rvir) factor, for the kpc top axis.
-    Mirrors sample_virial_radius_kpc but for one object (no biweight).
-    Returns None for non-virial bin modes or if it can't be derived."""
-    if config.bin_mode.lower() not in ("virial", "vr"):
+def _single_galaxy_rvir_kpc(config, mass, z, m_min: float = 7.0, m_max: float = 11.0):
+    """This galaxy's own R200c [kpc] -- the kpc-per-(R/Rvir=1) factor, for the
+    kpc<->R/Rvir comparison axis. Mirrors sample_virial_radius_kpc for one
+    object (no biweight/scatter -- a single galaxy has no sample scatter to
+    combine). Computed the same way regardless of config.bin_mode (see
+    sample_virial_radius_kpc)."""
+    if not np.isfinite(mass) or not np.isfinite(z) or z <= 0:
         return None
-    bins = np.asarray(config.bins, dtype=float)
-    nz = np.nonzero(bins)[0]
-    if nz.size == 0 or not np.isfinite(mass) or not np.isfinite(z):
-        return None
-    j = int(nz[0])
     try:
-        edges = np.asarray(radial_bin_edges(config, float(mass), float(z)), dtype=float)
-        val = edges[j] / bins[j]
-        return float(val) if np.isfinite(val) else None
+        m_used = np.clip(float(mass), m_min, m_max)
+        _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, float(z))
+        return float(r200c) if np.isfinite(r200c) else None
     except Exception:
         return None
 

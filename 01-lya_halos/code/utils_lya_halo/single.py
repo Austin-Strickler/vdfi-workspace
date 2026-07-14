@@ -33,6 +33,7 @@ import numpy as np
 
 from .stack import convert_avg_fiber_bin, stack_spec_values, rest_grid
 from .extract import radial_bin_edges, combine_fibers
+from .virial import estimate_M200c_R200c_from_Mstar
 from .measure import measure_centroid, integrated_line_flux, DEFAULT_CONT_BOUNDS
 
 if TYPE_CHECKING:
@@ -76,21 +77,18 @@ def resolve_galaxy_index(product: "GalaxyProduct", *, gid=None, index=None,
     return int(hits[0])
 
 
-def _single_galaxy_rvir_kpc(config, mass, z) -> Optional[float]:
-    """This galaxy's own kpc-per-(R/Rvir) factor, for the kpc top axis.
-    Mirrors stack.sample_virial_radius_kpc but for one object (no biweight).
-    Returns None for non-virial bin modes or if it can't be derived."""
-    if config.bin_mode.lower() not in ("virial", "vr"):
+def _single_galaxy_rvir_kpc(config, mass, z, m_min: float = 7.0, m_max: float = 11.0) -> Optional[float]:
+    """This galaxy's own R200c [kpc] -- the kpc-per-(R/Rvir=1) factor, for the
+    kpc<->R/Rvir comparison axis. Mirrors stack.sample_virial_radius_kpc for
+    one object (no biweight/scatter -- a single galaxy has no sample scatter
+    to combine). Computed the same way regardless of config.bin_mode (see
+    stack.sample_virial_radius_kpc)."""
+    if not np.isfinite(mass) or not np.isfinite(z) or z <= 0:
         return None
-    bins = np.asarray(config.bins, dtype=float)
-    nz = np.nonzero(bins)[0]
-    if nz.size == 0 or not np.isfinite(mass) or not np.isfinite(z):
-        return None
-    j = int(nz[0])
     try:
-        edges = np.asarray(radial_bin_edges(config, float(mass), float(z)), dtype=float)
-        val = edges[j] / bins[j]
-        return float(val) if np.isfinite(val) else None
+        m_used = np.clip(float(mass), m_min, m_max)
+        _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, float(z))
+        return float(r200c) if np.isfinite(r200c) else None
     except Exception:
         return None
 

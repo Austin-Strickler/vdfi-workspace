@@ -71,7 +71,7 @@ class PipelineConfig:
     bin_mode: str = "virial"             # 'virial' | 'kpc' | 'arcsec'
 
     # --- fiber masking (Stage 1.1) --------------------------------------
-    mask_method: str = "segmap+spec_global"  # single method ('segmap') OR a '+'-joined
+    mask_method: str = "segmap"           # single method ('segmap') OR a '+'-joined
                                           #   composite ('segmap+spec_local') that OR-combines
                                           #   each component's boolean mask (bad in ANY
                                           #   component -> bad in the result). Components:
@@ -114,13 +114,13 @@ class PipelineConfig:
                                           #   the plotting/diagnostic tools
 
     # --- background (Stage 1.3) -----------------------------------------
-    bg_inner_arcsec: float = 55.0
-    bg_outer_arcsec: float = 65.0
-    min_bg_fibers: int = 25
+    bg_inner_arcsec: float = 80.0
+    bg_outer_arcsec: float = 90.0
+    min_bg_fibers: int = 999999
     smooth_bg: bool = True                # master on/off for background smoothing
     bg_smooth_method: str = "interp_gauss"  # 'interp_gauss' (default, fast) | 'adaptive' (legacy)
     # -- 'interp_gauss' params (mask Lya, interpolate, one uniform gaussian) --
-    bg_smooth_sigma_A: float = 25.0       # uniform smoothing width (A)
+    bg_smooth_sigma_A: float = 30.0       # uniform smoothing width (A)
     line_mask_halfwidth_A: float = 10.0   # half-width (observed A) of the masked Lya gap
     # -- 'adaptive' params (legacy ramped-sigma nan-safe smoother) --
     smoothing_values: Sequence[float] = _field(
@@ -157,7 +157,7 @@ class PipelineConfig:
                                          #   the centroid -- finer is only correlated
                                          #   oversampling of the ~0.6 A native sampling
     rest_wave_min: float = 1100          # rest-frame grid min (A); covers blue sideband
-    rest_wave_max: float = 1400          # rest-frame grid max (A); covers red sideband
+    rest_wave_max: float = 1700          # rest-frame grid max (A); covers red sideband
     flux_unit: str = "L_kpc2"            # 'raw' | 'flux_arcsec2' | 'L_fiber' | 'L_kpc2'
     flux_unit_scale: float = 1e-17       # multiplies stored flux (erg/s/cm^2/A per count)
     fiber_diam_arcsec: float = 1.5       # average-fiber aperture diameter (arcsec)
@@ -194,10 +194,10 @@ class PipelineConfig:
     # module-level DEFAULT_* above back these fields and are what measure.py's
     # standalone notebook helpers use, so the default is defined in one place.
     line_window: Sequence[float] = _field(
-        default_factory=lambda: [PipelineConfig.LYA_REST - 4.0,
-                                 PipelineConfig.LYA_REST + 4.0]
+        default_factory=lambda: [PipelineConfig.LYA_REST - 3.0,
+                                 PipelineConfig.LYA_REST + 3.0]
     )                                              # +/-4 A about LYA_REST (1211.67-1219.67)
-    n_bootstrap: int = 1000
+    n_bootstrap: int = 2000
     cont_bounds: Sequence = DEFAULT_CONT_BOUNDS    # (blue, red) sidebands, Angstrom
     cont_method: str = DEFAULT_CONT_METHOD         # 'median' | 'poly'
     cont_order: int = DEFAULT_CONT_ORDER           # used only when cont_method == 'poly'
