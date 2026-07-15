@@ -10,7 +10,11 @@ validated the approach before it touched real data).
 
 **Status: Part 1 (below) describes shipped code
 (`utils_lya_halo/fitting.py`). Part 2 describes a proposed, not-started
-extension (Option C).**
+extension (Option C). Part 3 describes a proposed, not-started extension to
+measure/fit the UV-continuum radial decline from CFHT-LS r-band imaging — a
+genuinely different data product (broadband imaging, not VIRUS fiber spectra)
+that has to be extracted from scratch before any of Part 1/2's fitting
+machinery can be pointed at it.**
 
 ## Part 1 — what's implemented (`fitting.py`)
 
@@ -239,3 +243,262 @@ where noise is most likely to fool visual comparison.
    exist for Option C at all, given the two terms aren't swap-symmetric —
    likely no, but worth a one-line confirmation in the eventual code
    rather than silently assuming it.
+
+## Part 3 — proposed extension: UV-continuum radial decline from CFHT-LS r-band imaging
+
+**Goal.** Measure the sample's rest-frame UV-continuum flux as a function of
+radius directly from CFHT-LS r-band imaging (not VIRUS spectra), coadd it
+across the sample, and fit its radial decline — a genuinely different data
+product from Part 1/2 (broadband imaging vs. fiber spectroscopy), sized to
+eventually be fit and compared alongside the Lyα halo profile using the same
+`fitting.py` conventions once it exists as a real per-bin flux(r) array.
+
+**Why r-band is the right filter.** Over the sample's z=2–3 range, observed
+r-band samples rest-frame ≈1500–3000 Å — squarely the UV continuum, not a
+strong emission line — so this is a clean stellar-continuum probe, physically
+distinct from the scattered-Lyα-photon halo Part 1/2 model.
+
+**Physical picture — why this is a different model, not a Part-1 reuse.**
+Part 1/2's two-exponential and cored-power-law models describe *scattered
+Lyα photons* (a genuine core+extended-halo structure). The UV continuum is
+starlight from the galaxy itself — expected to look like an ordinary
+disk/Sersic light profile, not a core+halo structure. Per the Profile Model
+decision below, this is spec'd as its own single-exponential (Sersic-capable)
+model in `fitting.py`, not a repurposing of `intrinsic_profile`.
+
+### Data
+
+Two CFHT-LS r-band mosaics, one per field (AEGIS, COSMOS), each ≈1 deg²
+at 1/6″/pixel (≈0.167″/px). Full-mosaic images are too large to work with
+directly at per-galaxy speed, so each field needs its own **cutout** around
+the actual sample footprint before any per-galaxy extraction runs.
+
+**Image paths — DECIDED, rewire `cont_image_path` (config.py code TODO).**
+The current `resolve_cont_image_path()` per-field map
+(`CFHT_COSMOS_image.fits` for COSMOS, `groth.fits` for AEGIS) is stale.
+There's a newer, working pair already sitting in `catalogs/images/`:
+`catalogs/images/groth.fits` (AEGIS) and `catalogs/images/cosmos.fits`
+(COSMOS). **When coding this up: update `resolve_cont_image_path`'s
+per-field dict to these two paths** — no new config field needed (no
+`uv_image_path`, superseding the earlier draft of this spec); this
+extension and the existing `mask_method='image'` fiber-masking path both
+end up reading the same, now-current, per-field image through
+`cont_image_path`.
+
+- AEGIS already has a cutout defined from earlier work — **[DECIDE]:
+  confirm its footprint/margin (see below) still covers every AEGIS
+  galaxy's outermost annulus + background ring**, since it wasn't
+  necessarily built for this specific bin scheme; regenerate if not.
+- COSMOS has no cutout yet — build one the same way: bounding box from
+  the actual RA/Dec **object distribution** of the COSMOS subsample (from
+  the catalog, see RA/Dec source below), padded by a buffer of roughly
+  **2× the largest annulus radius** (angular size at the sample's lowest
+  z, i.e. the largest angular extent in the sample) — a deliberately
+  generous margin "just to be sure" per your call, not a tight minimum.
+
+**RA/Dec source: reuse the combined product, don't re-query.** The 450
+galaxies to extract are already the exact sample that made it into the
+spectral stack (same catalog cuts, same finite-spectrum cut). Pull RA/Dec
+from the already-combined `GalaxyProduct`/`stacks`/`boot`'s attached
+catalog table (`product.catalog`, carried through `_concat_products`,
+`load_for_stack`, and Stage 2) rather than re-querying
+`catalog_path` fresh — guarantees this UV-continuum sample is pixel-for-
+pixel the same 450 galaxies already in the Lyα profile, not a
+similar-but-possibly-drifted list.
+
+### Extraction: single-field-at-a-time, not interleaved
+
+Your instinct is right, and it matches an existing convention:
+`PipelineConfig.normalized_field()` already treats `field='BOTH'` as a
+**stacking-only** concept — Stage 1 extraction is always single-field, and
+combination happens after, specifically to avoid the extraction step
+having to reason about two fields at once. Do the same here: run every
+AEGIS galaxy's cutout+centroid+annuli against the AEGIS mosaic in one pass,
+then every COSMOS galaxy against the COSMOS mosaic, rather than switching
+field-by-field per galaxy. This avoids repeatedly opening/seeking a ~1 deg²
+FITS (or holding both mosaics memory-resident at once) — real cost, not a
+hypothetical one, at this pixel scale.
+
+### Per-galaxy pipeline
+
+1. **Cutout.** From the galaxy's catalog RA/Dec, cut a small WCS-aware
+   stamp sized to comfortably contain the outermost annulus + background
+   ring. Reuse the WCS/pixel-scale pattern already built for fiber masking
+   (`masking.py`'s `WCS(header)`, `get_pixscale_arcsec`, `SkyCoord`) rather
+   than reinventing RA/Dec-to-pixel handling — this is the same conversion,
+   just applied per-galaxy instead of per-fiber.
+2. **Centroid.** 2D-Gaussian fit (`photutils.centroid_2dg`) on the cutout
+   to locate the true continuum peak, windowed tightly enough to avoid
+   pulling onto a neighbor. Compute the angular offset from the catalog
+   position via `SkyCoord` separation; flag (`centroid_offset_flag`)
+   galaxies with offset > 0.5–1″ (exact threshold tunable — start at 0.5″
+   per your instinct, loosen if it flags an implausibly large fraction of
+   the sample). **DECIDED: kept-but-flagged**, not dropped — mirrors
+   `success_frac`/mask-based QC already used elsewhere in this pipeline
+   (e.g. `bootstrap_measurements`'s success tracking), so you can inspect
+   the flagged fraction before ever deciding to cut anything.
+   **DECIDED: fallback when the 2D-Gaussian fit fails to converge**
+   (low S/N, blended source) is the catalog position + flag — simplest
+   option, consistent with the kept-but-flagged policy above. Revisit
+   toward a multi-seed retry (same multi-seed-then-best-fit philosophy
+   `_default_seeds`/`_best_of_seeds` already use for the flux-profile
+   fits) only if this simple fallback ends up flagging an implausibly
+   large fraction of the sample in practice.
+3. **Circularized annuli / per-galaxy flux profile.** Once centroid is
+   fixed, build circular annuli (`photutils.CircularAnnulus`) at the same
+   radii convention as the rest of the pipeline (`config.bins`/
+   `bin_mode` — see Radial Bins below), converted to this image's native
+   pixel scale via the same kpc↔arcsec conversion machinery `virial.py`/
+   `stack.py` already use (`cosmo.angular_diameter_distance(z)` at each
+   galaxy's own z). Report the **bin AVERAGE** flux per annulus (mean
+   per-pixel value within the ring), not a raw sum — matches Part 1's
+   "average, not summed" convention exactly (see Part 1 above), so this
+   profile is fit with the same `bin_average_*`-style machinery once it
+   exists, not a differently-normalized quantity that needs reconciling
+   later.
+   - **Background/sky subtraction — plan sketched, exact form still
+     open.** Working approach: mask bright objects using the existing
+     full-field segmentation mask (see below — it's built from these
+     exact images), then take the **median of the remaining unmasked
+     sky pixels across the whole field** as one global background level
+     per field, subtracted from every galaxy's annuli. Simpler fallback
+     if that's not runtime-feasible right now: a flat median of the whole
+     (unmasked) field — accept the small risk of slight oversubtraction
+     from any bright-object flux that leaks through, and revisit only if
+     it turns out to matter.
+   - **Neighbor/contaminant masking — DECIDED, don't actively mask
+     per-annulus.** A SExtractor segmentation map already exists, built
+     directly from these CFHT-LS images (not the fiber-scale one — it's
+     pixel-compatible by construction) and lightly dilated to be
+     conservative; reuse it for the background-median masking above. For
+     the per-galaxy annulus photometry itself, don't reject or mask
+     contaminated bins — the final biweight coadd across the sample
+     (Coaddition below) is expected to be robust to the occasional
+     neighbor-contaminated annulus in one galaxy. **Note to revisit**: if
+     the stacked profile looks contaminated (e.g. an unexpected bump at a
+     particular radius), this is the first assumption to test — rerun
+     with per-annulus contaminant masking using the same segmap and
+     compare.
+
+### Radial bins
+
+Use `config.bin_mode`'s existing scheme (virial/kpc/arcsec), per your
+normal workflow of hand-defining a fresh `PipelineConfig` per notebook —
+so this reuses the *mechanism* (`radial_bin_edges`, the per-galaxy
+kpc↔arcsec conversion, `bin_mode` semantics) without reusing the Lyα
+halo's actual bin *values*. You'll pass your own ultra-fine, small-radius
+bin edges tailored to this imaging's much better native resolution
+(1/6″/px vs. the fiber-limited spectral bins) — nothing in this spec
+requires matching Part 1's `[0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]`
+default.
+
+### Coaddition and bootstrap
+
+Once every galaxy has a `(r, mean_flux)` profile: combine across the
+galaxy axis using the **same** `config.galaxy_combine_methods`
+(biweight/inv_var/mean/median/sigma_clip/weighted_median) Stage 2
+(`stack.py`) already computes for the spectral stack — one coadd
+methodology across the whole pipeline, not a second bespoke one for
+imaging. Once the fiducial coadd is validated, bootstrap the galaxy
+resampling (same style as `measure.py`'s `bootstrap_measurements`/
+`bootstrap_all` — resample *which galaxies* enter the coadd, not a
+per-pixel noise model) for 16/84 error bars on the stacked r-band
+flux(r) profile. Deferred until the fiducial pipeline is validated —
+same staged posture Part 1/2 already use (synthetic/Monte Carlo
+validation, or here fiducial-only validation, before bootstrap
+propagation).
+
+### Model: single exponential (default), with an optional Sersic fit
+
+Default model, a new addition to `fitting.py` (not a reuse of Part 1's
+`intrinsic_profile`, per the Physical Picture note above):
+
+```
+I(r) = A * exp(-r / h_UV)
+```
+
+one component, matching the expected disk-like UV-continuum decline. PSF
+correction reuses Part 1's ring-convolution machinery unchanged in
+structure — `ring_convolution_matrix` depends only on `(r_fine, r_edges,
+psf_r, psf_vals)`, never on the intrinsic profile's functional form, so
+swapping in the CFHT-LS PSF is the only new input needed — same "swap the
+PSF, touch nothing else" property Part 1's docstring already advertises.
+**Not needed to get the first profiles built**, but will be needed once
+real flux(r) curves exist and a PSF-aware fit is run: first choice is
+whatever seeing FWHM is documented in the image header or the CFHT-LS
+survey release notes (cheap, no new measurement); fall back to an
+empirical measurement from stars in the mosaic (mirroring how
+`starpsf.py` measures the VIRUS PSF) only if no documented value is
+trustworthy enough.
+
+Optional alternative form, offered alongside (not replacing) the default:
+
+```
+I(r) = A * exp(-b_n * [(r / r_e)^(1/n) - 1])          (Sersic)
+```
+
+with `n` fixed at 1 recovering the pure-exponential default above as a
+special case. **[DECIDE]: `n` floated vs. tested at a small set of fixed
+values** — same open-question shape as Part 2's `gamma`-floated-vs-fixed
+question; likely worth deferring to once real profiles are in hand rather
+than deciding blind.
+
+### Where this lives during development
+
+Per your direction, the extraction + fitting testbed for this starts in
+`fitting.py` (fast iteration in one file, same as Option C's Section 7),
+not `analysis.py`, until it's validated. One architectural note worth
+flagging now rather than discovering later: Part 1/2's existing code in
+`fitting.py` is pure numpy/scipy with no image I/O — this extension's
+cutout/WCS/centroiding/aperture-photometry pieces pull in astropy/photutils
+and are, in spirit, closer to `extract.py`'s Stage-1 job (turn raw
+data + a catalog position into a per-galaxy array) than to `fitting.py`'s
+job (turn an existing array into fitted parameters). Recommend keeping
+that seam explicit even while everything sits in `fitting.py` for testing
+— e.g. a clearly-separated "extraction" section vs. "fitting" section
+within the file — so that when this *does* mature, the extraction half has
+an obvious future home (`extract.py` or a new dedicated module) separate
+from the fitting half, which stays in `fitting.py` permanently alongside
+Part 1/2's models. Mirrors how Option C's fitting-only code was written to
+never touch `analysis.py` until it earns its way in via
+`compare_models_aic_bic` — same posture, applied to a wider slice of the
+pipeline this time since extraction itself is new, not just a new model.
+
+### Success criteria
+
+- Centroid offsets are small and consistent with astrometric + centroiding
+  noise across the sample — a handful of flagged outliers, not a
+  systematic offset suggesting a WCS or catalog-matching bug.
+- The fiducial coadded profile declines ~monotonically with radius,
+  consistent with a UV-continuum disk profile (not dominated by
+  neighbor contamination or an unsubtracted background gradient).
+- The default single-exponential fit converges with a reasonable
+  chi2/dof, reported with the same diagnostic conventions Part 1 already
+  established for the real-data Lyα fit.
+- Bootstrapped `h_UV` has a believable uncertainty and, once compared,
+  a sane relationship to the Lyα halo's own `h1`/`h2` (e.g. is the UV
+  continuum's scale length inside, comparable to, or well inside the
+  Lyα core term) — the actual physical payoff of building this at all.
+
+## Open questions before implementing Part 3
+
+1. **Code TODO**: rewire `config.py`'s `resolve_cont_image_path()`
+   per-field map to `catalogs/images/groth.fits` (AEGIS) and
+   `catalogs/images/cosmos.fits` (COSMOS); confirm AEGIS's existing
+   cutout still covers this bin scheme's radius + 2× margin, regenerate
+   if not; build the COSMOS cutout fresh the same way.
+2. Background subtraction: masked-median-of-field (primary plan) vs.
+   flat-median-of-field (simpler fallback) — start with flat-median if
+   the masked version isn't runtime-feasible yet; check against real
+   data whether the oversubtraction risk actually matters.
+3. PSF characterization — try the image header / CFHT-LS survey
+   documentation for seeing FWHM first; only build an empirical
+   star-based measurement (`starpsf.py`-style) if no trustworthy
+   documented value exists. Not needed until real profiles are in hand.
+4. Offset-flag threshold — start at 0.5″, revisit once the real flagged
+   fraction is known.
+5. Sersic `n`: floated vs. tested at fixed values — defer until real
+   profiles are in hand, same posture as Part 2's `gamma` question.
+6. If the stacked profile looks contaminated at some radius: revisit the
+   decision not to mask per-annulus neighbors, using the existing
+   SExtractor segmap.

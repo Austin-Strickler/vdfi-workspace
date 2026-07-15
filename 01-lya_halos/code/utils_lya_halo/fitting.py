@@ -32,6 +32,21 @@ Everything in Section 7 is additive -- nothing in Sections 1-6 above is
 modified. (plot_flux_profile_fit did later gain an opt-in show_components
 visualization flag -- see its docstring -- but that's a plotting addition
 only, not a change to the fitted model itself.)
+
+Section 8 below adds the fitting half of specs/halo-flux-fitting.md's
+"Part 3": a single-exponential UV-continuum radial-decline model,
+I(r) = A*exp(-r/h_UV) (default), plus an optional Sersic form with n
+floated or fixed, for the CFHT-LS r-band continuum profile -- a genuinely
+different data product (broadband imaging, not VIRUS fiber spectra) from
+Sections 1-7's Lya models. Only the MODEL + FIT pieces are implemented
+here; Part 3's extraction half (cutouts, centroiding, circular annuli,
+background subtraction, sample coaddition) is a separate, not-yet-built
+job per the spec's own note that it belongs closer to extract.py's
+territory than fitting.py's, even while it's staged here for now. Section
+8 reuses ring_convolution_matrix (Section 3) completely unmodified -- it
+never depended on the intrinsic profile's functional form -- so
+PSF-aware UV fits are just "build R with the CFHT-LS PSF instead of the
+VIRUS PSF," nothing else.
 """
 
 from __future__ import annotations
@@ -1742,3 +1757,735 @@ def plot_expcore_fit(
         describe_fit_expcore(fit_result, label=f"{method} expcore fit vs real data")
 
     return fig, (ax, ax_slope) if ax_slope is not None else ax, fit_result
+
+
+# =======================================================================
+# 8. Part 3 (fitting half only, proposed/not-shipped) -- UV-continuum
+#    radial-decline model. See specs/halo-flux-fitting.md, "Part 3 --
+#    proposed extension: UV-continuum radial decline from CFHT-LS r-band
+#    imaging", "Model: single exponential (default), with an optional
+#    Sersic fit". This section implements ONLY the model + fit machinery;
+#    the extraction half (cutouts/centroiding/annuli/background/coaddition)
+#    is separate and not built here -- per the spec's own framing, that
+#    piece is closer to extract.py's job than fitting.py's, even while it's
+#    staged in this file for now. Additive only: nothing in Sections 1-7 is
+#    touched, and analysis.py is not touched at all.
+# =======================================================================
+def sersic_bn(n):
+    """
+    Ciotti & Bertin (1999) approximation for b_n, the constant in the
+    Sersic profile I(r) = I_e*exp(-b_n*[(r/r_e)^(1/n) - 1]) chosen so that
+    r_e encloses half the total (2D-integrated) light. Valid to high
+    accuracy for n >~ 0.36 (the regime any physically reasonable
+    UV-continuum disk/bulge fit here would live in).
+
+    b_n(n=1) = 2 - 1/3 + 4/405 + 46/25515 + 131/1148175 - 2194697/30690717750
+             ~= 1.6783, matching the well-known n=1 (pure exponential)
+    value -- confirms intrinsic_profile_uv_sersic(r, A, r_e, n=1) reduces
+    to the same SHAPE as intrinsic_profile_uv_exp, just reparametrized
+    (h_uv = r_e / b_n(1); see intrinsic_profile_uv_sersic's docstring for
+    why the two aren't numerically interchangeable parameter-for-parameter).
+    """
+    n = np.asarray(n, dtype=float)
+    return (2.0 * n - 1.0 / 3.0 + 4.0 / (405.0 * n) + 46.0 / (25515.0 * n ** 2)
+            + 131.0 / (1148175.0 * n ** 3)
+            - 2194697.0 / (30690717750.0 * n ** 4))
+
+
+def intrinsic_profile_uv_exp(r, A, h_uv):
+    """
+    I(r) = A*exp(-r/h_uv) -- Part 3's DEFAULT UV-continuum model: a single
+    exponential, matching the expected disk-like starlight decline (as
+    opposed to Part 1/2's core+halo scattered-Lya-photon models). One
+    component, two parameters -- deliberately the simplest thing that
+    could work, per the spec's "Physical Picture" note that the UV
+    continuum is starlight from the galaxy itself, not a core+extended-halo
+    structure.
+    """
+    r = np.asarray(r, dtype=float)
+    return A * np.exp(-r / h_uv)
+
+
+def intrinsic_profile_uv_sersic(r, A, r_e, n):
+    """
+    I(r) = A*exp(-b_n*[(r/r_e)^(1/n) - 1]) -- Part 3's OPTIONAL alternative
+    to the default single exponential, offered alongside it (not replacing
+    it) per the spec. n=1 recovers a pure-exponential SHAPE as a special
+    case, but NOT the same parameter VALUES as intrinsic_profile_uv_exp, in
+    two ways that both need converting before comparing fit results:
+      (1) scale length: r_e/b_n(n), not r_e itself -- e.g. at n=1,
+          h_uv-equivalent = r_e / 1.6783, not r_e.
+      (2) amplitude anchor point: A here is I(r_e) (the Sersic convention --
+          exponent is exactly 0 at r=r_e), whereas intrinsic_profile_uv_exp's
+          A is I(0). The two are related by A_exp = A_sersic *
+          exp(+b_n(n)) at n=1 (i.e. A_sersic = A_exp * exp(-r_e/h_uv)).
+    Confirmed numerically: intrinsic_profile_uv_sersic(r, A*exp(-r_e/h_uv),
+    r_e=h_uv*sersic_bn(1), n=1) == intrinsic_profile_uv_exp(r, A, h_uv) to
+    machine precision -- the two ARE the same curve at n=1, just addressed
+    by different (amplitude, scale) coordinates; don't diff A or r_e/h_uv
+    directly across the two models without this conversion.
+    """
+    r = np.asarray(r, dtype=float)
+    b_n = sersic_bn(n)
+    return A * np.exp(-b_n * ((r / r_e) ** (1.0 / n) - 1.0))
+
+
+def _fine_ring_flux_generic(profile_fn, r_fine, params):
+    """
+    Shared implementation of Part 1/2's "_fine_ring_flux" pattern
+    (profile(r) treated as dF/dr, times local grid spacing dr -- the actual
+    flux quantum ring_convolution_matrix's R redistributes; see
+    _fine_ring_flux's docstring for why skipping the dr weighting is a real
+    bug, not a style choice), parameterized over a profile CALLABLE instead
+    of duplicated per model. Part 3 adds two more functional forms (plain
+    exponential, Sersic); rather than hand-copying the same ~4-line loop a
+    third and fourth time (as Sections 1/7 did when there was only one/two
+    models to support), it's factored out once here and reused by both.
+    """
+    r_fine = np.asarray(r_fine, dtype=float)
+    dr = np.gradient(r_fine)
+    return profile_fn(r_fine, *params) * dr
+
+
+def _bin_integrate_generic(profile_fn, r_fine, r_edges, params):
+    """Shared implementation of Part 1/2's "_bin_integrate" pattern (proper
+    bin-integrated, NO-PSF model prediction -- correct accounting for bin
+    width, not a point-evaluation at the bin midpoint), parameterized over a
+    profile callable for the same reason as _fine_ring_flux_generic."""
+    r_fine = np.asarray(r_fine, dtype=float)
+    r_edges = np.asarray(r_edges, dtype=float)
+    fine_flux = _fine_ring_flux_generic(profile_fn, r_fine, params)
+    n_bins = len(r_edges) - 1
+    bin_idx = np.searchsorted(r_edges, r_fine, side="right") - 1
+    result = np.zeros(n_bins)
+    valid = (bin_idx >= 0) & (bin_idx < n_bins)
+    np.add.at(result, bin_idx[valid], fine_flux[valid])
+    return result
+
+
+def bin_average_no_psf_uv_exp(r_fine, r_edges, A, h_uv):
+    """Mean intrinsic (single-exponential) UV flux in each bin, NO PSF --
+    same divide-by-bin-width convention as Part 1's bin_average_no_psf, per
+    the spec's explicit instruction to report the bin AVERAGE flux per
+    annulus, matching Part 1's convention exactly."""
+    return _bin_integrate_generic(intrinsic_profile_uv_exp, r_fine, r_edges,
+                                  (A, h_uv)) / _bin_widths(r_edges)
+
+
+def bin_average_psf_uv_exp(R, r_fine, r_edges, A, h_uv):
+    """Mean PSF-smeared (single-exponential) UV flux in each bin: (R @
+    fine_flux) / bin width. R is built from whatever PSF is passed to
+    ring_convolution_matrix -- the CFHT-LS PSF here, VIRUS elsewhere -- the
+    function itself is unchanged from Part 1/2."""
+    return (R @ _fine_ring_flux_generic(intrinsic_profile_uv_exp, r_fine, (A, h_uv))
+            ) / _bin_widths(r_edges)
+
+
+def bin_average_no_psf_uv_sersic(r_fine, r_edges, A, r_e, n):
+    """Sersic analogue of bin_average_no_psf_uv_exp."""
+    return _bin_integrate_generic(intrinsic_profile_uv_sersic, r_fine, r_edges,
+                                  (A, r_e, n)) / _bin_widths(r_edges)
+
+
+def bin_average_psf_uv_sersic(R, r_fine, r_edges, A, r_e, n):
+    """Sersic analogue of bin_average_psf_uv_exp."""
+    return (R @ _fine_ring_flux_generic(intrinsic_profile_uv_sersic, r_fine, (A, r_e, n))
+            ) / _bin_widths(r_edges)
+
+
+def _default_seeds_uv_exp(r, y):
+    """
+    Candidate (A, h_uv) seeds for the single-exponential UV model. Only one
+    nonlinear parameter (h_uv), so this is much less local-minima-prone
+    than Part 1/2's multi-component fits, but still tries a couple of
+    h_uv variants around the endpoint-ratio estimate (same trick
+    _seed_from_split uses internally) rather than trusting a single guess
+    on noisy real bins.
+    """
+    r = np.asarray(r, dtype=float)
+    y = np.clip(np.asarray(y, dtype=float), 1e-9, None)
+    A0 = max(float(y[0]), 1e-9)
+    if y[0] > y[-1] and y[-1] > 0:
+        h0 = max((r[-1] - r[0]) / np.log(y[0] / y[-1]), 1e-3)
+    else:
+        h0 = max(r[-1] - r[0], 1.0)
+    return [[A0, h0], [A0, h0 * 0.5], [A0, h0 * 2.0]]
+
+
+def _default_seeds_uv_sersic(r, y, *, n_fixed=None, r_e_guess=None):
+    """
+    Candidate (A, r_e[, n]) seeds for the Sersic UV model.
+
+    r_e_guess defaults to the plain-exponential h_uv estimate (same
+    endpoint-ratio trick as _default_seeds_uv_exp) converted to a Sersic
+    r_e at n=1 via r_e = h_uv * sersic_bn(1) -- a reasonable starting point
+    regardless of which n is actually being seeded, since it's just meant
+    to land in the right order of magnitude.
+
+    n_fixed=None (n floats): seeds a spread of common Sersic indices --
+    1.0 (pure exponential, the default UV model's own shape), 0.5 (a
+    Gaussian-like flatter core), 2.0, and 4.0 (de Vaucouleurs / classical
+    bulge profile) -- rather than a single arbitrary guess, since n and r_e
+    can trade off against each other on sparse bins the same way Part 2's
+    r_c/gamma do.
+
+    n_fixed=<float>: n isn't a free parameter, so seeds just vary r_e
+    around the guess.
+    """
+    r = np.asarray(r, dtype=float)
+    y = np.clip(np.asarray(y, dtype=float), 1e-9, None)
+    if r_e_guess is None:
+        if y[0] > y[-1] and y[-1] > 0:
+            h0 = max((r[-1] - r[0]) / np.log(y[0] / y[-1]), 1e-3)
+        else:
+            h0 = max(r[-1] - r[0], 1.0)
+        r_e_guess = max(h0 * float(sersic_bn(1.0)), 1.0)
+    A0 = max(float(y[0]), 1e-9)
+    if n_fixed is not None:
+        return [[A0, r_e_guess], [A0, r_e_guess * 0.5], [A0, r_e_guess * 2.0]]
+    return [[A0, r_e_guess, 1.0], [A0, r_e_guess, 0.5],
+            [A0, r_e_guess, 2.0], [A0, r_e_guess, 4.0]]
+
+
+def _data_driven_bounds_uv_exp(r_fit, y_fit):
+    """Same data-scaled philosophy as Part 1's _data_driven_bounds (see its
+    docstring) applied to the two-parameter single-exponential model."""
+    amp_max = max(50.0 * np.max(np.abs(y_fit)), 1.0)
+    h_max = max(10.0 * (np.max(r_fit) - np.min(r_fit)), 10.0)
+    return [0.0, 1e-3], [amp_max, h_max]
+
+
+def _data_driven_bounds_uv_sersic(r_fit, y_fit, *, n_fixed=None, n_bounds=(0.3, 8.0)):
+    """Same data-scaled philosophy as Part 2's _data_driven_bounds_expcore,
+    for (A, r_e[, n]). n_bounds default (0.3, 8.0) brackets everything from
+    a flattened-core (n<1) through exponential (n=1) to de Vaucouleurs
+    (n=4) and a bit beyond, rather than pinning the box to one assumed
+    shape."""
+    amp_max = max(50.0 * np.max(np.abs(y_fit)), 1.0)
+    re_max = max(10.0 * (np.max(r_fit) - np.min(r_fit)), 10.0)
+    re_min = max(1e-3, 0.01 * np.min(r_fit))
+    lower = [0.0, re_min]
+    upper = [amp_max, re_max]
+    if n_fixed is None:
+        lower.append(n_bounds[0])
+        upper.append(n_bounds[1])
+    return lower, upper
+
+
+def _pack_result_uv_exp(success, popt=None, pcov=None, reason=None, mask=None, extra=None):
+    """Same role as Part 1's _pack_result, for the (A, h_uv) parameter set."""
+    if not success:
+        return {"success": False, "reason": reason}
+    perr = (np.sqrt(np.diag(pcov)) if pcov is not None and np.all(np.isfinite(pcov))
+            else np.full(2, np.nan))
+    A, h_uv = popt
+    out = {"success": True, "model": "uv_exp",
+           "A": A, "h_uv": h_uv, "A_err": perr[0], "h_uv_err": perr[1],
+           "popt": popt, "pcov": pcov, "mask": mask}
+    if extra:
+        out.update(extra)
+    return out
+
+
+def _pack_result_uv_sersic(success, popt=None, pcov=None, reason=None, mask=None,
+                            n_fixed=None, extra=None):
+    """Same role as Part 2's _pack_result_expcore, for the (A, r_e[, n])
+    parameter set. When n_fixed is not None, n is still reported (as the
+    value it was fixed to) with n_err=0.0 and n_fixed=True, mirroring
+    _pack_result_expcore's gamma_fixed handling."""
+    if not success:
+        return {"success": False, "reason": reason}
+    if n_fixed is None:
+        perr = (np.sqrt(np.diag(pcov)) if pcov is not None and np.all(np.isfinite(pcov))
+                else np.full(3, np.nan))
+        A, r_e, n = popt
+        n_err = perr[2]
+    else:
+        perr = (np.sqrt(np.diag(pcov)) if pcov is not None and np.all(np.isfinite(pcov))
+                else np.full(2, np.nan))
+        A, r_e = popt
+        n = n_fixed
+        n_err = 0.0
+    out = {"success": True, "model": "uv_sersic",
+           "A": A, "r_e": r_e, "n": n, "n_fixed": n_fixed is not None,
+           "A_err": perr[0], "r_e_err": perr[1], "n_err": n_err,
+           "popt": popt, "pcov": pcov, "mask": mask}
+    if extra:
+        out.update(extra)
+    return out
+
+
+def describe_fit_uv_exp(result, *, label="fit", truth=None):
+    """Pretty-print a single-exponential UV fit result -- same role as
+    Part 1's describe_fit."""
+    if not result.get("success"):
+        print(f"[{label}] FAILED: {result.get('reason')}")
+        return
+    names = ("A", "h_uv")
+    print(f"[{label}] converged"
+          + (f"  chi2/dof = {result['chi2']:.2f}/{result['dof']} "
+             f"= {result['chi2'] / max(result['dof'], 1):.2f}"
+             if "chi2" in result else ""))
+    for k in names:
+        line = f"    {k:>4} = {result[k]:12.4g} +/- {result[f'{k}_err']:<10.3g}"
+        if truth is not None and k in truth:
+            t = truth[k]
+            pct = (result[k] - t) / t * 100 if t != 0 else float("nan")
+            line += f"   truth={t:11.4g}   err={pct:+7.1f}%"
+        print(line)
+
+
+def describe_fit_uv_sersic(result, *, label="fit", truth=None):
+    """Pretty-print a Sersic UV fit result -- same role as Part 2's
+    describe_fit_expcore."""
+    if not result.get("success"):
+        print(f"[{label}] FAILED: {result.get('reason')}")
+        return
+    names = ("A", "r_e", "n")
+    print(f"[{label}] converged"
+          + (f"  chi2/dof = {result['chi2']:.2f}/{result['dof']} "
+             f"= {result['chi2'] / max(result['dof'], 1):.2f}"
+             if "chi2" in result else ""))
+    for k in names:
+        tag = " (fixed)" if (k == "n" and result.get("n_fixed")) else ""
+        line = f"    {k:>4} = {result[k]:12.4g} +/- {result[f'{k}_err']:<10.3g}{tag}"
+        if truth is not None and k in truth:
+            t = truth[k]
+            pct = (result[k] - t) / t * 100 if t != 0 else float("nan")
+            line += f"   truth={t:11.4g}   err={pct:+7.1f}%"
+        print(line)
+
+
+# ---------------------------------------------------------------------
+# Four fits: naive/PSF-aware x exponential/Sersic. Same multi-seed-then-
+# lowest-chi2 strategy (_best_of_seeds, already fully generic) and the same
+# amplitude-normalization trick (_amp_scale) as Parts 1/2, for the same
+# numerical-conditioning reason (see _amp_scale's docstring).
+# ---------------------------------------------------------------------
+def fit_naive_uv_exp(r_mid, r_edges, r_fine, y, yerr, *, fit_skip_inner=1,
+                     p0=None, verbose=False):
+    """
+    Single-exponential UV-continuum fit with NO PSF: fits the bin-AVERAGED
+    model (bin_average_no_psf_uv_exp) against the data, dropping the
+    innermost fit_skip_inner bin(s) (default 1, mirroring fit_naive's
+    convention that the innermost annulus is the one most contaminated by
+    a PSF-smeared centroid/core -- pass fit_skip_inner=0 if that turns out
+    not to matter for this imaging's PSF once it's characterized).
+    """
+    r_mid = np.asarray(r_mid, dtype=float)
+    y = np.asarray(y, dtype=float)
+    yerr = np.asarray(yerr, dtype=float)
+
+    mask = np.arange(len(r_mid)) >= fit_skip_inner
+    mask &= np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
+    if mask.sum() < 2:
+        return _pack_result_uv_exp(False, reason="fewer than 2 usable bins after fit_skip_inner")
+
+    y_fit, e_fit = y[mask], yerr[mask]
+    scale = _amp_scale(y_fit)
+
+    def _model_masked(_, a, h_uv):
+        return bin_average_no_psf_uv_exp(r_fine, r_edges, a * scale, h_uv)[mask] / scale
+
+    seeds = [p0] if p0 is not None else _default_seeds_uv_exp(r_mid, y)
+    seeds = [[s[0] / scale, s[1]] for s in seeds]
+    lo, up = _data_driven_bounds_uv_exp(r_mid[mask], y_fit)
+    bounds = ([lo[0] / scale, lo[1]], [up[0] / scale, up[1]])
+
+    popt, pcov = _best_of_seeds(_model_masked, r_mid[mask], y_fit / scale,
+                                e_fit / scale, seeds, bounds)
+    if popt is None:
+        return _pack_result_uv_exp(False, reason="all seeds failed to converge")
+
+    D = np.array([scale, 1.0])
+    popt = popt * D
+    if pcov is not None:
+        pcov = pcov * np.outer(D, D)
+    # no canonical-order step -- single component, no swap ambiguity to guard against.
+
+    model_binned = bin_average_no_psf_uv_exp(r_fine, r_edges, *popt)
+    chi2 = float(np.nansum(((y_fit - model_binned[mask]) / e_fit) ** 2))
+    dof = int(mask.sum()) - 2
+    result = _pack_result_uv_exp(True, popt, pcov, mask=mask,
+                                 extra={"model_binned": model_binned, "chi2": chi2,
+                                        "dof": dof, "n_fit": int(mask.sum()), "k_params": 2})
+    if verbose:
+        n_drop = int((~mask).sum())
+        print(f"fit_naive_uv_exp: NO PSF, dropped {fit_skip_inner} inner bin(s) "
+              f"({int(mask.sum())} bins fit, {n_drop} excluded)")
+        describe_fit_uv_exp(result, label="naive-uv-exp")
+    return result
+
+
+def fit_psf_aware_uv_exp(r_mid, y, yerr, R, r_fine, r_edges, *, p0=None, verbose=False):
+    """
+    Single-exponential UV-continuum fit WITH the PSF forward model: trial
+    (A, h_uv) -> intrinsic_profile_uv_exp on r_fine -> R @ (...) -> per-bin
+    MEAN flux -> compared against the FULL binned data (no bins dropped).
+    R is the SAME ring_convolution_matrix machinery as Parts 1/2 -- built
+    with whatever PSF (r, vals) pair is passed in, CFHT-LS or otherwise.
+    """
+    r_mid = np.asarray(r_mid, dtype=float)
+    y = np.asarray(y, dtype=float)
+    yerr = np.asarray(yerr, dtype=float)
+
+    mask = np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
+    if mask.sum() < 2:
+        return _pack_result_uv_exp(False, reason="fewer than 2 finite bins")
+
+    y_fit, e_fit = y[mask], yerr[mask]
+    scale = _amp_scale(y_fit)
+
+    def _model_masked(_, a, h_uv):
+        return bin_average_psf_uv_exp(R, r_fine, r_edges, a * scale, h_uv)[mask] / scale
+
+    seeds = [p0] if p0 is not None else _default_seeds_uv_exp(r_mid, y)
+    seeds = [[s[0] / scale, s[1]] for s in seeds]
+    lo, up = _data_driven_bounds_uv_exp(r_mid[mask], y_fit)
+    bounds = ([lo[0] / scale, lo[1]], [up[0] / scale, up[1]])
+
+    popt, pcov = _best_of_seeds(_model_masked, r_mid[mask], y_fit / scale,
+                                e_fit / scale, seeds, bounds)
+    if popt is None:
+        return _pack_result_uv_exp(False, reason="all seeds failed to converge")
+
+    D = np.array([scale, 1.0])
+    popt = popt * D
+    if pcov is not None:
+        pcov = pcov * np.outer(D, D)
+
+    model_binned = bin_average_psf_uv_exp(R, r_fine, r_edges, *popt)
+    chi2 = float(np.nansum(((y_fit - model_binned[mask]) / e_fit) ** 2))
+    dof = int(mask.sum()) - 2
+    result = _pack_result_uv_exp(True, popt, pcov, mask=mask,
+                                 extra={"model_binned": model_binned, "chi2": chi2,
+                                        "dof": dof, "n_fit": int(mask.sum()), "k_params": 2})
+    if verbose:
+        print(f"fit_psf_aware_uv_exp: WITH PSF forward model, all {int(mask.sum())} "
+              f"bins fit (inner bin kept)")
+        describe_fit_uv_exp(result, label="psf-uv-exp")
+    return result
+
+
+def fit_naive_uv_sersic(r_mid, r_edges, r_fine, y, yerr, *, fit_skip_inner=1,
+                        n_fixed=None, p0=None, verbose=False):
+    """
+    Sersic UV-continuum fit with NO PSF -- same naive/drop-inner-bin(s)
+    convention as fit_naive_uv_exp, for the (A, r_e[, n]) parameter set.
+
+    n_fixed : None (default) lets n float, bounded per
+        _data_driven_bounds_uv_sersic. Pass a float (e.g. 1.0 to directly
+        compare against the pure-exponential default, or 4.0 for a
+        de Vaucouleurs/bulge-like test) to hold n fixed and fit only
+        (A, r_e) -- mirrors fit_naive_expcore's gamma_fixed pattern
+        (open question 5 in the spec: n floated vs. tested at fixed
+        values).
+    """
+    r_mid = np.asarray(r_mid, dtype=float)
+    y = np.asarray(y, dtype=float)
+    yerr = np.asarray(yerr, dtype=float)
+
+    mask = np.arange(len(r_mid)) >= fit_skip_inner
+    mask &= np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
+    n_free = 2 if n_fixed is not None else 3
+    if mask.sum() < n_free:
+        return _pack_result_uv_sersic(False, reason=f"fewer than {n_free} usable bins after fit_skip_inner")
+
+    y_fit, e_fit = y[mask], yerr[mask]
+    scale = _amp_scale(y_fit)
+
+    if n_fixed is None:
+        def _model_masked(_, a, r_e, n):
+            return bin_average_no_psf_uv_sersic(r_fine, r_edges, a * scale, r_e, n)[mask] / scale
+    else:
+        def _model_masked(_, a, r_e):
+            return bin_average_no_psf_uv_sersic(r_fine, r_edges, a * scale, r_e, n_fixed)[mask] / scale
+
+    seeds = [p0] if p0 is not None else _default_seeds_uv_sersic(r_mid, y, n_fixed=n_fixed)
+    if n_fixed is None:
+        seeds = [[s[0] / scale, s[1], s[2]] for s in seeds]
+    else:
+        seeds = [[s[0] / scale, s[1]] for s in seeds]
+
+    lo, up = _data_driven_bounds_uv_sersic(r_mid[mask], y_fit, n_fixed=n_fixed)
+    if n_fixed is None:
+        bounds = ([lo[0] / scale, lo[1], lo[2]], [up[0] / scale, up[1], up[2]])
+    else:
+        bounds = ([lo[0] / scale, lo[1]], [up[0] / scale, up[1]])
+
+    popt, pcov = _best_of_seeds(_model_masked, r_mid[mask], y_fit / scale,
+                                e_fit / scale, seeds, bounds)
+    if popt is None:
+        return _pack_result_uv_sersic(False, reason="all seeds failed to converge")
+
+    D = np.array([scale, 1.0, 1.0] if n_fixed is None else [scale, 1.0])
+    popt = popt * D
+    if pcov is not None:
+        pcov = pcov * np.outer(D, D)
+
+    if n_fixed is None:
+        model_binned = bin_average_no_psf_uv_sersic(r_fine, r_edges, *popt)
+    else:
+        model_binned = bin_average_no_psf_uv_sersic(r_fine, r_edges, popt[0], popt[1], n_fixed)
+    chi2 = float(np.nansum(((y_fit - model_binned[mask]) / e_fit) ** 2))
+    dof = int(mask.sum()) - n_free
+    result = _pack_result_uv_sersic(True, popt, pcov, mask=mask, n_fixed=n_fixed,
+                                    extra={"model_binned": model_binned, "chi2": chi2,
+                                           "dof": dof, "n_fit": int(mask.sum()), "k_params": n_free})
+    if verbose:
+        n_drop = int((~mask).sum())
+        print(f"fit_naive_uv_sersic: NO PSF, dropped {fit_skip_inner} inner bin(s) "
+              f"({int(mask.sum())} bins fit, {n_drop} excluded), n "
+              f"{'fixed=' + str(n_fixed) if n_fixed is not None else 'free'}")
+        describe_fit_uv_sersic(result, label="naive-uv-sersic")
+    return result
+
+
+def fit_psf_aware_uv_sersic(r_mid, y, yerr, R, r_fine, r_edges, *, n_fixed=None,
+                            p0=None, verbose=False):
+    """
+    Sersic UV-continuum fit WITH the PSF forward model -- same structure as
+    fit_psf_aware_uv_exp, for the (A, r_e[, n]) parameter set. See
+    fit_naive_uv_sersic's docstring for n_fixed.
+    """
+    r_mid = np.asarray(r_mid, dtype=float)
+    y = np.asarray(y, dtype=float)
+    yerr = np.asarray(yerr, dtype=float)
+
+    mask = np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
+    n_free = 2 if n_fixed is not None else 3
+    if mask.sum() < n_free:
+        return _pack_result_uv_sersic(False, reason=f"fewer than {n_free} finite bins")
+
+    y_fit, e_fit = y[mask], yerr[mask]
+    scale = _amp_scale(y_fit)
+
+    if n_fixed is None:
+        def _model_masked(_, a, r_e, n):
+            return bin_average_psf_uv_sersic(R, r_fine, r_edges, a * scale, r_e, n)[mask] / scale
+    else:
+        def _model_masked(_, a, r_e):
+            return bin_average_psf_uv_sersic(R, r_fine, r_edges, a * scale, r_e, n_fixed)[mask] / scale
+
+    seeds = [p0] if p0 is not None else _default_seeds_uv_sersic(r_mid, y, n_fixed=n_fixed)
+    if n_fixed is None:
+        seeds = [[s[0] / scale, s[1], s[2]] for s in seeds]
+    else:
+        seeds = [[s[0] / scale, s[1]] for s in seeds]
+
+    lo, up = _data_driven_bounds_uv_sersic(r_mid[mask], y_fit, n_fixed=n_fixed)
+    if n_fixed is None:
+        bounds = ([lo[0] / scale, lo[1], lo[2]], [up[0] / scale, up[1], up[2]])
+    else:
+        bounds = ([lo[0] / scale, lo[1]], [up[0] / scale, up[1]])
+
+    popt, pcov = _best_of_seeds(_model_masked, r_mid[mask], y_fit / scale,
+                                e_fit / scale, seeds, bounds)
+    if popt is None:
+        return _pack_result_uv_sersic(False, reason="all seeds failed to converge")
+
+    D = np.array([scale, 1.0, 1.0] if n_fixed is None else [scale, 1.0])
+    popt = popt * D
+    if pcov is not None:
+        pcov = pcov * np.outer(D, D)
+
+    if n_fixed is None:
+        model_binned = bin_average_psf_uv_sersic(R, r_fine, r_edges, *popt)
+    else:
+        model_binned = bin_average_psf_uv_sersic(R, r_fine, r_edges, popt[0], popt[1], n_fixed)
+    chi2 = float(np.nansum(((y_fit - model_binned[mask]) / e_fit) ** 2))
+    dof = int(mask.sum()) - n_free
+    result = _pack_result_uv_sersic(True, popt, pcov, mask=mask, n_fixed=n_fixed,
+                                    extra={"model_binned": model_binned, "chi2": chi2,
+                                           "dof": dof, "n_fit": int(mask.sum()), "k_params": n_free})
+    if verbose:
+        print(f"fit_psf_aware_uv_sersic: WITH PSF forward model, all {int(mask.sum())} "
+              f"bins fit (inner bin kept), n "
+              f"{'fixed=' + str(n_fixed) if n_fixed is not None else 'free'}")
+        describe_fit_uv_sersic(result, label="psf-uv-sersic")
+    return result
+
+
+def binned_model_from_result_uv_exp(result, r_fine, r_edges, R=None):
+    """UV-exponential analogue of binned_model_from_result: the fit's
+    prediction in the same per-bin AVERAGE-flux units as the data."""
+    if result.get("model_binned") is not None:
+        return np.asarray(result["model_binned"], dtype=float)
+    if not result.get("success"):
+        return None
+    params = (result["A"], result["h_uv"])
+    if R is not None and r_edges is not None:
+        return bin_average_psf_uv_exp(R, r_fine, r_edges, *params)
+    if r_edges is not None:
+        return bin_average_no_psf_uv_exp(r_fine, r_edges, *params)
+    return None
+
+
+def binned_model_from_result_uv_sersic(result, r_fine, r_edges, R=None):
+    """UV-Sersic analogue of binned_model_from_result_expcore."""
+    if result.get("model_binned") is not None:
+        return np.asarray(result["model_binned"], dtype=float)
+    if not result.get("success"):
+        return None
+    params = (result["A"], result["r_e"], result["n"])
+    if R is not None and r_edges is not None:
+        return bin_average_psf_uv_sersic(R, r_fine, r_edges, *params)
+    if r_edges is not None:
+        return bin_average_no_psf_uv_sersic(r_fine, r_edges, *params)
+    return None
+
+
+# ---------------------------------------------------------------------
+# Notebook-testing convenience: same headline plot as plot_expcore_fit
+# (Section 7), for Part 3's UV-continuum model(s). Takes plain
+# (r_edges, y, yerr) arrays rather than a Lya-pipeline `boot` dict, since
+# Part 3's extraction half (cutouts/centroiding/annuli/coaddition) isn't
+# built yet -- this lets the fit be tested against a synthetic profile or
+# a hand-assembled array right now, with no change needed once the real
+# coadded UV flux(r) exists.
+# ---------------------------------------------------------------------
+def plot_uv_fit(
+    r_edges,
+    y,
+    yerr,
+    *,
+    model: str = "exp",
+    method: str = "psf",
+    fit_skip_inner: int = 1,
+    n_fixed=None,
+    psf_r=None,
+    psf_vals=None,
+    psf_fwhm: float = 1.0,
+    psf_beta: float = 3.0,
+    p0=None,
+    r_fine=None,
+    logy: bool = True,
+    logx: bool = False,
+    xlims=None,
+    figsize=(9, 5),
+    title=None,
+    verbose=True,
+):
+    """
+    NOTEBOOK-TESTING convenience for halo-flux-fitting.md Part 3's
+    UV-continuum model.
+
+    r_edges, y, yerr : bin edges (same units you want h_uv/r_e reported
+        in) and the per-bin AVERAGE flux + its 1-sigma error -- whatever
+        Part 3's eventual coadded profile produces, or a synthetic/
+        hand-built stand-in for testing now.
+    model : "exp" (default, intrinsic_profile_uv_exp) or "sersic"
+        (intrinsic_profile_uv_sersic).
+    method : "psf" (default) or "naive" -- see fit_psf_aware_uv_exp /
+        fit_naive_uv_exp (or their _sersic counterparts).
+    n_fixed : only used when model="sersic" -- see fit_naive_uv_sersic's
+        docstring.
+    psf_r, psf_vals : explicit PSF curve (e.g. an empirical CFHT-LS star
+        measurement). If not given, falls back to an analytic Moffat with
+        psf_fwhm/psf_beta -- psf_fwhm=1.0 here is a PLACEHOLDER, not a
+        real CFHT-LS seeing value (per the spec's open question 3: try the
+        image header / survey docs first, fall back to an empirical
+        star-based measurement only if no documented value is
+        trustworthy). Replace it once a real number is in hand.
+
+    Returns (fig, ax, fit_result), mirroring plot_expcore_fit's return
+    shape.
+    """
+    import matplotlib.pyplot as plt
+
+    if method not in ("psf", "naive"):
+        raise ValueError(f"method must be 'psf' or 'naive' (got {method!r})")
+    if model not in ("exp", "sersic"):
+        raise ValueError(f"model must be 'exp' or 'sersic' (got {model!r})")
+
+    r_edges = np.asarray(r_edges, dtype=float)
+    y = np.asarray(y, dtype=float)
+    yerr = np.asarray(yerr, dtype=float)
+    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
+    r_fine_arr = (np.asarray(r_fine, dtype=float) if r_fine is not None
+                 else default_fine_grid(r_edges))
+
+    if method == "psf":
+        if psf_r is not None and psf_vals is not None:
+            psf_r_use = np.asarray(psf_r, dtype=float)
+            psf_vals_use = np.asarray(psf_vals, dtype=float)
+        else:
+            psf_r_use = np.linspace(0.0, 20.0 * psf_fwhm, 400)
+            psf_vals_use = moffat_1d(psf_r_use, fwhm=psf_fwhm, beta=psf_beta)
+        R = ring_convolution_matrix(r_fine_arr, r_edges, psf_r_use, psf_vals_use)
+        if model == "exp":
+            fit_result = fit_psf_aware_uv_exp(r_mid, y, yerr, R, r_fine_arr, r_edges,
+                                              p0=p0, verbose=verbose)
+        else:
+            fit_result = fit_psf_aware_uv_sersic(r_mid, y, yerr, R, r_fine_arr, r_edges,
+                                                 n_fixed=n_fixed, p0=p0, verbose=verbose)
+        fit_result["R"] = R
+    else:
+        if model == "exp":
+            fit_result = fit_naive_uv_exp(r_mid, r_edges, r_fine_arr, y, yerr,
+                                          fit_skip_inner=fit_skip_inner, p0=p0, verbose=verbose)
+        else:
+            fit_result = fit_naive_uv_sersic(r_mid, r_edges, r_fine_arr, y, yerr,
+                                             fit_skip_inner=fit_skip_inner, n_fixed=n_fixed,
+                                             p0=p0, verbose=verbose)
+
+    fit_result.update({"method": method, "model_name": model, "r_edges": r_edges,
+                       "r_mid": r_mid, "r_fine": r_fine_arr, "y": y, "yerr": yerr})
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.errorbar(r_mid, y, yerr=yerr, fmt="o", capsize=3.5, ms=6, lw=1.5,
+                color="tab:orange", label="UV-continuum profile (input)", zorder=5)
+
+    if fit_result.get("success"):
+        popt = fit_result["popt"]
+        if model == "exp":
+            curve = intrinsic_profile_uv_exp(r_fine_arr, *popt)
+            chi2_txt = (f", $\\chi^2$/dof={fit_result['chi2']/max(fit_result['dof'],1):.2f}"
+                        if "chi2" in fit_result else "")
+            ax.plot(r_fine_arr, curve, "-", color="tab:red", lw=1.8, zorder=3,
+                    label=f"exp fit (h_UV={fit_result['h_uv']:.3g}{chi2_txt})")
+            model_binned = binned_model_from_result_uv_exp(fit_result, r_fine_arr, r_edges,
+                                                            fit_result.get("R"))
+        else:
+            params_for_curve = popt if n_fixed is None else np.append(popt, n_fixed)
+            curve = intrinsic_profile_uv_sersic(r_fine_arr, *params_for_curve)
+            chi2_txt = (f", $\\chi^2$/dof={fit_result['chi2']/max(fit_result['dof'],1):.2f}"
+                        if "chi2" in fit_result else "")
+            ntag = f"n={fit_result['n']:.2f}" + (" (fixed)" if fit_result["n_fixed"] else "")
+            ax.plot(r_fine_arr, curve, "-", color="tab:red", lw=1.8, zorder=3,
+                    label=f"Sersic fit (r_e={fit_result['r_e']:.3g}, {ntag}{chi2_txt})")
+            model_binned = binned_model_from_result_uv_sersic(fit_result, r_fine_arr, r_edges,
+                                                               fit_result.get("R"))
+        if model_binned is not None:
+            ax.plot(r_mid, model_binned, "D", color="tab:red", ms=6, zorder=4,
+                    label="predicted bin mean")
+    elif verbose:
+        print(f"plot_uv_fit: fit FAILED -- {fit_result.get('reason')}")
+
+    ax.axhline(0, color="0.7", lw=0.7)
+    if logy:
+        pos = y[y > 0]
+        if len(pos):
+            ax.set_yscale("log")
+            ax.set_ylim(pos.min() * 0.3, y.max() * 3)
+    if logx:
+        ax.set_xscale("log")
+        if xlims is None:
+            ax.set_xlim(0.5 * r_mid[0], r_edges[-1] * 1.2)
+    if xlims is not None:
+        ax.set_xlim(xlims)
+    ax.set_xlabel("radius")
+    ax.set_ylabel("UV-continuum flux (bin mean)")
+    ax.set_title(title or (f"{'PSF-aware' if method == 'psf' else 'Naive'} UV-continuum "
+                           f"{'single-exponential' if model == 'exp' else 'Sersic'} fit "
+                           f"(halo-flux-fitting.md Part 3)"))
+    ax.legend(frameon=False, fontsize=8.5)
+    ax.grid(alpha=0.15)
+    plt.tight_layout()
+    plt.show()
+
+    if verbose:
+        (describe_fit_uv_exp if model == "exp" else describe_fit_uv_sersic)(
+            fit_result, label=f"{method} UV {model} fit")
+
+    return fig, ax, fit_result
