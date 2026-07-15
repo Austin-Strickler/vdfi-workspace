@@ -24,6 +24,8 @@ setup:
     # Radial profiles
     analysis.plot_centroid_profile(boot, stacks)
     analysis.plot_flux_profile(boot, stacks)        # logy=True by default
+    analysis.plot_flux_profile_fit(boot, stacks, method="psf")     # + double-exp fit
+    analysis.plot_flux_profile_fit(boot, stacks, method="naive")   # no-PSF fit
     analysis.plot_asymmetry_profile(boot, stacks)
     analysis.plot_moments_profile(stacks)
 
@@ -92,6 +94,7 @@ from .plotting import (
     plot_centroid_comparison, plot_radial_overlay,
     _mark_lines,
 )
+from . import fitting
 
 
 def _resolve_measure_defaults(config=None, *, bounds=None, cont_bounds=None,
@@ -1027,6 +1030,245 @@ def plot_flux_profile(
                     dpi=300, bbox_inches="tight")
     plt.show()
     return fig, ax
+
+
+def plot_flux_profile_fit(
+    boot: dict,
+    stacks: dict | None = None,
+    r_edges=None,
+    bin_mode=None,
+    VR_biweight_v=None,
+    vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    method: str = "psf",
+    fit_skip_inner: int = 1,
+    psf_r=None,
+    psf_vals=None,
+    psf_fwhm: float = 3.0,
+    psf_beta: float = 3.0,
+    p0=None,
+    r_fine=None,
+    logy: bool = True,
+    ylims=None,
+    xlims=None,
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
+    show_components: bool = True,
+    figsize=(10, 5),
+    title: str | None = _AUTO,
+    save_fig: bool = False,
+    save_name: str | None = None,
+    verbose: bool = True,
+):
+    """
+    Same headline figure as plot_flux_profile (integrated/mean Lyα flux ±
+    bootstrap 16-84 vs radius) but with a two-component exponential
+    I(r) = A1*exp(-r/h1) + A2*exp(-r/h2) fit overlaid, using the fitting.py
+    infrastructure (see fitting.py's module docstring -- the same code this
+    fits with is validated against known-truth synthetic data in
+    ../psf_exponential_recovery.py).
+
+    boot['total_flux_fid'] is treated as a per-bin AVERAGE flux (not a sum;
+    see fitting.bin_average_no_psf / bin_average_psf), matching how the real
+    stack is biweight-averaged within each radial annulus.
+
+    method : "psf" (default) -- forward-models the PSF (ring-convolution ->
+             per-bin mean), fits against ALL bins including the innermost
+             one (the PSF model accounts for its core contamination
+             directly, so nothing needs to be dropped).
+             "naive" -- no PSF correction; fits the bin-averaged intrinsic
+             profile directly, after dropping the innermost fit_skip_inner
+             bin(s) (default 1, since the innermost bin is the one most
+             smeared by the PSF core for a naive/no-PSF fit; pass
+             fit_skip_inner=0 to keep every bin).
+
+    psf_r, psf_vals : explicit PSF curve (e.g. from
+             starpsf.psf_profiles_for_lines), in the SAME radial unit as
+             `bin_mode` (typically kpc -- pass r_edges/bin_mode='kpc' for a
+             physically meaningful h1/h2 when fitting with a PSF). Only used
+             for method="psf". If not given, falls back to an analytic
+             Moffat PSF built from psf_fwhm/psf_beta (fitting.moffat_1d) --
+             psf_fwhm must then also be in that same radial unit.
+    psf_fwhm, psf_beta : Moffat PSF parameters used ONLY when psf_r/psf_vals
+             are not given. Defaults (fwhm=3.0, beta=3.0) are a generic
+             VIRUS-like core in kpc-scale units -- sized for your actual
+             data/instrument if fitting in a different unit.
+    p0      : optional explicit (A1, h1, A2, h2) starting guess, passed
+             through to fitting.fit_naive/fit_psf_aware. None -> a handful
+             of automatic seeds (fitting._default_seeds) are tried and the
+             lowest-chi2 one kept -- see fitting.estimate_truth_from_profile
+             for a quick standalone ballpark if you want to inspect a seed
+             first.
+    r_fine  : optional fine radial grid (fitting.default_fine_grid used if
+             not given) that the fit integrates over internally.
+    logy    : log-y axis (default True, recommended for the faint outer
+             bins -- matches plot_flux_profile's default).
+    title   : axis title; the default (_AUTO sentinel) auto-generates one
+             from `method`; pass a string to override, or None for no title.
+    save_name : filename (with or without extension) used when save_fig=True.
+             None -> "Figure_flux_profile_fit.png".
+    show_vr, VR_biweight_error : same Rvir reference-line behavior as
+             plot_flux_profile.
+    show_components : True (default) -- in addition to the combined
+             I(r)=A1*exp(-r/h1)+A2*exp(-r/h2) curve already drawn, overplot
+             each exponential term ALONE (A1*exp(-r/h1) dashed, A2*exp(-r/h2)
+             dash-dot) from the SAME fitted popt. Purely a visualization
+             addition -- the fit itself (this module's validated model) is
+             completely unchanged; this only draws two extra lines so it's
+             visually obvious which term dominates at a given radius, rather
+             than only seeing the sum (where the steep core term dying out
+             and the shallow halo term taking over can look like one smooth
+             curve instead of two distinct physical components handing off).
+    verbose : print the fitted (A1,h1,A2,h2) +/- errors and chi2/dof via
+             fitting.describe_fit.
+
+    Returns
+    -------
+    (fig, ax, fit_result) : fit_result is the dict from fitting.fit_naive /
+        fit_psf_aware (success, A1/h1/A2/h2 + _err, popt, pcov, chi2, dof,
+        mask, model_binned, ...), plus a few extra keys stashed here for
+        later inspection without recomputing anything:
+            method, r_edges, r_mid, r_fine, y, y_lo, y_hi, sigma, bin_mode,
+            and (method="psf" only) R, psf_r, psf_vals.
+        Keep this around to see exactly how the fit did against your real
+        data -- e.g. fit_result['chi2'] / fit_result['dof'],
+        fit_result['h1'] +/- fit_result['h1_err'], or re-plot
+        fitting.intrinsic_profile(r, *fit_result['popt']) yourself.
+    """
+    if method not in ("psf", "naive"):
+        raise ValueError(f"method must be 'psf' or 'naive' (got {method!r})")
+    if "total_flux_fid" not in boot:
+        raise KeyError("boot does not contain total_flux_fid; re-run with "
+                       "compute_side_ratio=True (the default).")
+
+    radial_bins = np.asarray(r_edges if r_edges is not None
+                             else boot.get("r_edges",
+                             stacks["r_edges"] if stacks else []))
+    bm  = _resolve_bin_mode(bin_mode, stacks or boot)
+    vr  = _get_vr_biweight_v(VR_biweight_v, stacks or boot)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks or boot)
+    if method == "psf" and bm != "kpc" and psf_r is None and verbose:
+        print(f"plot_flux_profile_fit: bin_mode={bm!r} but psf_fwhm/psf_beta "
+              f"build a Moffat assumed to be in the SAME unit as bin_mode -- "
+              f"pass r_edges/bin_mode='kpc' (or your own psf_r/psf_vals in "
+              f"{bm} units) for a physically meaningful PSF-aware fit.")
+
+    y    = np.asarray(boot["total_flux_fid"], dtype=float)
+    y_lo = np.asarray(boot["total_flux_lo"], dtype=float)
+    y_hi = np.asarray(boot["total_flux_hi"], dtype=float)
+    # per-bin sigma for the fit: average of the up/down bootstrap 16-84
+    # half-widths (a symmetric 1-sigma-equivalent from an asymmetric band).
+    sigma = ((y_hi - y) + (y - y_lo)) / 2.0
+
+    r_fine_arr = (np.asarray(r_fine, dtype=float) if r_fine is not None
+                 else fitting.default_fine_grid(radial_bins))
+    r_mid = 0.5 * (radial_bins[:-1] + radial_bins[1:])
+
+    if method == "psf":
+        if psf_r is not None and psf_vals is not None:
+            psf_r_use = np.asarray(psf_r, dtype=float)
+            psf_vals_use = np.asarray(psf_vals, dtype=float)
+        else:
+            psf_r_use = np.linspace(0.0, 20.0 * psf_fwhm, 400)
+            psf_vals_use = fitting.moffat_1d(psf_r_use, fwhm=psf_fwhm, beta=psf_beta)
+        R = fitting.ring_convolution_matrix(r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
+        fit_result = fitting.fit_psf_aware(r_mid, y, sigma, R, r_fine_arr, radial_bins,
+                                           p0=p0, verbose=verbose)
+        fit_result["R"] = R
+        fit_result["psf_r"] = psf_r_use
+        fit_result["psf_vals"] = psf_vals_use
+    else:
+        fit_result = fitting.fit_naive(r_mid, radial_bins, r_fine_arr, y, sigma,
+                                       fit_skip_inner=fit_skip_inner, p0=p0,
+                                       verbose=verbose)
+
+    fit_result["method"] = method
+    fit_result["r_edges"] = radial_bins
+    fit_result["r_mid"] = r_mid
+    fit_result["r_fine"] = r_fine_arr
+    fit_result["y"] = y
+    fit_result["y_lo"] = y_lo
+    fit_result["y_hi"] = y_hi
+    fit_result["sigma"] = sigma
+    fit_result["bin_mode"] = bm
+
+    fig, ax = plt.subplots(figsize=figsize)
+    r_mid_native, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                            show_vr=show_vr, VR_biweight_error=vr_e)
+    yerr, unstable = _safe_yerr(y, y_lo, y_hi)
+    ax.errorbar(r_mid_native, y, xerr=xerr, yerr=yerr,
+                fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:blue",
+                label="observed (bootstrap 16-84)", zorder=5)
+    if np.any(unstable):
+        ax.scatter(r_mid_native[unstable], y[unstable], s=70, facecolors="none",
+                   edgecolors="tab:blue", linewidths=1.3, zorder=6,
+                   label="fiducial outside 16-84 band")
+
+    if method == "naive" and fit_result.get("mask") is not None:
+        dropped = ~fit_result["mask"]
+        if np.any(dropped):
+            ax.scatter(r_mid_native[dropped], y[dropped], s=130, facecolors="none",
+                       edgecolors="tab:blue", linewidths=1.6, zorder=7,
+                       label=f"dropped by naive fit (inner {fit_skip_inner})")
+
+    if fit_result.get("success"):
+        popt = fit_result["popt"]
+        A1_f, h1_f, A2_f, h2_f = popt
+        color = "tab:green" if method == "psf" else "tab:orange"
+        chi2_txt = (f", $\\chi^2$/dof={fit_result['chi2']/max(fit_result['dof'],1):.2f}"
+                    if "chi2" in fit_result else "")
+        ax.plot(r_fine_arr, fitting.intrinsic_profile(r_fine_arr, *popt), "-",
+                color=color, lw=1.8, zorder=3,
+                label=(f"{'PSF-aware' if method == 'psf' else 'naive'} fit (sum)  "
+                       f"(h1={h1_f:.2g}, h2={h2_f:.2g}{chi2_txt})"))
+        model_binned = fitting.binned_model_from_result(
+            fit_result, r_fine_arr, radial_bins, fit_result.get("R"))
+        if model_binned is not None:
+            ax.plot(r_mid_native, model_binned,
+                    "^" if method == "psf" else "s",
+                    color=color, ms=7, mfc="none" if method == "naive" else color,
+                    zorder=4, label="fit predicted bin mean")
+        if show_components:
+            # Each exponential term alone, from the SAME fitted popt -- no
+            # new fitting here, just splitting the already-drawn sum back
+            # into its two physical pieces so it's visible which one is
+            # actually doing the work at a given radius (rather than only
+            # seeing one smooth combined curve where the steep term dies
+            # out and the shallow term takes over).
+            ax.plot(r_fine_arr, A1_f * np.exp(-r_fine_arr / h1_f), "--",
+                    color=color, lw=1.3, alpha=0.65, zorder=2,
+                    label=f"  core term alone (h1={h1_f:.2g})")
+            ax.plot(r_fine_arr, A2_f * np.exp(-r_fine_arr / h2_f), "-.",
+                    color=color, lw=1.3, alpha=0.65, zorder=2,
+                    label=f"  halo term alone (h2={h2_f:.2g})")
+    elif verbose:
+        print(f"plot_flux_profile_fit: fit FAILED -- {fit_result.get('reason')}")
+
+    ax.axhline(0, color="0.7", lw=0.7)
+    if logy:
+        pos = y[y > 0]
+        if len(pos):
+            ax.set_yscale("log")
+            ax.set_ylim(pos.min() * 0.3, y.max() * 3)
+    elif ylims is not None:
+        ax.set_ylim(ylims)
+    unit = (boot.get("unit_info") or {}).get("y_unit", "")
+    ax.set_ylabel(f"Integrated Lyα flux [{unit}]" if unit else "Integrated Lyα flux")
+    title_final = (f"{'PSF-aware' if method == 'psf' else 'Naive'} double-exponential fit"
+                   if title is _AUTO else title)
+    if title_final:
+        ax.set_title(title_final)
+    ax.legend(frameon=False, fontsize=9)
+    ax.grid(alpha=0.15)
+    plt.tight_layout()
+    if save_fig:
+        plt.savefig(_resolve_savename(save_name, "Figure_flux_profile_fit.png"),
+                    dpi=300, bbox_inches="tight")
+    plt.show()
+
+    if verbose:
+        fitting.describe_fit(fit_result, label=f"{method} fit vs real data")
+
+    return fig, ax, fit_result
 
 
 def plot_flux_curve_of_growth(

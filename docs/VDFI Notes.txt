@@ -367,4 +367,17 @@ More Papers:
 - https://www.aanda.org/articles/aa/pdf/2022/10/aa42320-21.pdf
 - https://arxiv.org/pdf/1308.6578
 - https://arxiv.org/pdf/1303.0006
-- 
+
+Look into COSMOS field for this LAN:
+https://arxiv.org/pdf/2006.11089
+
+-------------------------------------------------------------------------------------------------------------------
+7/15/26: 
+
+Large-Scale Infall: https://iopscience.iop.org/article/10.1088/0004-637X/751/2/94
+"This compression along the LOS can be explained by large-scale infall, i.e., the Kaiser effect. As the absorbing gas must be cool, i.e., T ∼ 104 K ≪ Tvir, to be visible in H i, this form of gas accretion could be called “cold accretion” (e.g., Kereš et al. 2005), although we note that this term is most often used in the context of cold streams within the virial radii of halos hosting galaxies. We conclude that we have an unambiguous and highly significant detection of cool gas falling toward star-forming galaxies at z ≈ 2.4. The large-scale infall of gas onto halos and its impact on the absorption signal has been a topic of several theoretical studies (e.g., Kollmeier et al. 2003; Barkana 2004; Kim & Croft 2008), and is also investigated in O. Rakic et al. (in preparation) where we will compare the observational results with cosmological hydrodynamical simulations."
+
+Large-Scale Kinematics and HI optical depth: https://ui.adsabs.harvard.edu/abs/2020MNRAS.499.1721C/abstract
+
+Limber Approximation to convert between 3D and 2D Clustering: https://arxiv.org/pdf/astro-ph/0609165
+
