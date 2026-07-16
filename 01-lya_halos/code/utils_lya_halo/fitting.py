@@ -1863,6 +1863,29 @@ def _bin_integrate_generic(profile_fn, r_fine, r_edges, params):
     return result
 
 
+def _annulus_areas(r_edges):
+    """Geometric area pi*(r_out^2 - r_in^2) of each annulus. The PSF forward
+    model (bin_average_psf_uv_*) redistributes real 2-D FLUX between annuli,
+    so its per-bin flux is converted to a per-bin mean SURFACE BRIGHTNESS by
+    dividing by annulus AREA -- NOT by radial bin width (that leaves a stray
+    ~2*pi*r factor; see bin_average_psf_uv_exp)."""
+    e = np.asarray(r_edges, dtype=float)
+    return np.pi * (e[1:] ** 2 - e[:-1] ** 2)
+
+
+def _fine_ring_flux_uv_2d(profile_fn, r_fine, params):
+    """2-D ring flux of the intrinsic profile: profile(r) * 2*pi*r * dr --
+    the actual FLUX carried by a thin annulus of surface brightness
+    profile(r), width dr, at radius r. This is what ring_convolution_matrix's
+    R (a flux-redistribution operator, weighted by the OUTPUT annulus'
+    2*pi*rho) must be applied to. Differs from _fine_ring_flux_generic
+    (profile(r)*dr, NO 2*pi*r) -- the circumference factor is required, not
+    optional; see bin_average_psf_uv_exp's docstring."""
+    r_fine = np.asarray(r_fine, dtype=float)
+    dr = np.gradient(r_fine)
+    return profile_fn(r_fine, *params) * (2.0 * np.pi * r_fine) * dr
+
+
 def bin_average_no_psf_uv_exp(r_fine, r_edges, A, h_uv):
     """Mean intrinsic (single-exponential) UV flux in each bin, NO PSF --
     same divide-by-bin-width convention as Part 1's bin_average_no_psf, per
@@ -1873,12 +1896,26 @@ def bin_average_no_psf_uv_exp(r_fine, r_edges, A, h_uv):
 
 
 def bin_average_psf_uv_exp(R, r_fine, r_edges, A, h_uv):
-    """Mean PSF-smeared (single-exponential) UV flux in each bin: (R @
-    fine_flux) / bin width. R is built from whatever PSF is passed to
-    ring_convolution_matrix -- the CFHT-LS PSF here, VIRUS elsewhere -- the
-    function itself is unchanged from Part 1/2."""
-    return (R @ _fine_ring_flux_generic(intrinsic_profile_uv_exp, r_fine, (A, h_uv))
-            ) / _bin_widths(r_edges)
+    """Mean PSF-smeared (single-exponential) UV SURFACE BRIGHTNESS in each
+    bin: (R @ 2-D ring flux) / annulus AREA.
+
+    CORRECTED (verified against a brute-force 2-D image convolution +
+    azimuthal average -- agreement to <0.1% across all bins). The previous
+    version computed (R @ [profile*dr]) / bin_width, which is neither the
+    intrinsic 2-D flux (the input ring flux was missing its 2*pi*r
+    circumference) NOR a surface brightness (dividing FLUX by radial width
+    instead of annulus area leaves a stray ~2*pi*r factor that GROWS with
+    radius). That radial ramp suppressed the center and pushed the model's
+    peak outward -- the source of the bin1>bin0 inversion and the runaway
+    chi^2 when a real (large) PSF FWHM was passed. R itself (the
+    ring-convolution geometry) is unchanged; only the input flux weighting
+    (now 2*pi*r*dr via _fine_ring_flux_uv_2d) and the output normalization
+    (now annulus area via _annulus_areas) are fixed, both at the model level.
+
+    R is built from whatever PSF is passed to ring_convolution_matrix -- the
+    CFHT-LS PSF here, VIRUS elsewhere."""
+    return (R @ _fine_ring_flux_uv_2d(intrinsic_profile_uv_exp, r_fine, (A, h_uv))
+            ) / _annulus_areas(r_edges)
 
 
 def bin_average_no_psf_uv_sersic(r_fine, r_edges, A, r_e, n):
@@ -1888,9 +1925,11 @@ def bin_average_no_psf_uv_sersic(r_fine, r_edges, A, r_e, n):
 
 
 def bin_average_psf_uv_sersic(R, r_fine, r_edges, A, r_e, n):
-    """Sersic analogue of bin_average_psf_uv_exp."""
-    return (R @ _fine_ring_flux_generic(intrinsic_profile_uv_sersic, r_fine, (A, r_e, n))
-            ) / _bin_widths(r_edges)
+    """Sersic analogue of bin_average_psf_uv_exp -- same corrected 2-D-flux
+    input (2*pi*r*dr) and annulus-area normalization (see that function's
+    docstring for why bin width was wrong)."""
+    return (R @ _fine_ring_flux_uv_2d(intrinsic_profile_uv_sersic, r_fine, (A, r_e, n))
+            ) / _annulus_areas(r_edges)
 
 
 def _default_seeds_uv_exp(r, y):

@@ -59,20 +59,58 @@ Splitting the stack loses statistical power (roughly √N per split), so each ca
 - Split on peak separation (proxy for HI column density / scattering path length) and on relative peak height (proxy for outflow vs. inflow asymmetry, red-peak dominance)
 - More free parameters per fit means more noise per bin — needs better core data, but the payoff is a direct kinematic handle on HI column density and outflow/inflow asymmetry
 
+### 10. Burstiness — Hα vs. UV/SED-timescale SFR (or τ from SFH fitting)
+
+- Bursty star formation drives episodic feedback; instantaneous (Hα, ~10 Myr) vs.
+  time-averaged (UV/SED, ~100 Myr–1 Gyr) SFR mismatch is the standard burstiness proxy
+- Prediction: bursty subsample shows a larger/more redshifted centroid offset (fresh
+  outflow launch) vs. steady star-formers at fixed total SFR/mass — a direct test of
+  whether kinematics track instantaneous or time-averaged energy injection
+- Caveat: matched radii are currently PSF-dominated and burstiness timescales only reach
+  ~0.3 R_vir — too shallow to speak to the R_vir-scale transition that's Paper 1's
+  headline result with the current data; Paper 2's incoming ~2× data is what unlocks this
+  (already scoped there as "Burstiness ↔ kinematics")
+
+### 11. Half-light radius, mass-normalized
+
+- Tests whether the halo scale length (h1) tracks a purely gravitational/kinematic scale
+  (R_vir, mass) or a baryonic/morphological one — do more extended galaxies at fixed mass
+  produce a more extended halo, independent of mass itself?
+- Also a direct handle on the "population mixing (LBG+MELG)" blindspot from the Discussion
+  draft: could show whether h1 undershooting Steidel 2011 is a morphology effect rather
+  than a sample-composition one
+- Prediction: larger R_half at fixed mass → larger h1, more diffuse core term; compact
+  galaxies → tighter profile, cleaner test of the pure gravitational prediction
+- Lightweight, similar effort to the dust-attenuation split (#5) — needs an imaging-based
+  size measurement, not a new apparatus
+
 ---
 
 ## Paper 2 (`02-lya_escape`) — flux / photon budget
 
-### 10. Hβ-normalized escape fraction
+### 12. Hβ-normalized escape fraction
 
 - Intrinsic photon budget normalized
 - Test differences between high and low escaping systems in kinematics and extent
 
-### 11. Core classification type
+### 13. Core classification type
 
 - AGN, LAE, emitter, null, absorber → if too low signal, split into AGN, emitter, no emission
 - Test the Trainor+2025 findings that even LAA are net-emitters
 - Determine kinematics of each sample and possible emission mechanics (AGN = fluorescence...)
+
+### 14. Exponential scale length of Lyα, PSF-aware
+
+- PSF-deconvolved fit for the Lyα-emitting region's own scale length, rather than
+  borrowing Steidel's continuum-based 3–4 kpc figure — the same "fit our own continuum
+  scale length from CFHT-LS imaging" upgrade flagged as future work in the Discussion
+  draft (§3), but for the Lyα profile itself rather than continuum
+- Note: the known PSF forward-model area bug in `fitting.py` (returns 2πr·SB, not
+  surface brightness — needs dividing by annulus area, not bin width) sits directly in
+  this measurement's path; fix that first
+- Prediction: a clean PSF-corrected h1 is the input the core-to-halo escape-fraction
+  machinery (§3 Methods, Paper 2) actually needs — this is infrastructure Paper 2's
+  headline result depends on, not an optional split
 
 ---
 

@@ -15,7 +15,7 @@ Working list across the workspace. Check items off as they land; log the actual 
 
 ## Science
 
-- [ ] Think through subsample splits and their physical predictions in the literature — candidates: `split_by_derived`/`split_controlled` (selection.py), `split_by_redshift`/`split_product_by` (multicat.py)
+- [ ] Think through subsample splits and their physical predictions in the literature — candidates: `split_by_derived`/`split_controlled` (selection.py), `split_by_redshift`/`split_product_by` (multicat.py) --- finalize the list to what is in paper 1 vs paper 2
 - [ ] Read more!
 - [ ] Check whether core measurement templates (single vs. double Gaussian) and their related separation/flux-ratio stacks (blue- vs. redshifted) are being fit to noise that resembles the template by construction — test whether fitting these templates to pure noise/null spectra converges toward a template-shaped stack at high N, and if so how much of any observed double-peaked structure is genuine vs. fitting-induced. See `01-lya_halos/docs/research-notes.md`.
 

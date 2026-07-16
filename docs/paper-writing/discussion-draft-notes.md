@@ -29,58 +29,65 @@
 
 ---
 
-## 2. The ~1 R_vir cutoff
+## 2. The ~1 R_vir cutoff, quantified by the fit
 
-- R_vir reference = **75 kpc** (AGN-excluded, ~450 galaxies — the correct way to compute it). The
-  90 kpc in the current draft tex is the full ~500-galaxy sample (AGN included); supersede it.
-- Three independent diagnostics turn over near this radius: flux curve bends, centroid flips
-  negative (§1), B/T flips negative. The point of this section is just that agreement across
-  independent diagnostics = a real physical transition, not a fit artifact — save large-scale
-  fit specifics (r_c, γ, crossover radius, etc.) for §3.
-- Supporting checks: Niemeyer O[III] comparison (independent reduction/background/method) agrees —
-  good corroboration, worth pulling out of the Appendix. A COSMOS-vs-EGS split would directly test
-  whether the cutoff radius is field-stable (matters given the correlated-noise caveat below).
-- Lit: **Rakic et al. 2012** (ApJ 751,94) — optical depth drops an order of magnitude at ~100 kpc
-  (≈R_vir); FoG (<1 Mpc) vs. Kaiser (1.4–2.0 Mpc) anisotropy split is the field's cleanest
-  precedent for "two physically distinct scales." **Chen et al. 2020** — independent kinematic
-  transition (outflow→infall) at 80–200 pkpc, pure Hubble flow beyond ~300 pkpc — a supporting
-  analog, not the same measurement.
-- Caveats: correlated (not random) outer-bin background noise is still an open systematic — could
-  bias the exact cutoff location. R_vir is calibrated assuming a KBSS/LBG-like ~10^12 M_sun halo;
-  LAE clustering (ODIN/DESI) suggests lower masses (~10^11) — could shift "1 R_vir" itself.
+R_vir reference = **75 kpc** (AGN-excluded, ~450 galaxies — the correct way to compute it). The
+90 kpc in the current draft tex is the full ~500-galaxy sample (AGN included); supersede it.
 
----
+**Three independent qualitative diagnostics turn over near this radius:** flux curve bends,
+centroid flips negative (§1), B/T flips negative. Agreement across independent diagnostics is the
+actual evidence this is a real physical transition, not a fitting artifact — and the two-component
+fit below is what turns that agreement into an actual number, so the cutoff and the fit are one
+story, not two.
 
-## 3. Fitting: core exponential + outer decline
-
-Keep this modest — core term is solid, outer term is real but still being interpreted. Don't
-over-invest in the γ=1.8→0.8 story; there's a real chance it's not even the right comparison.
-
-- **Core:** h1 = 16.9 ± 1.1 kpc. vs. Steidel 2011 (20.8–28.4 kpc range), Wisotzki 2016 (1–7 kpc),
+**The fit.** Two-component exponential, `I(r) = A1*exp(-r/h1) + A2*exp(-r/h2)`, PSF-aware
+(ring-convolution forward model), all 10 bins: χ²/dof = 7.04/6 = 1.17.
+- **Core: h1 = 16.9 ± 1.1 kpc.** vs. Steidel 2011 (20.8–28.4 kpc range), Wisotzki 2016 (1–7 kpc),
   Leclercq 2017 (~4.5 kpc). Sits below Steidel, plausibly from our mixed LBG+MELG composition.
   Continuum comparison currently borrows Steidel's 3–4 kpc; **plan to fit our own continuum scale
   length from CFHT-LS imaging** for a same-sample comparison instead — future work, flag it here.
-- **Outer term:** flux persists to large radii — the qualitative result is solid, the
-  interpretation isn't:
+- **Crossover radius (term1=term2) ≈ 76 kpc ≈ R_vir, robust.** This is the fit's own quantitative
+  echo of the cutoff — the same turnover the flux/centroid/B-T diagnostics point to qualitatively,
+  landing almost exactly on the independently-derived R_vir = 75 kpc. Four independent routes to
+  the same radius (three qualitative diagnostics + one quantitative fit) is the strongest version
+  of the cutoff claim and worth stating as such, not as four separate coincidences.
+- **Outer term (h2 = 1552 ± 548 kpc):** flux persists to very large radii — the qualitative result
+  is solid, the interpretation isn't. Keep this modest; don't over-invest in the γ=1.8→0.8 story
+  below, there's a real chance it's not even the right comparison.
   - raw galaxy-clustering slope (γ~1.8, 3D) vs. Limber-projected (~0.8) tested; projected fits
     marginally better but not decisively (small ΔAIC, 6 dof) — plausibility note, not a result.
   - **counter-claim worth featuring:** Chen 2020's own optical-depth slope at large radii is
     ~−0.5, from diffuse IGM HI — arguably the more apt comparison, since our outer signal is
     diffuse emission, not a galaxy-clustering statistic. Genuinely open, not resolved either way.
-  - crossover radius (term1=term2) ≈76 kpc ≈ R_vir, robust — the fitting-side echo of §1.
-  - r_c ≈488±211 kpc (~6.5×R_vir) loosely echoes Sorini 2018's ~7×R_vir "sphere of influence"
-    (different observable — absorption vs. our emission) — one sentence, don't lean on it; r_c/γ
-    are degenerate at current radial coverage.
+  - r_c ≈488±211 kpc (~6.5×R_vir, from the proposed Option C exponential + cored-power-law
+    extension) loosely echoes Sorini 2018's ~7×R_vir "sphere of influence" (different observable —
+    absorption vs. our emission) — one sentence, don't lean on it; r_c/γ are degenerate at current
+    radial coverage.
   - Byrohl 2021: outer flattening = photons from *other* halos, not own CGM, onset ~30 pkpc in
-    TNG50 (below our ~76 kpc) — a testable prediction for §4, not an assumed explanation.
+    TNG50 (below our ~76 kpc) — a testable prediction for §3, not an assumed explanation.
 - Flux curve-of-growth: worth quoting as one clean number — "X% of total flux lies beyond R_vir."
-- Caveats: r_c/γ degeneracy (bins only reach ~1000 kpc, need ~1.5 Mpc to clear it); fit errors are
-  single-fit covariance, not bootstrapped; still undecided whether the shipped model is a broken
-  exponential pinned to R_vir vs. a smooth two-component sum — changes the rhetorical claim.
+
+**Supporting checks:** Niemeyer O[III] comparison (independent reduction/background/method)
+agrees — good corroboration, worth pulling out of the Appendix. A COSMOS-vs-EGS split would
+directly test whether the cutoff radius is field-stable (matters given the correlated-noise
+caveat below).
+
+**Lit:** **Rakic et al. 2012** (ApJ 751,94) — optical depth drops an order of magnitude at ~100 kpc
+(≈R_vir); FoG (<1 Mpc) vs. Kaiser (1.4–2.0 Mpc) anisotropy split is the field's cleanest
+precedent for "two physically distinct scales." **Chen et al. 2020** — independent kinematic
+transition (outflow→infall) at 80–200 pkpc, pure Hubble flow beyond ~300 pkpc — a supporting
+analog, not the same measurement.
+
+**Caveats:** correlated (not random) outer-bin background noise is still an open systematic —
+could bias the exact cutoff location. R_vir is calibrated assuming a KBSS/LBG-like ~10^12 M_sun
+halo; LAE clustering (ODIN/DESI) suggests lower masses (~10^11) — could shift "1 R_vir" itself.
+r_c/γ degeneracy (bins only reach ~1000 kpc, need ~1.5 Mpc to clear it); fit errors are single-fit
+covariance, not bootstrapped; still undecided whether the shipped model is a broken exponential
+pinned to R_vir vs. a smooth two-component sum — changes the rhetorical claim.
 
 ---
 
-## 4. Origins of emission — subsample splits
+## 3. Origins of emission — subsample splits
 
 Widest-scoped section — will include AGN vs. galaxy, low-z vs. high-z, and the rest below,
 organized around one question: which term (core vs. outer) tracks which physical variable.
@@ -117,9 +124,9 @@ organized around one question: which term (core vs. outer) tracks which physical
 
 ## Blindspots (quick hits)
 
-1. Scale-length "category error" — h1/h2, r_c, r0 aren't interchangeable; one clarifying line in §3.
+1. Scale-length "category error" — h1/h2, r_c, r0 aren't interchangeable; one clarifying line in §2.
 2. R_vir-anchor mass mismatch touches every R_vir-relative number, not just §2's cutoff.
-3. Correlated outer-bin noise is one systematic threading through all three sections — say it once, reference it later, rather than repeating.
+3. Correlated outer-bin noise is one systematic threading through §1 and §2 especially — say it once, reference it later, rather than repeating.
 4. Population mixing (LBG+MELG) is itself a candidate explanation for why h1 undershoots Steidel.
 5. Cosmic-web imaging comparisons (Bacon SB, UVB fluorescence line) are still qualitative — not unit-matched to our flux convention yet.
 6. Fit functional form (broken exponential @ R_vir vs. smooth sum) still undecided — changes what the "break" claim actually means.

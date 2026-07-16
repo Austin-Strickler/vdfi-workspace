@@ -127,7 +127,7 @@ from .masking import get_pixscale_arcsec
 from .virial import physical_kpc_to_arcsec
 from .io import load_for_stack
 from .extract import combine_fibers
-from .fitting import plot_uv_fit
+from .fitting import plot_uv_fit, moffat_1d, normalize_psf_flux
 
 
 # =======================================================================
@@ -245,6 +245,40 @@ class UVExtractConfig:
     # bg_method='masked_median' with no segmap).
     mask_annulus_neighbors: bool = True
 
+    # --- PSF (Part-3 forward model) ---
+    # The survey seeing is a fixed ANGULAR FWHM per field (CFHT-LS T0007
+    # image quality), but becomes a DIFFERENT physical (kpc) FWHM for every
+    # galaxy via its own z. Since the profile is stacked on shared kpc bins,
+    # the fit uses an AVERAGED effective PSF curve built from the per-galaxy
+    # kpc Moffats (build_effective_psf_uv) -- NOT a single scalar psf_fwhm.
+    #   psf_fwhm_arcsec : per-field FALLBACK/override seeing in arcsec, used
+    #       only when a field's image header carries NONE of the seeing
+    #       keywords below. read_seeing_fwhm_arcsec tries the HEADER first
+    #       (per spec open question 3), so both fields are normally read
+    #       straight from their own stacks -- leave this empty ({}) unless a
+    #       field's header genuinely lacks a seeing keyword.
+    #   psf_seeing_header_keys : CANDIDATE FITS keywords (arcsec), tried in
+    #       order; the CFHT-LS T0007 stacks are not consistent about the
+    #       name -- COSMOS/D2 uses IQIMAGE (=0.751"), AEGIS/D3 uses FINALIQ
+    #       (=0.83"). Both are the delivered image-quality FWHM of the stack.
+    #       Add more names here if another field's header uses yet another.
+    #   psf_beta : Moffat wing index. The header gives only the core FWHM,
+    #       so beta stays an ASSUMED value until a star-based empirical PSF
+    #       is measured (starpsf.py). Shared by every per-galaxy Moffat.
+    #   psf_moffat_params : per-field FITTED Moffat PSF, as
+    #       {field: {"fwhm_arcsec": .., "beta": ..}} -- the star-based
+    #       (FWHM, beta) from fit_moffat_psf run on that field's stacked
+    #       stellar PSF (the citable numbers). When a field has an entry
+    #       here it OVERRIDES both the header seeing and the global psf_beta
+    #       for that field: extraction uses this fwhm_arcsec (not the header)
+    #       and stores this beta per galaxy, so build_effective_psf_uv builds
+    #       each galaxy's Moffat with its own field's measured core AND wing
+    #       shape. Fields absent here fall back to header seeing + psf_beta.
+    psf_fwhm_arcsec: dict = _field(default_factory=dict)
+    psf_seeing_header_keys: tuple = ("IQIMAGE", "FINALIQ")
+    psf_beta: float = 3.0
+    psf_moffat_params: dict = _field(default_factory=dict)
+
 
 # =======================================================================
 # 1. Image / segmap path resolution
@@ -274,6 +308,75 @@ def _open_image_hdu(path: str):
     hdu = next((h for h in hdul if getattr(h, "data", None) is not None
                and np.ndim(h.data) == 2), hdul[0])
     return hdul, hdu
+
+
+def read_seeing_fwhm_arcsec(image_path: str, field: str, uvcfg: UVExtractConfig,
+                            *, verbose: bool = True) -> float:
+    """
+    Seeing FWHM (ARCSEC) for `field`: try each of uvcfg.psf_seeing_header_keys
+    in order (default ('IQIMAGE', 'FINALIQ') -- the CFHT-LS T0007 stacks are
+    inconsistent: COSMOS/D2 uses IQIMAGE=0.751", AEGIS/D3 uses FINALIQ=0.83")
+    FIRST, per halo-flux-fitting.md Part 3's open question 3 ("try the image
+    header / survey docs for the seeing FWHM first; fall back to an empirical
+    star-based measurement only if no trustworthy documented value exists"),
+    then fall back to uvcfg.psf_fwhm_arcsec[field]. Raises if none is found.
+
+    Each candidate keyword is searched across ALL HDUs (T0007 stacks carry
+    the image-quality keyword on the primary HDU even when the image data
+    lives in an extension). Returned in arcsec -- convert to per-galaxy kpc
+    with psf_fwhm_kpc_for_z, never passed to the fit as arcsec directly.
+    """
+    keys = uvcfg.psf_seeing_header_keys
+    if isinstance(keys, str):   # tolerate a single string
+        keys = (keys,)
+    val = None
+    matched_key = None
+    try:
+        hdul, _ = _open_image_hdu(image_path)
+        try:
+            for k in keys:
+                for h in hdul:
+                    if k in h.header:
+                        v = float(h.header[k])
+                        if np.isfinite(v) and v > 0:
+                            val, matched_key = v, k
+                            break
+                if val is not None:
+                    break
+        finally:
+            hdul.close()
+    except Exception:
+        val = None
+
+    if val is not None:
+        if verbose:
+            print(f"read_seeing_fwhm_arcsec [{field}]: header {matched_key}={val:.4f}\" "
+                  f"(from {image_path}).")
+        return float(val)
+
+    fallback = uvcfg.psf_fwhm_arcsec.get(field)
+    if fallback is None or not np.isfinite(fallback) or fallback <= 0:
+        raise ValueError(
+            f"No seeing FWHM for field={field!r}: none of {tuple(keys)} present in "
+            f"{image_path} and no usable uvcfg.psf_fwhm_arcsec[{field!r}] set.")
+    if verbose:
+        print(f"read_seeing_fwhm_arcsec [{field}]: none of {tuple(keys)} found in "
+              f"{image_path}; using uvcfg.psf_fwhm_arcsec[{field!r}]={float(fallback):.4f}\".")
+    return float(fallback)
+
+
+def psf_fwhm_kpc_for_z(fwhm_arcsec, z):
+    """
+    Convert an ANGULAR seeing FWHM (arcsec) to a PHYSICAL FWHM (kpc) at
+    redshift z, using the SAME Planck18 machinery the radial bins use
+    (virial.physical_kpc_to_arcsec): arcsec-per-kpc = physical_kpc_to_arcsec(
+    1 kpc, z), so kpc = arcsec / that. Vectorized over z. This is the
+    per-galaxy conversion that makes a single fixed angular seeing a
+    DIFFERENT kpc FWHM for each galaxy -- the reason the stacked fit needs an
+    averaged effective PSF (build_effective_psf_uv) rather than one Moffat.
+    """
+    arcsec_per_kpc = np.asarray(physical_kpc_to_arcsec(1.0, z), dtype=float)
+    return np.asarray(fwhm_arcsec, dtype=float) / arcsec_per_kpc
 
 
 # =======================================================================
@@ -922,6 +1025,27 @@ def extract_uv_profiles_for_field(field: str, catalog, image_path: str,
         wcs_full = WCS(hdu.header)
         bg_level = background["background"] if background is not None else 0.0
 
+        # PSF for this field. If a star-fitted Moffat is registered
+        # (uvcfg.psf_moffat_params[field], from fit_moffat_psf) use its
+        # measured FWHM + beta -- the citable, star-based PSF -- overriding
+        # both the header seeing and the global psf_beta. Otherwise fall back
+        # to the header seeing (read once, per spec) + global psf_beta. Either
+        # way the ANGULAR FWHM is fixed for the field and becomes a per-galaxy
+        # kpc FWHM inside the loop via each galaxy's z; both FWHM and beta are
+        # stored per galaxy so build_effective_psf_uv rebuilds each Moffat with
+        # this field's own shape, no re-reading.
+        mp = uvcfg.psf_moffat_params.get(field) if uvcfg.psf_moffat_params else None
+        if mp is not None:
+            seeing_arcsec = float(mp["fwhm_arcsec"])
+            psf_beta_field = float(mp.get("beta", uvcfg.psf_beta))
+            if verbose:
+                print(f"extract_uv_profiles_for_field [{field}]: star-fitted Moffat "
+                      f"FWHM={seeing_arcsec:.4f}\", beta={psf_beta_field:.3f} "
+                      f"(uvcfg.psf_moffat_params[{field!r}]).")
+        else:
+            seeing_arcsec = read_seeing_fwhm_arcsec(image_path, field, uvcfg, verbose=verbose)
+            psf_beta_field = float(uvcfg.psf_beta)
+
         results = []
         for i in tqdm(range(len(sub)), desc=f"UV extract {field}"):
             row = sub[i]
@@ -948,13 +1072,16 @@ def extract_uv_profiles_for_field(field: str, catalog, image_path: str,
 
             results.append({
                 "id": row[id_col] if id_col in sub.colnames else i,
-                "ra": ra, "dec": dec, "z": z,
+                "ra": ra, "dec": dec, "z": z, "field": field,
                 "centroid_ra": cen["ra"], "centroid_dec": cen["dec"],
                 "centroid_offset_arcsec": cen["offset_arcsec"],
                 "centroid_fit_ok": cen["fit_ok"], "centroid_flag": cen["flag"],
                 "r_mid_arcsec": prof["r_mid_arcsec"],
                 "flux_mean": prof["flux_mean"], "flux_mean_raw": prof["flux_mean_raw"],
                 "npix": prof["npix"], "neighbor_frac": prof["neighbor_frac"],
+                "psf_fwhm_arcsec": float(seeing_arcsec),
+                "psf_fwhm_kpc": float(psf_fwhm_kpc_for_z(seeing_arcsec, z)),
+                "psf_beta": float(psf_beta_field),
             })
     finally:
         hdul.close()
@@ -1311,11 +1438,14 @@ def fit_and_plot_uv_coadd(coadd: dict, method: str = "biweight", *, boot: Option
     model  : 'exp' (default, single exponential, fitting.intrinsic_profile_
         uv_exp) or 'sersic' (fitting.intrinsic_profile_uv_sersic).
     fit_method : 'naive' (default) -- no PSF correction, drops
-        fit_skip_inner inner bin(s) (default 1). 'psf' forward-models a
-        PSF and keeps every bin, but needs a REAL CFHT-LS seeing FWHM
-        (psf_fwhm here defaults to 1.0, a placeholder -- see
-        fitting.plot_uv_fit's own docstring); 'naive' is the reasonable
-        first fit to run before that number is in hand.
+        fit_skip_inner inner bin(s) (default 1). 'psf' forward-models the
+        PSF and keeps every bin. For 'psf', pass the sample's EFFECTIVE PSF
+        via psf_r/psf_vals from build_effective_psf_uv(results, uvcfg) --
+        the galaxy-average of the per-galaxy kpc Moffats (a fixed angular
+        seeing is a different kpc FWHM per galaxy). The scalar psf_fwhm/
+        psf_beta path (single Moffat) still works but is a fallback; its
+        1.0 default is only a placeholder. 'naive' is the reasonable first
+        fit to run before the PSF curve is built.
 
     The coadd's r_mid_kpc / r_edges_kpc feed plot_uv_fit's r_edges
     directly (already in physical kpc, per coadd_uv_profiles' docstring on
@@ -1367,6 +1497,247 @@ def fit_and_plot_uv_coadd(coadd: dict, method: str = "biweight", *, boot: Option
     )
 
 
+def fit_moffat_psf(r_arcsec, psf_profile, *, sigma=None, fwhm0: float = 0.8,
+                   beta0: float = 3.0, fit_log: bool = True, verbose: bool = True):
+    """
+    Fit an analytic Moffat -- BOTH FWHM and beta FREE -- to a measured PSF
+    profile (e.g. a stacked-star curve), giving the citable per-field PSF
+    parameters to register in UVExtractConfig.psf_moffat_params.
+
+    Model: A * moffat_1d(r, fwhm, beta), with amplitude A a free nuisance
+    parameter so the input profile need not be perfectly peak-normalized.
+
+    fit_log (default True): fit log10(profile) instead of the linear profile,
+    so every radius carries ~equal weight across the PSF's several decades.
+    This is what makes the fit follow the WINGS -- the whole reason to measure
+    a stellar PSF -- rather than being dominated by the near-unity core (a
+    plain linear least-squares essentially ignores everything below ~1% of
+    peak, i.e. exactly the wing excess that pins down beta). Only finite,
+    POSITIVE bins are used (log needs > 0).
+
+    sigma : optional per-bin 1-sigma (same length as psf_profile), e.g. the
+    star-to-star scatter of the stellar stack. In log-fit mode it is mapped
+    to a log-space error (sigma / profile / ln10). None -> unweighted. Bins
+    with zero or non-finite sigma are DROPPED from the fit (a peak-normalized
+    stack has zero scatter in its central bin -- that bin is simply ignored
+    rather than given infinite weight), so a raw np.nanstd weight is safe to
+    pass as-is.
+
+    Returns dict: fwhm, beta (best fit), fwhm_err, beta_err (1-sigma from the
+    covariance), A, r_arcsec, model (fitted curve sampled on r_arcsec),
+    n_points, success. Drop fwhm/beta straight into
+    uvcfg.psf_moffat_params[field].
+    """
+    from scipy.optimize import curve_fit
+    r = np.asarray(r_arcsec, dtype=float)
+    y = np.asarray(psf_profile, dtype=float)
+    good = np.isfinite(r) & np.isfinite(y) & (y > 0)
+    # Drop bins with no usable weight. A peak-normalized stack has EXACTLY
+    # zero star-to-star scatter in its central bin (every star = 1 there),
+    # and often in sparse outer bins; a 0 (or NaN) sigma becomes an infinite
+    # 1/sigma weight, which makes curve_fit's residuals non-finite at the
+    # initial point ("Residuals are not finite ..."). Excluding those bins
+    # here -- rather than flooring them -- is the "just ignore that bin" fix:
+    # the free amplitude + log-space fit still pin FWHM/beta from the rest.
+    if sigma is not None:
+        sigma = np.asarray(sigma, dtype=float)
+        good &= np.isfinite(sigma) & (sigma > 0)
+    if good.sum() < 3:
+        return {"success": False,
+                "reason": "fewer than 3 finite positive bins with usable sigma"}
+    rg, yg = r[good], y[good]
+    sg = sigma[good] if sigma is not None else None
+
+    if fit_log:
+        def model(rr, logA, fwhm, beta):
+            return logA + np.log10(moffat_1d(rr, fwhm=fwhm, beta=beta))
+        ydata = np.log10(yg)
+        s = (sg / (yg * np.log(10.0))) if sg is not None else None
+        p0 = [float(np.log10(np.nanmax(yg))), fwhm0, beta0]
+        bounds = ([-np.inf, 0.05, 1.05], [np.inf, 5.0, 15.0])
+    else:
+        def model(rr, A, fwhm, beta):
+            return A * moffat_1d(rr, fwhm=fwhm, beta=beta)
+        ydata = yg
+        s = sg
+        p0 = [float(np.nanmax(yg)), fwhm0, beta0]
+        bounds = ([0.0, 0.05, 1.05], [np.inf, 5.0, 15.0])
+
+    try:
+        popt, pcov = curve_fit(model, rg, ydata, p0=p0, sigma=s,
+                               absolute_sigma=False, bounds=bounds, maxfev=20000)
+    except Exception as e:
+        return {"success": False, "reason": f"curve_fit failed: {e}"}
+
+    perr = np.sqrt(np.diag(pcov))
+    A = 10.0 ** popt[0] if fit_log else float(popt[0])
+    fwhm, beta = float(popt[1]), float(popt[2])
+    fwhm_err, beta_err = float(perr[1]), float(perr[2])
+    if verbose:
+        print(f"fit_moffat_psf: FWHM = {fwhm:.4f} +/- {fwhm_err:.4f}\"   "
+              f"beta = {beta:.3f} +/- {beta_err:.3f}   "
+              f"({'log' if fit_log else 'linear'} fit over {int(good.sum())} bins)")
+    return {"success": True, "fwhm": fwhm, "beta": beta,
+            "fwhm_err": fwhm_err, "beta_err": beta_err, "A": float(A),
+            "r_arcsec": r, "model": A * moffat_1d(r, fwhm=fwhm, beta=beta),
+            "n_points": int(good.sum())}
+
+
+def build_effective_psf_uv(results: list, uvcfg: UVExtractConfig, *,
+                           r_max_kpc: Optional[float] = None, n_grid: int = 400,
+                           psf_key: str = "psf_fwhm_kpc", verbose: bool = True):
+    """
+    Build the sample's EFFECTIVE PSF curve (psf_r, psf_vals), in kpc, for the
+    stacked-profile fit -- the DECIDED averaged-effective-PSF approach.
+
+    Each galaxy's seeing is a fixed ANGULAR FWHM but a different PHYSICAL
+    (kpc) FWHM via its own z (stored as result['psf_fwhm_kpc'] by
+    extract_uv_profiles_for_field). The stacked profile -- combining
+    per-galaxy profiles on shared kpc bins -- therefore sees not one Moffat
+    but the galaxy-AVERAGE of their individual kpc Moffats. This returns that
+    average as an explicit (psf_r, psf_vals) curve to hand straight to
+    fit_and_plot_uv_coadd(..., fit_method='psf', psf_r=?, psf_vals=?),
+    bypassing the single-scalar psf_fwhm path entirely.
+
+    Each per-galaxy Moffat is FLUX-normalized (normalize_psf_flux, unit
+    2*pi*r integral) BEFORE averaging, so every galaxy contributes equal
+    total flux regardless of its kpc width -- a narrow and a broad PSF weigh
+    the same, which is what "average PSF of the sample" should mean. The
+    result is itself a unit-flux PSF (ring_convolution_matrix re-normalizes
+    anyway, so absolute scale is irrelevant; the SHAPE is the point).
+
+    This is the first-order effective PSF of a LINEAR stack. The actual
+    galaxy combine is biweight (mildly non-linear), so treat this as
+    correct-to-first-order, not exact. Each galaxy's Moffat uses its OWN
+    field's (kpc FWHM, beta) -- from result['psf_fwhm_kpc'] and
+    result['psf_beta'], set by extraction from uvcfg.psf_moffat_params (the
+    star-fitted per-field values) or falling back to the header FWHM +
+    uvcfg.psf_beta -- so different-seeing / different-wing fields average
+    correctly.
+
+    r_max_kpc : outer radius of the PSF grid (kpc). Default 20 * (max
+        per-galaxy kpc FWHM), covering even the broadest galaxy's wings
+        (matches plot_uv_fit's own 20*fwhm convention).
+
+    Returns (psf_r, psf_vals) -- both length n_grid, psf_r in kpc.
+    """
+    pairs = [(float(r[psf_key]), float(r.get("psf_beta", uvcfg.psf_beta)))
+             for r in results if np.isfinite(r.get(psf_key, np.nan))]
+    if len(pairs) == 0:
+        raise ValueError(
+            f"No finite '{psf_key}' in results -- run extract_uv_profiles_for_field "
+            f"with a seeing value first (see read_seeing_fwhm_arcsec).")
+    fwhm_kpc = np.array([p[0] for p in pairs], dtype=float)
+    betas = np.array([p[1] for p in pairs], dtype=float)
+
+    if r_max_kpc is None:
+        r_max_kpc = 20.0 * float(np.max(fwhm_kpc))
+    psf_r = np.linspace(0.0, float(r_max_kpc), n_grid)
+
+    # Each galaxy's Moffat uses ITS OWN field's (kpc FWHM, beta), so a
+    # multi-field sample with different seeing AND different wing shapes
+    # (e.g. COSMOS beta!=AEGIS beta from fit_moffat_psf) is averaged
+    # correctly rather than forced onto one global beta.
+    acc = np.zeros_like(psf_r)
+    for f, b in zip(fwhm_kpc, betas):
+        acc += normalize_psf_flux(psf_r, moffat_1d(psf_r, fwhm=f, beta=b))
+    psf_vals = acc / len(fwhm_kpc)
+
+    if verbose:
+        ub = np.unique(np.round(betas, 3))
+        print(f"build_effective_psf_uv: averaged {len(fwhm_kpc)} flux-normalized "
+              f"per-galaxy Moffats (beta value(s) {ub}); kpc FWHM "
+              f"min/median/max = {fwhm_kpc.min():.2f}/{np.median(fwhm_kpc):.2f}/"
+              f"{fwhm_kpc.max():.2f}; grid 0..{r_max_kpc:.1f} kpc, {n_grid} pts.")
+    return psf_r, psf_vals
+
+
+def apply_psf_to_results(results: list, uvcfg: UVExtractConfig, *, verbose: bool = True):
+    """
+    (Re)assign each galaxy's PSF metadata -- psf_fwhm_arcsec, psf_fwhm_kpc,
+    psf_beta -- from uvcfg.psf_moffat_params WITHOUT re-running extraction.
+
+    The PSF never enters the measured fluxes (it's used only later by
+    build_effective_psf_uv and the fit), so once you've fit the stellar PSF
+    (fit_moffat_psf) and registered the numbers in uvcfg.psf_moffat_params,
+    call this to push them onto an EXISTING results list and go straight to
+    build_effective_psf_uv -- no cutouts/photometry recomputed. This is the
+    fast iterate-on-beta loop: change psf_moffat_params, re-apply, refit.
+
+    Per galaxy: if its field is in uvcfg.psf_moffat_params, adopt that field's
+    fitted (fwhm_arcsec, beta); otherwise keep the field's already-stored
+    header psf_fwhm_arcsec with uvcfg.psf_beta. psf_fwhm_kpc is recomputed
+    from the (possibly updated) arcsec FWHM and the galaxy's z. Requires each
+    result to carry 'field' and 'z' (extraction stores both) -- raises if
+    'field' is absent (results predate the field tag: re-extract once).
+
+    Mutates results in place AND returns it.
+    """
+    n_fit, n_hdr = 0, 0
+    for r in results:
+        if "field" not in r:
+            raise KeyError("apply_psf_to_results: a result has no 'field' -- re-extract "
+                           "once with the current extract_uv_profiles_for_field to add it.")
+        fld, z = r["field"], float(r["z"])
+        mp = uvcfg.psf_moffat_params.get(fld) if uvcfg.psf_moffat_params else None
+        if mp is not None:
+            fw = float(mp["fwhm_arcsec"])
+            be = float(mp.get("beta", uvcfg.psf_beta))
+            n_fit += 1
+        else:
+            fw = float(r.get("psf_fwhm_arcsec", np.nan))
+            be = float(uvcfg.psf_beta)
+            n_hdr += 1
+        r["psf_fwhm_arcsec"] = fw
+        r["psf_beta"] = be
+        r["psf_fwhm_kpc"] = float(psf_fwhm_kpc_for_z(fw, z))
+    if verbose:
+        print(f"apply_psf_to_results: {n_fit} galaxies set from star-fitted "
+              f"psf_moffat_params, {n_hdr} kept header/global fallback.")
+    return results
+
+
+def stack_and_bootstrap_uv(results: list, bins_kpc, *, method: str = "biweight",
+                           nboot: int = 500, ci=(16, 84), seed: Optional[int] = None,
+                           flux_col: str = "flux_mean", weight_col: str = "npix",
+                           verbose: bool = True):
+    """
+    Coadd + bootstrap ONCE, DECOUPLED from fitting -- run this a single time
+    (e.g. nboot=5000) and then fit the SAME (coadd, boot) pair as many times
+    as you like (naive/psf, exp/sersic, different psf_fwhm, ...) via
+    fit_and_plot_uv_coadd, without ever paying for the bootstrap again.
+
+    The bootstrap resamples the GALAXY axis -- it's a property of the DATA
+    (this sample, this method, these bins_kpc), NOT of any particular fit
+    model. So it only needs computing once; every downstream fit is a cheap
+    curve_fit against the already-bootstrapped error band. This is the whole
+    runtime win over bootstrap_and_fit_uv, which recomputes coadd+bootstrap
+    on every call: the 5000-draw resample is by far the expensive step.
+
+    Typical use:
+        coadd, boot = stack_and_bootstrap_uv(results_all, uvcfg.bins_kpc,
+                                             method="biweight", nboot=5000)
+        # now fit as many ways as you want, reusing the SAME boot:
+        fit_and_plot_uv_coadd(coadd, boot=boot, method="biweight",
+                              model="exp", fit_method="naive")
+        fit_and_plot_uv_coadd(coadd, boot=boot, method="biweight",
+                              model="exp", fit_method="psf", psf_fwhm=...)
+
+    Returns (coadd, boot):
+      coadd : coadd_uv_profiles(...) output containing `method` (pass as
+              fit_and_plot_uv_coadd's first positional arg).
+      boot  : bootstrap_uv_coadd(...) output for `method` (pass as
+              fit_and_plot_uv_coadd's boot= arg).
+    See coadd_uv_profiles / bootstrap_uv_coadd for every argument's meaning.
+    """
+    coadd = coadd_uv_profiles(results, bins_kpc, methods=(method,),
+                              flux_col=flux_col, weight_col=weight_col, verbose=verbose)
+    boot = bootstrap_uv_coadd(results, bins_kpc, method=method, nboot=nboot, ci=ci,
+                              seed=seed, flux_col=flux_col, weight_col=weight_col,
+                              verbose=verbose)
+    return coadd, boot
+
+
 def bootstrap_and_fit_uv(results: list, bins_kpc, *, method: str = "biweight",
                          nboot: int = 500, ci=(16, 84), seed: Optional[int] = None,
                          model: str = "exp", fit_method: str = "naive", n_fixed=None,
@@ -1375,25 +1746,22 @@ def bootstrap_and_fit_uv(results: list, bins_kpc, *, method: str = "biweight",
                          logy: bool = True, logx: bool = False, xlims=None,
                          figsize=(9, 5), title=None, verbose: bool = True):
     """
-    One-call coadd -> bootstrap -> fit -> plot for the UV-continuum sample
-    -- the "full data pipeline" entry point: everything upstream
-    (extract_uv_profiles_for_field / run_uv_extraction_testbed) has already
-    produced `results`; this takes it the rest of the way with REAL error
-    bars instead of the floor-based placeholder fit_and_plot_uv_coadd falls
-    back to when no bootstrap is given.
+    One-call coadd -> bootstrap -> fit -> plot for the UV-continuum sample.
 
-    Thin plumbing over three calls you could also make separately
-    (coadd_uv_profiles, bootstrap_uv_coadd, fit_and_plot_uv_coadd) -- see
-    each one's own docstring for what every argument here actually does;
-    they're passed straight through.
+    CONVENIENCE WRAPPER, kept for backward compatibility and one-shot use.
+    It is now a thin call to stack_and_bootstrap_uv (once) + fit_and_plot_uv_
+    coadd (once). If you plan to run MORE THAN ONE fit off the same sample
+    (e.g. naive AND psf, or several psf_fwhm values), do NOT call this
+    repeatedly -- it re-bootstraps every time. Instead call
+    stack_and_bootstrap_uv ONCE (with your big nboot) and then
+    fit_and_plot_uv_coadd for each fit, reusing the one (coadd, boot).
 
     Returns (fig, ax, fit_result, coadd, boot) -- the fit/plot outputs plus
     both intermediate dicts, so you can inspect n_gal-per-bin, the raw
     bootstrap draws, etc. without recomputing anything.
     """
-    coadd = coadd_uv_profiles(results, bins_kpc, methods=(method,), verbose=verbose)
-    boot = bootstrap_uv_coadd(results, bins_kpc, method=method, nboot=nboot, ci=ci,
-                              seed=seed, verbose=verbose)
+    coadd, boot = stack_and_bootstrap_uv(results, bins_kpc, method=method, nboot=nboot,
+                                         ci=ci, seed=seed, verbose=verbose)
     fig, ax, fit_result = fit_and_plot_uv_coadd(
         coadd, method=method, boot=boot, model=model, fit_method=fit_method,
         n_fixed=n_fixed, psf_r=psf_r, psf_vals=psf_vals, psf_fwhm=psf_fwhm,
