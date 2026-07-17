@@ -118,3 +118,4 @@ Splitting the stack loses statistical power (roughly √N per split), so each ca
 
 - `GOALS.md` — the broader (less detailed) subsample-split candidate list this doc expands on
 - `TODO.md` (workspace root) — subsample splits and their physical predictions in the literature is tracked there as the top-priority open item
+- `../specs/subsample-derived-properties.md` — turns each split's comparison plot into a row of derived numbers (core/halo flux, core/halo velocity) collected into one paper-ready table, not just a figure

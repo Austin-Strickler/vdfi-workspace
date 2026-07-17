@@ -52,6 +52,11 @@ This module has four layers:
                                       footprint (fiber_area_kpc2, from the L_kpc2
                                       unit conversion), cumulatively summed out to
                                       a configurable r_max.
+        flux_curve_of_growth_annulus -- same inputs/outputs, but weights each
+                                      bin by its REAL annulus area
+                                      pi*(r_out**2 - r_in**2) instead of one
+                                      fixed fiber area -- a true azimuthally-
+                                      integrated curve of growth.
 
 All functions take plain arrays (no PipelineConfig required) so they drop
 straight into a notebook. LYA_REST defaults to 1215.67 (== PipelineConfig.LYA_REST).
@@ -63,6 +68,7 @@ import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
+import astropy.units as u
 from astropy.stats import biweight_location
 
 try:
@@ -73,6 +79,7 @@ except Exception:  # tqdm optional
 
 if TYPE_CHECKING:
     from .config import PipelineConfig
+    from .io import GalaxyProduct
 
 # Canonical measurement defaults live in config.py (the single source of truth);
 # imported here so the standalone per-spectrum helpers below share ONE default
@@ -81,6 +88,8 @@ from .config import (
     DEFAULT_CONT_BOUNDS, DEFAULT_CONT_METHOD, DEFAULT_CONT_ORDER,
     DEFAULT_CENTROID_METHOD,
 )
+from .virial import cosmo   # Planck18 -- same angular_diameter_distance stack.py uses
+from . import fitting        # PSF encircled-energy + core/halo boundary helpers (Section 4b below)
 
 C_KMS = 299792.458       # speed of light (km/s)
 LYA_REST = 1215.67       # vacuum Lya rest wavelength (Angstrom); == PipelineConfig.LYA_REST
@@ -1718,4 +1727,716 @@ def flux_curve_of_growth(
             "n_nan_bins": n_nan,
             "n_negative_bins": n_neg,
         },
+    }
+
+
+def flux_curve_of_growth_annulus(
+    boot: dict,
+    stacks: dict | None = None,
+    r_max_kpc: float | None = None,
+    drop_last_bin: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """
+    True azimuthally-integrated Lya curve of growth: cumulative luminosity and
+    flux fraction vs radius, weighting each bin's surface density
+    (total_flux_fid, in L_kpc2) by that bin's ACTUAL annulus area --
+    pi*(r_out**2 - r_in**2) from r_edges -- instead of flux_curve_of_growth's
+    single fixed fiber-footprint area applied at every radius.
+
+    Rationale: total_flux_fid is a surface density (L/kpc^2) measured through
+    one fiber aperture per bin. Treating that per-fiber value as the AVERAGE
+    surface brightness of the full annulus at that radius (the standard
+    assumption behind any surface-brightness-profile curve of growth) and
+    multiplying by the annulus's real geometric area gives the actual
+    luminosity contained in that annulus -- unlike flux_curve_of_growth, which
+    multiplies every bin by the same fiber-sized patch and so systematically
+    under-weights outer bins relative to how much more sky they really cover.
+    r_edges[0] == 0 is expected (innermost "annulus" is a filled disk out to
+    r_edges[1]); the formula reduces to pi*r_edges[1]**2 there automatically.
+
+    Parameters
+    ----------
+    boot : dict
+        Output of measure_all_bins / bootstrap_all / bootstrap_measurements.
+        Needs total_flux_fid (and, for error bands, total_flux_all) plus
+        r_edges and unit_info -- measure_all_bins already carries all three
+        through from `stacks`, so passing `stacks` again is usually optional.
+    stacks : dict, optional
+        Falls back here for r_edges / unit_info if not present on `boot`.
+    r_max_kpc : float or None
+        Outer radius (kpc) to sum out to. Must land exactly on a bin edge in
+        r_edges. None (default) -> governed by `drop_last_bin` instead.
+    drop_last_bin : bool
+        When r_max_kpc is None, True (default) sums out to r_edges[-2],
+        i.e. EXCLUDES the outermost bin (its bootstrap errors blow up
+        fastest, so it's a poor default contributor to a cumulative total).
+        False includes every bin out to r_edges[-1].
+    verbose : bool
+        Emit warnings on NaN/negative bins (see flux_curve_of_growth). Set
+        False to silence them (the values returned are identical either way).
+
+    Returns
+    -------
+    dict
+        r_edges_used            (n_bins+1,)  bin edges actually summed over
+        flux_bin_fid             (n_bins,)    per-bin luminosity
+                                               (total_flux_fid * annulus_area)
+        flux_cumulative_fid      (n_bins,)    running total, center -> r_max
+        flux_cumulative_lo/_hi   (n_bins,)    16/84 bootstrap band (NaN if
+                                               total_flux_all unavailable)
+        flux_cumulative_all      (nboot, n_bins) or None
+        flux_fraction_fid        (n_bins,)    flux_cumulative_fid / its last
+                                               value
+        flux_fraction_lo/_hi     (n_bins,)    16/84 band, computed PER DRAW
+                                               (cum_draw / cum_draw[-1]) then
+                                               percentiled
+        flux_fraction_all        (nboot, n_bins) or None
+        annulus_area_kpc2_used   (n_bins,)    the real geometric area applied
+                                               to each bin (replaces
+                                               flux_curve_of_growth's single
+                                               fiber_area_kpc2_used float)
+        unit_info                dict         passed through, for the y-unit
+                                               label
+        meta                     dict         n_bins, r_max_kpc,
+                                               drop_last_bin, n_nan_bins,
+                                               n_negative_bins
+    """
+    if "total_flux_fid" not in boot:
+        raise KeyError("boot does not contain total_flux_fid; re-run the bootstrap with "
+                       "compute_side_ratio=True (the default).")
+
+    r_edges = np.asarray(
+        boot.get("r_edges", (stacks or {}).get("r_edges")), dtype=float)
+    if r_edges.size == 0:
+        raise KeyError("no r_edges found on boot or stacks.")
+
+    unit_info = boot.get("unit_info") or (stacks or {}).get("unit_info") or {}
+    if unit_info.get("fiber_area_kpc2") is None:
+        raise KeyError(
+            "unit_info has no fiber_area_kpc2 -- flux_curve_of_growth_annulus "
+            "needs the stack built with flux_unit='L_kpc2' (the default), so "
+            "total_flux_fid is a surface density (L/kpc^2) that a real "
+            "annulus area can be multiplied into.")
+
+    total_flux_fid = np.asarray(boot["total_flux_fid"], dtype=float)
+    nrad = total_flux_fid.size
+    if r_edges.size != nrad + 1:
+        raise ValueError(
+            f"r_edges has {r_edges.size} edges but total_flux_fid has {nrad} "
+            f"bins; expected {nrad + 1} edges.")
+
+    # --- real per-bin annulus area, pi*(r_out**2 - r_in**2); r_edges[0]==0 -> disk ---
+    annulus_area_full = np.pi * (r_edges[1:] ** 2 - r_edges[:-1] ** 2)
+    flux_bin_fid_full = total_flux_fid * annulus_area_full
+
+    # --- resolve how many bins to sum ---
+    if r_max_kpc is not None:
+        idx = np.where(np.isclose(r_edges, r_max_kpc, rtol=1e-3, atol=1e-6))[0]
+        if idx.size == 0:
+            raise ValueError(
+                f"r_max_kpc={r_max_kpc!r} does not match any edge in r_edges="
+                f"{r_edges.tolist()}; pass an exact bin edge, or leave "
+                f"r_max_kpc=None and use drop_last_bin instead.")
+        n_bins = int(idx[0])
+    else:
+        n_bins = (nrad - 1) if drop_last_bin else nrad
+    if n_bins < 1:
+        raise ValueError(
+            f"n_bins resolved to {n_bins} (<1); check r_max_kpc/drop_last_bin "
+            f"against r_edges={r_edges.tolist()}.")
+
+    sl = slice(0, n_bins)
+    r_edges_used = r_edges[: n_bins + 1]
+    annulus_area_used = annulus_area_full[sl]
+    flux_bin_fid = flux_bin_fid_full[sl]
+
+    # --- warn (not hide) on bad bins within the summed range ---
+    n_nan = int(np.sum(~np.isfinite(flux_bin_fid)))
+    n_neg = int(np.sum(np.isfinite(flux_bin_fid) & (flux_bin_fid < 0)))
+    if verbose and n_nan:
+        warnings.warn(
+            f"flux_curve_of_growth_annulus: {n_nan} bin(s) within r_max have a "
+            f"NaN total_flux_fid; the cumulative curve is NaN from that bin "
+            f"outward (propagated, not masked).")
+    if verbose and n_neg:
+        warnings.warn(
+            f"flux_curve_of_growth_annulus: {n_neg} bin(s) within r_max have "
+            f"negative net flux (noise-driven, typically the faint outer "
+            f"bins); the cumulative curve may be locally non-monotonic -- "
+            f"this reflects the actual measurement and is left uncorrected.")
+
+    flux_cumulative_fid = np.cumsum(flux_bin_fid)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        flux_fraction_fid = flux_cumulative_fid / flux_cumulative_fid[-1]
+
+    # --- bootstrap bands: cumsum/fraction PER DRAW, then percentile ---
+    flux_cumulative_all = flux_fraction_all = None
+    flux_cumulative_lo = np.full(n_bins, np.nan)
+    flux_cumulative_hi = np.full(n_bins, np.nan)
+    flux_fraction_lo = np.full(n_bins, np.nan)
+    flux_fraction_hi = np.full(n_bins, np.nan)
+    if "total_flux_all" in boot:
+        total_flux_all = np.asarray(boot["total_flux_all"], dtype=float)  # (nboot, nrad)
+        flux_bin_all = total_flux_all[:, sl] * annulus_area_used[None, :]
+        flux_cumulative_all = np.cumsum(flux_bin_all, axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            flux_fraction_all = flux_cumulative_all / flux_cumulative_all[:, -1][:, None]
+        flux_cumulative_lo = np.nanpercentile(flux_cumulative_all, 16, axis=0)
+        flux_cumulative_hi = np.nanpercentile(flux_cumulative_all, 84, axis=0)
+        flux_fraction_lo = np.nanpercentile(flux_fraction_all, 16, axis=0)
+        flux_fraction_hi = np.nanpercentile(flux_fraction_all, 84, axis=0)
+    elif verbose:
+        warnings.warn(
+            "flux_curve_of_growth_annulus: boot has no total_flux_all; "
+            "returning the fiducial curve only (no bootstrap error bands).")
+
+    return {
+        "r_edges_used": r_edges_used,
+        "flux_bin_fid": flux_bin_fid,
+        "flux_cumulative_fid": flux_cumulative_fid,
+        "flux_cumulative_lo": flux_cumulative_lo,
+        "flux_cumulative_hi": flux_cumulative_hi,
+        "flux_cumulative_all": flux_cumulative_all,
+        "flux_fraction_fid": flux_fraction_fid,
+        "flux_fraction_lo": flux_fraction_lo,
+        "flux_fraction_hi": flux_fraction_hi,
+        "flux_fraction_all": flux_fraction_all,
+        "annulus_area_kpc2_used": annulus_area_used,
+        "unit_info": unit_info,
+        "meta": {
+            "n_bins": n_bins,
+            "r_max_kpc": float(r_edges_used[-1]),
+            "drop_last_bin": drop_last_bin,
+            "n_nan_bins": n_nan,
+            "n_negative_bins": n_neg,
+        },
+    }
+
+
+# =====================================================================
+# 4b. SUBSAMPLE-DERIVED CORE/HALO PROPERTIES
+#     (subsample-derived-properties.md Parts 2-3)
+#
+# All of these operate on a measure_all_bins/bootstrap_all summary dict
+# (`boot`) for ONE subsample, given that subsample's own core/halo boundary
+# radius (Part 1 -- see fitting.find_core_halo_boundary, which turns a
+# fitting.fit_psf_aware_expcore/fit_naive_expcore -- or the older
+# fit_psf_aware/fit_naive two-exponential -- fit_result into exactly the
+# float this section's functions want).
+#
+# measure_core_halo_velocity / measure_halo_luminosity / measure_outer_
+# properties reuse boot's EXISTING bootstrap draws only -- no new
+# stacking/bootstrap pass, per the spec's framing that this half is
+# "simple." measure_psf_corrected_core_luminosity is the one genuinely
+# heavy piece (a second per-galaxy-rescaled stacking + bootstrap pass), kept
+# separate for exactly that reason.
+# =====================================================================
+
+def _annulus_area_kpc2(r_lo, r_hi):
+    """
+    Geometric annulus area, pi*(r_hi**2 - r_lo**2), given r in kpc (r_lo/
+    r_hi may be scalars or arrays of matching shape -- e.g. r_edges[:-1]/
+    r_edges[1:] for every bin at once).
+
+    For r_lo=0 (the innermost bin, which always starts at the center) this
+    reduces exactly to the FULL CIRCLE area pi*r_hi**2 -- i.e. the "core"
+    is just the r_lo=0 special case of the same annulus formula every other
+    bin uses, not a separate calculation. This is the ONE geometric-area
+    convention measure_halo_luminosity and measure_psf_corrected_core_
+    luminosity both use to turn a per-bin surface-brightness value
+    (total_flux_fid / core_lum's own per-bin quantity, both in L_kpc2 --
+    luminosity per kpc^2) into an actual luminosity (erg/s): multiply THAT
+    bin's own value by THAT bin's own area, per Austin's correction that
+    summing surface-brightness values straight across bins of different
+    areas mixes regimes (a small annulus's and a large annulus's surface
+    brightness are not directly additive; their LUMINOSITIES are).
+    """
+    return np.pi * (np.asarray(r_hi, dtype=float) ** 2 - np.asarray(r_lo, dtype=float) ** 2)
+
+
+def _resolve_boundary_radius(boundary_radius) -> float:
+    """Accept either a bare float or a dict with a 'boundary_radius' key
+    (e.g. straight from fitting.find_core_halo_boundary) -- every function
+    below takes either. Raises if the resolved value is None (no boundary
+    available -- see find_core_halo_boundary's docstring for why that can
+    legitimately happen and what the caller should do about it)."""
+    b = boundary_radius.get("boundary_radius") if isinstance(boundary_radius, dict) else boundary_radius
+    if b is None:
+        raise ValueError(
+            "boundary_radius resolved to None -- no core/halo boundary is "
+            "available for this subsample (its own fit didn't converge/cross "
+            "AND no fallback was supplied). See fitting.find_core_halo_boundary.")
+    return float(b)
+
+
+def measure_core_halo_velocity(
+    boot: dict, boundary_radius, *, r_edges=None,
+    halo_combine: str = "inv_var", core_bin_index: int = 0,
+) -> dict:
+    """
+    subsample-derived-properties.md Part 2.
+
+    Core velocity = the innermost radial bin's centroid, UNMODIFIED -- not
+    an average over several inner bins. The centroid genuinely evolves with
+    radius (redward near center, decreasing, crossing systemic near the
+    boundary); averaging inner bins together would smear exactly that
+    gradient, the same way averaging inner FLUX bins would smear PSF
+    structure (this is why velocity and flux get different core-side
+    treatment -- no PSF correction is needed here either: the PSF blurs a
+    photon's spatial position, not its wavelength).
+
+    Halo velocity = a COMBINED average of every bin beyond
+    `boundary_radius` -- combining is fine on this side, unlike the core
+    side, because the profile is already established to be comparatively
+    flat out there.
+
+    No new bootstrap or restacking: both the core point estimate's error
+    (the innermost bin's own existing 16/84) and the halo combine's error
+    reuse boot's EXISTING per-draw centroid arrays (centroid_v_all),
+    combined PER DRAW across the outer bins and then percentiled -- this is
+    the statistically correct way to combine correlated per-bin bootstrap
+    draws (same galaxies/resample in every bin of one draw), not two
+    independently-computed error bars combined afterward.
+
+    Parameters
+    ----------
+    boot : measure_all_bins / bootstrap_all summary for ONE subsample
+        (needs centroid_v_fid/_lo/_hi/_all and r_edges).
+    boundary_radius : float, or a dict with a 'boundary_radius' key (e.g.
+        fitting.find_core_halo_boundary's return value).
+    r_edges : bin edges; None -> boot['r_edges'].
+    halo_combine : 'inv_var' (default) -- weight each outer bin by
+        1/sigma_bin**2, sigma_bin = 0.5*(centroid_v_hi - centroid_v_lo) read
+        from boot's OWN summary (one FIXED weight per bin, computed once
+        from the overall bootstrap spread and reused for every draw --
+        estimating a genuine per-draw variance would need a nested
+        bootstrap this function deliberately avoids). 'biweight' -- the
+        pipeline's other existing centroid-combine convention
+        (astropy.stats.biweight_location of the outer-bin centroids, PER
+        DRAW), per the spec's explicit "or biweight" alternative.
+    core_bin_index : which bin counts as "the innermost bin" (default 0).
+
+    Returns
+    -------
+    dict : core_v_fid/_lo/_hi (innermost bin, unmodified); halo_v_fid,
+        halo_v_med/_lo/_hi, halo_v_all (nboot,); diff_fid = core_v_fid -
+        halo_v_fid, diff_med/_lo/_hi, diff_all (nboot,, core_bin_index's own
+        draw MINUS that same draw's halo_v_all -- correctly correlated, not
+        independently combined); boundary_radius, outer_mask, n_outer_bins,
+        halo_combine, core_bin_index.
+    """
+    if halo_combine not in ("inv_var", "biweight"):
+        raise ValueError("halo_combine must be 'inv_var' or 'biweight'")
+    boundary = _resolve_boundary_radius(boundary_radius)
+    r_edges = np.asarray(r_edges if r_edges is not None else boot["r_edges"], dtype=float)
+    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
+    outer_mask = r_mid > boundary
+    n_outer = int(outer_mask.sum())
+    if n_outer < 1:
+        raise ValueError(f"no bins beyond boundary_radius={boundary:.4g}; "
+                         f"check units (r_edges vs boundary_radius) and binning.")
+
+    cv_fid = np.asarray(boot["centroid_v_fid"], dtype=float)
+    cv_lo = np.asarray(boot["centroid_v_lo"], dtype=float)
+    cv_hi = np.asarray(boot["centroid_v_hi"], dtype=float)
+    cv_all = np.asarray(boot["centroid_v_all"], dtype=float)   # (nboot, nrad)
+
+    core_v_fid = float(cv_fid[core_bin_index])
+    core_v_lo = float(cv_lo[core_bin_index])
+    core_v_hi = float(cv_hi[core_bin_index])
+
+    outer_all = cv_all[:, outer_mask]   # (nboot, n_outer)
+    if halo_combine == "inv_var":
+        sigma_bin = 0.5 * (cv_hi[outer_mask] - cv_lo[outer_mask])
+        w = np.where(np.isfinite(sigma_bin) & (sigma_bin > 0), 1.0 / sigma_bin ** 2, 0.0)
+        if not np.any(w > 0):
+            raise ValueError("measure_core_halo_velocity: no finite positive-sigma outer "
+                             "bins for inv_var combine; try halo_combine='biweight'.")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            num = np.nansum(np.where(np.isfinite(outer_all), outer_all * w[None, :], 0.0), axis=1)
+            denom = np.nansum(np.where(np.isfinite(outer_all), w[None, :], 0.0), axis=1)
+            halo_v_all = np.where(denom > 0, num / denom, np.nan)
+        good_fid = cv_fid[outer_mask]
+        fid_finite = np.isfinite(good_fid)
+        halo_v_fid = float(np.sum(good_fid[fid_finite] * w[fid_finite]) / np.sum(w[fid_finite]))
+    else:  # biweight
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            halo_v_all = np.array([
+                float(biweight_location(row[np.isfinite(row)])) if np.isfinite(row).sum() >= 2
+                else np.nan for row in outer_all])
+            good_fid = cv_fid[outer_mask]
+            good_fid = good_fid[np.isfinite(good_fid)]
+            halo_v_fid = float(biweight_location(good_fid)) if good_fid.size >= 2 else np.nan
+
+    halo_v_med = float(np.nanmedian(halo_v_all))
+    halo_v_lo = float(np.nanpercentile(halo_v_all, 16))
+    halo_v_hi = float(np.nanpercentile(halo_v_all, 84))
+
+    diff_fid = core_v_fid - halo_v_fid
+    diff_all = cv_all[:, core_bin_index] - halo_v_all
+    diff_med = float(np.nanmedian(diff_all))
+    diff_lo = float(np.nanpercentile(diff_all, 16))
+    diff_hi = float(np.nanpercentile(diff_all, 84))
+
+    return {
+        "core_v_fid": core_v_fid, "core_v_lo": core_v_lo, "core_v_hi": core_v_hi,
+        "halo_v_fid": halo_v_fid, "halo_v_med": halo_v_med,
+        "halo_v_lo": halo_v_lo, "halo_v_hi": halo_v_hi, "halo_v_all": halo_v_all,
+        "diff_fid": diff_fid, "diff_med": diff_med,
+        "diff_lo": diff_lo, "diff_hi": diff_hi, "diff_all": diff_all,
+        "boundary_radius": boundary, "outer_mask": outer_mask,
+        "n_outer_bins": n_outer, "halo_combine": halo_combine,
+        "core_bin_index": core_bin_index,
+    }
+
+
+def measure_halo_luminosity(boot: dict, boundary_radius, *, r_edges=None) -> dict:
+    """
+    subsample-derived-properties.md Part 3, halo side.
+
+    Halo luminosity = each outer bin's own surface-brightness value
+    (boot['total_flux_fid'], in L_kpc2 -- luminosity per kpc^2, the same
+    per-bin quantity fitting.py fits) multiplied by THAT bin's OWN
+    geometric annulus area (pi*(r_out^2 - r_in^2), _annulus_area_kpc2),
+    THEN summed across every bin beyond `boundary_radius` -- a genuine
+    integrated luminosity (erg/s), not a raw sum of surface-brightness
+    values. Summing surface brightness straight across bins of different
+    areas would mix regimes (a small annulus's and a large annulus's
+    surface brightness aren't directly additive; their LUMINOSITIES are) --
+    scaling by each bin's own area before summing is what makes the sum
+    physically meaningful. No PSF correction is needed out here: the PSF's
+    angular support shrinks fast at large radius, so contamination is a
+    near-field-only problem (see measure_psf_corrected_core_luminosity for
+    the core side, where it is very much not negligible).
+
+    Error: scale boot['total_flux_all'] by the SAME per-bin areas and sum
+    across the SAME outer bins PER DRAW, then 16/84-percentile the
+    resulting (nboot,) distribution -- reuses boot's existing bootstrap
+    draws directly, no re-stacking.
+
+    Requires r_edges in KPC (the annulus-area conversion is only physically
+    meaningful in a physical, not angular/virial, radial unit) -- same
+    assumption the rest of this spec's boundary/velocity/core-luminosity
+    machinery already makes.
+
+    Parameters
+    ----------
+    boot : measure_all_bins / bootstrap_all summary (needs total_flux_fid,
+        r_edges; total_flux_all for the error band).
+    boundary_radius : float, or a dict with a 'boundary_radius' key.
+    r_edges : bin edges, in kpc; None -> boot['r_edges'].
+
+    Returns
+    -------
+    dict : halo_lum_fid, halo_lum_med/_lo/_hi, halo_lum_all (nboot,) or
+        None -- all true luminosities (erg/s), NOT surface brightness --
+        boundary_radius, outer_mask, n_outer_bins, area_kpc2 (per outer
+        bin, the areas actually used), unit_info.
+    """
+    if "total_flux_fid" not in boot:
+        raise KeyError("boot missing total_flux_fid; re-run with "
+                       "compute_side_ratio=True (the default).")
+    boundary = _resolve_boundary_radius(boundary_radius)
+    r_edges = np.asarray(r_edges if r_edges is not None else boot["r_edges"], dtype=float)
+    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
+    outer_mask = r_mid > boundary
+    n_outer = int(outer_mask.sum())
+    if n_outer < 1:
+        raise ValueError(f"no bins beyond boundary_radius={boundary:.4g}; "
+                         f"check units (r_edges vs boundary_radius) and binning.")
+
+    area = _annulus_area_kpc2(r_edges[:-1], r_edges[1:])   # (nrad,) kpc^2, per bin
+    area_outer = area[outer_mask]
+
+    tf_fid = np.asarray(boot["total_flux_fid"], dtype=float)
+    halo_lum_fid = float(np.nansum(tf_fid[outer_mask] * area_outer))
+
+    halo_lum_all = None
+    halo_lum_med = halo_lum_lo = halo_lum_hi = float("nan")
+    if "total_flux_all" in boot:
+        tf_all = np.asarray(boot["total_flux_all"], dtype=float)   # (nboot, nrad)
+        halo_lum_all = np.nansum(tf_all[:, outer_mask] * area_outer[None, :], axis=1)
+        halo_lum_med = float(np.nanmedian(halo_lum_all))
+        halo_lum_lo = float(np.nanpercentile(halo_lum_all, 16))
+        halo_lum_hi = float(np.nanpercentile(halo_lum_all, 84))
+    else:
+        warnings.warn("measure_halo_luminosity: boot has no total_flux_all; "
+                      "returning the fiducial value only (no bootstrap error band).")
+
+    return {
+        "halo_lum_fid": halo_lum_fid, "halo_lum_med": halo_lum_med,
+        "halo_lum_lo": halo_lum_lo, "halo_lum_hi": halo_lum_hi,
+        "halo_lum_all": halo_lum_all,
+        "boundary_radius": boundary, "outer_mask": outer_mask,
+        "n_outer_bins": n_outer, "area_kpc2": area_outer,
+        "unit_info": boot.get("unit_info"),
+    }
+
+
+def measure_outer_properties(
+    boot: dict, boundary_radius, *, r_edges=None,
+    halo_combine: str = "inv_var", core_bin_index: int = 0,
+) -> dict:
+    """
+    Package wrapper (per Austin's request to compute the "simple" derived
+    numbers together as one call): everything in subsample-derived-
+    properties.md Parts 2-3 that needs NO new stacking/bootstrap pass --
+    core velocity, halo velocity, core-halo velocity difference
+    (measure_core_halo_velocity) and halo luminosity
+    (measure_halo_luminosity) -- for one subsample, given its core/halo
+    boundary. Deliberately excludes core luminosity, the one piece that
+    DOES need a genuinely new per-galaxy-rescaled restacking + its own
+    bootstrap pass -- see measure_psf_corrected_core_luminosity, called
+    separately (and combined with this function's halo_lum_* afterward for
+    the core/halo luminosity ratio).
+
+    Returns one merged dict: every key from measure_core_halo_velocity plus
+    every key from measure_halo_luminosity (boundary_radius/outer_mask/
+    n_outer_bins are shared/redundant between the two -- they agree by
+    construction since both come from the same boundary_radius/r_edges).
+    """
+    vel = measure_core_halo_velocity(boot, boundary_radius, r_edges=r_edges,
+                                     halo_combine=halo_combine, core_bin_index=core_bin_index)
+    lum = measure_halo_luminosity(boot, boundary_radius, r_edges=r_edges)
+    out = dict(vel)
+    for k, v in lum.items():
+        out.setdefault(k, v)
+    return out
+
+
+def measure_psf_corrected_core_luminosity(
+    config: "PipelineConfig", product: "GalaxyProduct", stacks: dict, boot: dict, *,
+    psf_fwhm_arcsec: float = 1.3, psf_beta: float = 3.0,
+    inner_bin_index: int = 0,
+    nboot: int | None = None, seed: int | None = None, stack_method: str | None = None,
+    bounds=None, cont_bounds=None, cont_method=None, cont_order=None,
+    clip_negative_sides: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """
+    subsample-derived-properties.md Part 3, core side -- the genuinely new
+    pipeline work (a second per-galaxy-rescaled stacking + bootstrap pass),
+    per the spec's own note that this belongs alongside stack.py/measure.py's
+    combine/bootstrap machinery, not as an analysis.py-level computation.
+
+    Core luminosity is a genuine point-source aperture correction, applied
+    PER GALAXY before combining -- not one blanket factor slapped onto the
+    already-stacked innermost bin (see the spec for the full "why per
+    galaxy" reasoning: each galaxy's own z gives it its own kpc-per-arcsec
+    scaling, so a PSF that is fixed in ANGULAR size corresponds to a
+    different kpc width for every galaxy).
+
+    Procedure (mirrors the spec exactly):
+      1. PSF model: a FIXED literature Moffat (Lujan Niemeyer 2022; default
+         beta=3, FWHM=1.3" -- the midpoint of their 1.2-1.4" fiducial range)
+         -- deliberately not re-measured/empirical; this correction only
+         needs to be approximately right (extended PSF-wing residuals shift
+         the result by a fraction of a percent, per the spec).
+      2. Convert that ONE fixed angular FWHM to each galaxy's own kpc width
+         via ITS OWN z (cosmo.angular_diameter_distance -- the exact
+         conversion stack.convert_avg_fiber_bin already uses) -- the only
+         per-galaxy step; no second PSF-measurement pipeline.
+      3. EE_i = fraction of a point source's flux landing inside the
+         innermost bin's aperture (r_edges[inner_bin_index+1], in kpc --
+         requires stacks['bin_mode']=='kpc') for THAT galaxy's fwhm_kpc_i
+         (fitting.moffat_encircled_energy_fraction). c_i = 1/EE_i.
+      4. Rescale galaxy i's ENTIRE rest-frame flux+error cube (stacks
+         ['cube_flux'][i], stacks['cube_err'][i]) by the single scalar c_i
+         -- not radius-dependent (only step 6's innermost bin is ever kept;
+         every other radius of the rescaled re-coadd is a discarded
+         artifact of applying an innermost-bin-only correction array-wide).
+      5. Re-run the SAME galaxy-combine method used to measure `boot`
+         (read from boot['meta']['stack_method'], e.g. biweight) across all
+         of the now-individually-rescaled galaxy arrays -- an actual second
+         stacking pass (stack_galaxies), fed rescaled inputs instead of raw.
+      6. This new stack's innermost-bin integrated flux (blue_red_side_
+         ratio's blue+red sum, the SAME convention total_flux_fid/_all
+         already use) is a surface-brightness value (L_kpc2 -- luminosity
+         per kpc^2), ONLY for that one bin. Core luminosity = that value
+         times the core's OWN circular aperture area, pi*R_inner_kpc^2
+         (_annulus_area_kpc2 with r_lo=0 -- the same area-scaling
+         measure_halo_luminosity applies per outer bin, since a circle is
+         just the r_lo=0 case of an annulus) -- a genuine luminosity
+         (erg/s), not a surface-brightness value left unscaled (per
+         Austin's correction: reporting the unscaled surface brightness
+         would not even be comparable to the halo side's OWN area-scaled
+         luminosity, let alone summable with it for a core+halo total).
+
+    Bootstrap alignment (important): uses the EXACT SAME rng seed and
+    per-draw galaxy-index sequence as `boot`'s own bootstrap (read from
+    boot['meta']['seed']/['nboot'] unless explicitly overridden, and
+    replayed with `np.random.default_rng(seed)` + one `rng.integers(0,
+    ngal, ngal)` call per draw -- identical to bootstrap_all's own loop, and
+    consuming no rng draws before it, same as bootstrap_all's fiducial
+    step). This means core_lum_all[b] and boot['total_flux_all'][b, :] are
+    THE SAME resample of THE SAME galaxies for every b -- required for a
+    correct per-draw core/halo RATIO error (ratio_b = core_lum_all[b] /
+    halo_lum_all[b]), since the two are not independent draws of
+    independent quantities (same galaxies, same noise realizations) and
+    combining two separately-bootstrapped error bars would misstate the
+    ratio's real uncertainty (the spec's explicit warning).
+
+    Parameters
+    ----------
+    config  : PipelineConfig (z_col, line_window, cont_bounds/method/order).
+    product : the GalaxyProduct THIS stacks/boot pair was built from (for
+        product.catalog[config.z_col] -- per-galaxy z, aligned to
+        stacks['cube_flux']'s galaxy axis; raises if the galaxy counts
+        don't match, since a silent misalignment here would be worse than
+        an error).
+    stacks  : Stage-2 build_stacks(..., keep_cube=True) dict for this
+        SAME subsample (cube_flux, cube_err, cube_weights, rest_wave,
+        r_edges, bin_mode).
+    boot    : Stage-3 measure_all_bins/bootstrap_all summary for this SAME
+        subsample -- supplies the seed/nboot/stack_method/ngal to replicate,
+        and is what core_lum_all is meant to line up against draw-for-draw.
+    psf_fwhm_arcsec, psf_beta : the fixed literature Moffat.
+    inner_bin_index : which bin is "the innermost bin" (default 0).
+    nboot, seed, stack_method : override boot['meta']'s values; leave None
+        to reuse them exactly (the entire point of this function).
+    bounds, cont_bounds, cont_method, cont_order : line-window/continuum
+        convention; None -> resolved from `config` (same fallback chain
+        measure_all_bins uses), so this uses the SAME integrated-flux
+        convention as total_flux_fid/_all.
+    verbose : print a run header + progress bar (same convention as the
+        rest of this module's bootstraps).
+
+    Returns
+    -------
+    dict : core_lum_fid, core_lum_med/_lo/_hi, core_lum_all (nboot,, ALIGNED
+        draw-for-draw with boot['total_flux_all'] -- see above) -- all TRUE
+        luminosities (erg/s, already scaled by pi*R_inner_kpc^2), NOT
+        surface brightness -- EE (ngal,), c_i (ngal,), fwhm_kpc (ngal,),
+        R_inner_kpc, core_area_kpc2 (= pi*R_inner_kpc^2, the area actually
+        used), psf_fwhm_arcsec, psf_beta, inner_bin_index, unit_info,
+        meta{nboot, ngal, stack_method, seed, bounds, cont_bounds,
+        cont_method, cont_order}.
+    """
+    if "cube_flux" not in stacks or "cube_err" not in stacks:
+        raise KeyError("stacks needs the per-galaxy cube -- re-run Stage 2 with "
+                       "build_stacks(..., keep_cube=True) (the default).")
+
+    bin_mode = stacks.get("bin_mode", "virial")
+    if bin_mode != "kpc" and verbose:
+        warnings.warn(
+            f"measure_psf_corrected_core_luminosity: stacks['bin_mode'] is "
+            f"{bin_mode!r}, not 'kpc' -- the innermost-bin aperture radius is "
+            f"read directly from r_edges and assumed to already be in kpc, "
+            f"matching psf_fwhm_arcsec's per-galaxy kpc conversion. Re-bin in "
+            f"kpc (or pass a stacks dict built that way) for a physically "
+            f"meaningful correction.")
+
+    r_edges = np.asarray(stacks["r_edges"], dtype=float)
+    R_inner_kpc = float(r_edges[inner_bin_index + 1])
+
+    cube_flux = np.asarray(stacks["cube_flux"], dtype=float)
+    cube_err = np.asarray(stacks["cube_err"], dtype=float)
+    ngal = cube_flux.shape[0]
+
+    z = np.asarray(product.catalog[config.z_col], dtype=float)
+    if z.size != ngal:
+        raise ValueError(
+            f"product.catalog has {z.size} galaxies but stacks['cube_flux'] has "
+            f"{ngal}; product and stacks must be the SAME sample, in the SAME "
+            f"galaxy order (pass the exact product/stacks pair this subsample "
+            f"was built from).")
+
+    boot_meta = boot.get("meta", {}) or {}
+    boot_ngal = boot_meta.get("ngal")
+    if boot_ngal is not None and int(boot_ngal) != ngal:
+        raise ValueError(
+            f"stacks has {ngal} galaxies but boot was measured on "
+            f"{boot_ngal}; core_lum_all would not align draw-for-draw with "
+            f"boot['total_flux_all']. Pass the matching stacks/boot pair for "
+            f"this exact subsample.")
+
+    kpc_per_arcsec = np.array(
+        [cosmo.angular_diameter_distance(zi).to(u.kpc).value / 206265 for zi in z])
+    fwhm_kpc = psf_fwhm_arcsec * kpc_per_arcsec
+
+    EE = np.asarray(fitting.moffat_encircled_energy_fraction(
+        R_inner_kpc, fwhm_kpc, beta=psf_beta), dtype=float)
+    EE = np.clip(EE, 1e-6, 1.0)   # guard a pathological c_i -> inf
+    c_i = 1.0 / EE
+
+    cube_flux_r = cube_flux * c_i[:, None, None]
+    cube_err_r = cube_err * c_i[:, None, None]
+
+    wave = np.asarray(stacks["rest_wave"], dtype=float)
+    weights = stacks.get("cube_weights")
+    w_all = None if weights is None else np.asarray(weights, dtype=float)
+
+    nboot = int(nboot if nboot is not None else boot_meta.get("nboot", 1000))
+    seed = seed if seed is not None else boot_meta.get("seed", 1)
+    sm = stack_method or boot_meta.get("stack_method") or getattr(config, "measure_stack_method", "biweight")
+
+    lya = float(getattr(config, "LYA_REST", LYA_REST))
+    b_bounds = tuple(bounds) if bounds is not None else tuple(getattr(config, "line_window", (lya - 4, lya + 4)))
+    cb = cont_bounds if cont_bounds is not None else getattr(config, "cont_bounds", DEFAULT_CONT_BOUNDS)
+    cm = cont_method if cont_method is not None else getattr(config, "cont_method", DEFAULT_CONT_METHOD)
+    co = cont_order if cont_order is not None else getattr(config, "cont_order", DEFAULT_CONT_ORDER)
+
+    # pi*R_inner_kpc^2 -- the core's OWN circular aperture area (the r_lo=0
+    # special case of _annulus_area_kpc2), used to turn the innermost bin's
+    # surface-brightness value (L_kpc2) into an actual luminosity (erg/s) --
+    # see this function's step-6 docstring for why this must happen here,
+    # not be left as an unscaled surface-brightness number.
+    core_area_kpc2 = float(_annulus_area_kpc2(0.0, R_inner_kpc))
+
+    # Speedup: _inner_bin_flux below only ever reads stack_arr[inner_bin_index]
+    # -- every stack_galaxies method (biweight/median/mean/inv_var/sigma_clip/
+    # weighted_median) combines each (radius, wave) pixel independently along
+    # the galaxy axis (axis=0), so there is no cross-bin coupling. Slicing the
+    # cube down to just the inner bin BEFORE stacking is therefore numerically
+    # IDENTICAL to stacking the full (ngal, nrad, nwave) cube and discarding
+    # every other bin afterward, at ~nrad-times less compute per draw. This is
+    # what makes nboot=1000 (matching this module's other bootstraps) tractable
+    # instead of nboot~100. Does NOT touch the rng draw sequence below, so
+    # core_lum_all stays draw-for-draw aligned with boot['total_flux_all'].
+    cube_flux_c = cube_flux_r[:, inner_bin_index:inner_bin_index + 1, :]
+    cube_err_c = cube_err_r[:, inner_bin_index:inner_bin_index + 1, :]
+    w_all_c = w_all
+    if w_all is not None and w_all.ndim == 2:
+        w_all_c = w_all[:, inner_bin_index:inner_bin_index + 1]
+
+    def _inner_bin_flux(stack_arr):
+        # stack_arr has a single radial bin (index 0) after the slice above.
+        res = blue_red_side_ratio(wave, stack_arr[0], bounds=b_bounds,
+                                  cont_bounds=cb, lya_center=lya, cont_method=cm,
+                                  cont_order=co, clip_negative=clip_negative_sides)
+        return (res["blue_flux"] + res["red_flux"]) if res["success"] else np.nan
+
+    fid_stack, _ = stack_galaxies(cube_flux_c, cube_err_c, method=sm, weights=w_all_c)
+    core_lum_fid = _inner_bin_flux(fid_stack) * core_area_kpc2
+
+    rng = np.random.default_rng(seed)
+    core_lum_all = np.full(nboot, np.nan)
+    desc = run_header("psf-corrected core luminosity bootstrap", verbose=verbose,
+                      nboot=nboot, stack=sm, seed=seed,
+                      psf_fwhm_arcsec=psf_fwhm_arcsec, psf_beta=psf_beta)
+    for b in tqdm(range(nboot), disable=not verbose, desc=desc):
+        idx = rng.integers(0, ngal, ngal)
+        flux_bs = cube_flux_c[idx]
+        err_bs = cube_err_c[idx]
+        w_bs = w_all_c[idx] if w_all_c is not None else None
+        stack_bs, _ = stack_galaxies(flux_bs, err_bs, method=sm, weights=w_bs)
+        core_lum_all[b] = _inner_bin_flux(stack_bs) * core_area_kpc2
+
+    core_lum_med = float(np.nanmedian(core_lum_all))
+    core_lum_lo = float(np.nanpercentile(core_lum_all, 16))
+    core_lum_hi = float(np.nanpercentile(core_lum_all, 84))
+
+    return {
+        "core_lum_fid": core_lum_fid, "core_lum_med": core_lum_med,
+        "core_lum_lo": core_lum_lo, "core_lum_hi": core_lum_hi,
+        "core_lum_all": core_lum_all,
+        "EE": EE, "c_i": c_i, "fwhm_kpc": fwhm_kpc, "R_inner_kpc": R_inner_kpc,
+        "core_area_kpc2": core_area_kpc2,
+        "psf_fwhm_arcsec": psf_fwhm_arcsec, "psf_beta": psf_beta,
+        "inner_bin_index": inner_bin_index,
+        "unit_info": stacks.get("unit_info"),
+        "meta": {"nboot": nboot, "ngal": ngal, "stack_method": sm, "seed": seed,
+                 "bounds": b_bounds, "cont_bounds": cb, "cont_method": cm, "cont_order": co},
     }

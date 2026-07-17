@@ -1,170 +1,253 @@
-# Lyα Halos (VIRAL) — Comprehensive Work Summary
+# Lyα Halos (VIRAL) — Project Overview
 
-*Compiled 2026-07-16, combining the "VIRAL-Halos Overview" deck (6-16-26) with everything worked on since.*
-
----
-
-## Part 1 — Foundation (established through mid-June 2026)
-
-### 1.1 Project & motivating questions
-
-**VIRAL** = VIRUS Investigation of Resonant Lyman-Alpha Light (Halos). Goal: quantify the extent and kinematics of Lyα halos around a sample of Cosmic Noon galaxies to learn about galaxy formation, accretion, and environment.
-
-Motivating questions the project was framed around:
-- How can we observe galaxy evolution through extended Lyα emission?
-- What do Lyα halos tell us about a galaxy and its immediate environment?
-- How, where, and when do galaxies primarily accrete mass?
-- How does halo extent/kinematics change with galaxy properties (mass, SFR, dust, etc.)?
-- What can a *stack* of galaxies reveal that individual measurements can't?
-- How and where do satellite galaxies contribute to an observed Lyα halo?
-
-### 1.2 Dataset
-
-**MOSDEF survey** (galaxy sample):
-- H-band selected, H≲24.5 (z~2 bin) / H≲25 (z~3 bin)
-- Systemic (rest-frame optical) redshifts from Hα or [OIII] — this is the project's core methodological advantage: an *independent* systemic anchor, not a shift measured relative to the Lyα line itself (the limitation in comparable studies like Guo et al. 2024)
-- Spans a range of SFR, mass, and Lyα detection status (LAEs, LAAs, AGN)
-- Current sample (no AGN emission lines detected in stacks):
-  - 1.9 < z < 2.75 — AEGIS 232, COSMOS 219, GOODS-N 176
-  - 2.75 < z < 3.5 — AEGIS 48, COSMOS 107, GOODS-N 93
-  - (Later narrowed to the ~450-500 galaxy AEGIS/COSMOS-only sample once VDFI footprint coverage was applied; see below)
-- Benchmarked against 3D-HST: MOSDEF median stellar mass 9.94 vs. 3D-HST 9.40 (log M☉), plus a redshift-distribution comparison
-
-**VDFI data** (the actual spectroscopic data being stacked):
-- First data release, EGS and COSMOS fields
-- ~100–150 exposures, each with ~35,000 fibers distributed across the sky in individual IFUs, each fiber giving one spectrum
-
-### 1.3 Pre-pipeline setup
-
-- **Data cuts**: quality cut requiring [OIII] or Hα S/N > 5, removing ~10% of the MOSDEF sample
-- **Fiber masking**: mask fibers in the upper 90th percentile of brightness in CFHT g-band imaging
-- **Config-driven pipeline**: a `config.py` "instructions" object defines field, catalog, fiber-masking method (spectral vs. image-based), bin scheme/type, background annulus extent, minimum background fibers, background smoothing size, fiber-combine method, and more — every run is fully parameterized rather than hardcoded
-
-### 1.4 Full extraction & stacking pipeline
-
-Per galaxy, per exposure:
-1. Compute a background from a 57″–63″ annulus, smoothed with a ~200 Å filter
-2. Subtract background per fiber, bin fibers into annuli defined in angular, kpc, or virial-radius units
-   - kpc bins: redshift-dependent only (~9 kpc ≈ 1″)
-   - virial bins: scale with mass, shrink with redshift (1 R_vir ≈ 90 kpc ≈ 10″ historically — later refined, see Part 2); capped at log(M)=11 to avoid runaway bin sizes/memory use
-3. Coadd fibers per bin (inv_var vs. biweight — inv_var produced a spurious blue-end continuum rise, likely mis-estimated errors; biweight became the standard)
-4. Write each galaxy's per-bin spectra to a FITS product (caching against kernel death at large radii, where hundreds of thousands of fibers get pulled in)
-5. Read galaxies back in, de-redshift, convert to physical units (L/kpc², the deprojected analog of F/arcsec²), and coadd across the galaxy sample (biweight standard) — produces one spectrum per radial bin representing the "average galaxy" at that radius
-   - Innermost bins (<5″) are PSF-dominated and highly correlated — VIRUS cannot resolve a clean down-the-barrel ISM spectrum
-
-### 1.5 Measurement methods
-
-- **Continuum**: median continuum fit from bounds flanking the line, subtracted; a 1D linear fit is available but risks biasing outer-bin centroids by fitting a slope to noise
-- **Line flux**: integrated within ±4 Å of rest-frame Lyα (1215.67 Å), window set by the MOSDEF redshift precision (~60 km/s)
-- **Centroid**: several consistent estimators; the adopted method is a median-flux centroid (cumulative flux from the left edge to 50%), more noise-robust than a standard first-moment centroid
-- **Errors**: bootstrap resampling, cross-checked against propagated error spectra and found consistent
-
-### 1.6 Core results (as of the June deck)
-
-- **Flux (brightness) profile** vs. radius, shown in both virial and kpc binning
-- **Centroid velocity vs. radius**, shown in both virial and kpc binning — red-dominated near center, moving toward/through systemic with radius
-- **Other radial diagnostics**: biweight-normalized radius–velocity map, blue-side vs. red-side flux vs. radius, blue/red flux-ratio asymmetry vs. radius (ratio ≈1 near ~4 kpc)
-
-### 1.7 Validation & systematics (established)
-
-- **PSF comparison**: radial continuum profiles of field stars (AEGIS/COSMOS) vs. the galaxy signal — confirms the halo is genuinely more extended than the instrumental PSF; used finer 0–100″ binning and a tighter ±3 Å window (thinner peaks at large radii)
-- **LSF comparison**: synthetic LSF built from VIRUS FWHM=5.6 Å convolved with the 60 km/s MOSDEF redshift uncertainty — the LSF sets the width of the red Lyα peak but centroids are recoverable despite the blurring
-- **Independent error methods**: z-scramble (randomize redshifts, restack), bootstrap (galaxy resampling), and jackknife (delete-one) — cross-checked against each other across radial bins
-- **Centroid-method comparison**: multiple estimators (flux-weighted moment, Gaussian-weighted moment, Gaussian fit, median-flux) agree
-- **External cross-check**: compared against an independent 3D-HST sample (Niemeyer et al. 2022) — consistent, a good sign the result isn't dataset-specific
-
-### 1.8 Preliminary subsample looks (June deck, "Extras")
-
-Early, uncontrolled low-vs-high splits shown for: redshift, stellar mass, E(B−V), and SFR100 — flagged as preliminary, not yet controlled or statistically vetted (that rigor is exactly what Part 2's subsample-split framework below was built to formalize).
-
-### 1.9 Known data artifacts (June deck)
-
-- Small spurious flux "spikes" resembling previously-identified fake LAEs in VDFI — traced to miscalibrated pixel errors that show up in inverse-variance galaxy stacks but not in biweight fiber stacks
-- A similar mean-vs-biweight outlier issue in far-radius annuli
-
-### 1.10 Insights / interpretation (as of the June deck)
-
-- An observed blueshift trend moving away from a red-dominant central peak, read as consistent with either accretion or a decreasing line-of-sight outflow velocity
-- No strong blue-shifted peak detected in the middle bins — argued against gravitational accretion being the dominant signal in this sample
-- At far radii (systematics-dependent), a possible net outflow/red-peak signature consistent with clustering with satellite LAEs — supported by a flattening of the flux profile at a similar radius, ~2 R_vir (at the time)
-
-### 1.11 Next steps identified in the June deck
-
-Re-run with additional VDFI data; compare halo extent/kinematics across subsamples grounded in physical hypotheses; run theoretical tests; build/improve a core-spectrum measurement function (escape fraction, core-vs-halo flux, LAE/LAA status — scoped as future/Paper 2 work); define the scope of and begin writing the Lyα halo paper.
+*Planning document for the next presentation/paper pass, revised 2026-07-16. Organized around the
+science rather than the chronology of the work — dataset/pipeline/methods are kept brief;
+motivation, results, validation, and interpretation carry the weight. Title TBD.*
 
 ---
 
-## Part 2 — Recent work (July 2026)
+## 1. Motivation
 
-This is where the June deck's "Next Steps" turned into actual results — a real fit, a formal statistical-significance treatment, a literature-grounded interpretation, and the scaffolding for the subsample-split and UV-continuum work still ahead.
+The project quantifies the extent and kinematics of Lyα halos around a sample of Cosmic Noon
+(z~2–3) galaxies. Five questions frame why this matters:
 
-### 2.1 Statistical rigor: combined significance beyond R_vir
+- **How can we observe galaxy evolution through extended Lyα emission?** Resonantly scattered
+  Lyα traces neutral hydrogen well beyond what continuum imaging reaches, offering a direct probe
+  of gas that continuum-only studies can't see.
+- **What do Lyα halos tell us about galaxies and their surrounding environments** — spanning the
+  ISM, CGM, and IGM/cosmic web? A single radial profile potentially carries information across all
+  three regimes, from the galaxy's own interstellar gas out to structure shared with neighbors.
+- **How are gas distribution and kinematics related to galaxy properties?** Does halo extent or
+  velocity structure track mass, star formation, dust, or environment — and which of those
+  relationships is causal versus incidental?
+- **How does the Lyα line behave kinematically relative to the systemic velocity?** Is the gas
+  net-inflowing, net-outflowing, or something more radius-dependent — and can that be pinned to
+  true zero velocity rather than just a relative line shape?
+- **How do satellite galaxies contribute to Lyα halos, and how much of the halo is produced by
+  scattering** (as opposed to in-situ emission — cooling radiation, fluorescence, or truly diffuse
+  intergalactic gas)?
 
-Formalized *how confident* the centroid signal beyond R_vir actually is, via two independent methods:
-- **`combined_bin_significance`** — combines several already-bootstrapped per-bin centroids into one test, using the full covariance matrix induced by resampling the *same* galaxies across all radial bins in each bootstrap draw (bins aren't independent — treating them as such overstates the evidence). Reports a covariance-aware combined offset/z/p, a naive-independent comparison for contrast, and a whole-vector Mahalanobis test.
-- **`pool_bins_and_bootstrap`** — an independent cross-check that instead pools several radial bins at the *flux* level (before any centroid is measured), using the same weighted-combine machinery (`combine_fibers`) the rest of the pipeline already uses, then bootstraps the merged bin directly.
-
-**Result:** individual outer bins (~110–220 kpc) sit at ~1.2–1.35σ each; the covariance-combined significance across all bins beyond R_vir is **~1.7σ** (two-sided, the primary number); the independent flux-pooled cross-check reproduces a consistent central value (~−47 to −48 km/s) at **~1.5σ**. Agreement across two independent combination methods is the strongest part of the case — stated honestly as "a consistent, modest trend," not a confident detection.
-
-Also fixed while building this: `plot_line_panels`'s bootstrap error band was re-anchored onto the fiducial stack (it had been centered on the bootstrap distribution's own median, which can visibly diverge from the fiducial curve in low-S/N outer bins), and a `seed` parameter was threaded through `measure_all_bins`/`bootstrap_all` (previously silently hardcoded, so different runs weren't drawing genuinely independent resamples).
-
-### 2.2 PSF-aware two-component flux-profile fitting
-
-The headline new *result* of the last month: a proper forward-modeled fit to the flux profile, built and validated from scratch.
-
-- **Model:** two-component exponential, `I(r) = A1·exp(-r/h1) + A2·exp(-r/h2)`
-- **PSF treatment:** closed-form 1D ring-convolution (`ring_convolution_matrix`) — for a circularly symmetric PSF and a thin unit-flux ring source, computes the exact PSF-smeared contribution to each observed radial bin. Validated via a flux-conservation check (a unit-flux ring must integrate back to 1 at every source radius, out to 2000 kpc). Two real bugs were caught and fixed in the process: a fixed angular-quadrature grid that missed the PSF's shrinking angular support at large radii, and a bin-midpoint-vs-bin-integral mismatch that was wrong by up to ~10⁹× for the widest bins.
-- **Two fits, same interface:** `fit_naive` (no PSF correction, drops the innermost bin) and `fit_psf_aware` (full forward model, all bins including the inner one) — both multi-seed with lowest-χ² selection, amplitude-normalized and data-driven bounds for numerical stability.
-- **Validated first on synthetic data** (`psf_exponential_recovery.py`, a Phase-1 testbed with known ground truth) before being pointed at the real stack — the exact same fitting code runs on both, so there's no drift between "validated code" and "code that fits real bins."
-
-**Current real-data result (PSF-aware, all 10 bins):** χ²/dof = 7.04/6 = 1.17; **h1 = 16.9 ± 1.1 kpc** (core term), **h2 = 1552 ± 548 kpc** (outer term). h1 sits inside the Steidel et al. 2011 range (20.8–28.4 kpc) for stacked KBSS-like halos; h2 is well beyond the one-halo/CGM regime — the break between the two terms falls almost exactly at R_vir (≈75 kpc), and h2 itself, converted to comoving units, lands close to the only direct-imaging detections of the cosmic web in Lyα emission in the literature (Bacon et al. 2021, 2.5–4 comoving Mpc; a 2024/2025 MUSE Ultra Deep Field 5 Mpc filament result).
-
-**Proposed next step (spec'd, not yet fit — "Option C"):** an exponential core + *cored* power-law halo, `I(r) = A1·exp(-r/h1) + A2·(1+(r/r_c)²)^(-γ/2)`, motivated by a bare power law fitting the outer term noticeably worse and diverging unphysically as r→0. Flags an important prerequisite: a 3D galaxy-clustering correlation slope (γ≈1.8) does *not* project onto a 2D radial profile at the same slope — the Limber approximation predicts a fully-projected slope closer to γ−1≈0.8 — so any literature-slope comparison needs the line-of-sight window depth checked first.
-
-### 2.3 Literature deep-dive: one-halo / two-halo framing
-
-A full literature review (`halo_gas_correlation_literature_review.md`) was written to properly ground the h1/h2 result, organized around the field's own halo-model vocabulary:
-- **One-halo term** = galaxy-to-own-CGM correlation, dominates from a few kpc out to ~R_vir
-- **Two-halo term** = galaxy-to-neighboring-halo correlation (large-scale structure/clustering bias), dominates beyond R_vir
-
-Surveyed both emission-side exponential fits (Steidel 2011, Wisotzki 2016, Leclercq 2017, and critically **Byrohl et al. 2021**, whose IllustrisTNG50 radiative-transfer simulations show the outer-profile flattening is dominated by photons from *other* halos, not the galaxy's own diffuse gas — the physical interpretation the h2 term is now organized around) and absorption-side tomography (Rakic 2012's FoG/Kaiser two-scale anisotropy split, and **Sorini et al. 2018**, which stitches together small- and large-scale absorption measurements and finds a galaxy's "sphere of influence" extends to ~7×R_vir — a literature-calibrated number that loosely echoes the fitted r_c ≈ 488 ± 211 kpc, ~6.5×R_vir). Also surveyed direct cosmic-web-in-emission detections (Umehata 2019, Bacon 2021) as the comparison set if h2 is confirmed to be tracing genuinely diffuse/large-scale structure.
-
-### 2.4 Discussion-section draft: three organizing pillars
-
-The paper's Discussion section (`docs/paper-writing/discussion-draft-notes.md`) was drafted around three pillars, confirmed as "the heart of the paper." (Originally scoped as four — the R_vir cutoff and the flux-profile fit were merged into one pillar, since the fit turned out to be the quantitative confirmation of the cutoff rather than a separate topic.)
-
-1. **Centroid vs. radius** — the systemic-redshift anchor as the core methodological advance over Guo et al. 2024's self-referenced approach; overall shape (red-dominated center → crosses systemic near R_vir → mildly negative beyond) and candidate physical readings (inflow scattering vs. outflow vs. satellite clustering); the ~1.7σ / ~1.5σ combined-significance result from §2.1, stated as a modest trend.
-2. **~1 R_vir cutoff, quantified by the fit** — three independent qualitative diagnostics (flux profile bend, centroid sign flip, blue/red flip) converge on one radius, and the PSF-aware two-component fit (§2.2 above) turns that agreement into a number: the fitted crossover radius between the core and outer terms lands at ≈76 kpc, essentially exactly on the independently-derived **R_vir = 75 kpc** (corrected, AGN-excluded, ~450-galaxy reference value — a ~90 kpc figure elsewhere in the draft is the older full ~500-galaxy AGN-included sample and is superseded). Four independent routes converging on the same radius — three qualitative diagnostics plus one quantitative fit — is the strongest version of this claim. The core term (h1=16.9 kpc) is compared to Steidel/Wisotzki/Leclercq; the outer term's interpretation is left deliberately open between a galaxy-clustering-slope story and Chen et al. 2020's own IGM optical-depth slope (~−0.5), which may be the more physically apt comparison for diffuse emission.
-3. **Origins via subsample splits** (§2.5 below) — organized around Byrohl 2021's inner/outer photon-origin decomposition.
-
-### 2.5 Subsample-split framework
-
-A full candidate list (`docs/subsample_splits.md`) was built and split across the two papers:
-
-- **Paper 1 (kinematics, prioritized for discovery):** mass/SFR-normalized mass, ΣSFR, Lyα velocity self-split, z~2 vs. z~3 (mass-normalized), dust attenuation (Balmer decrement/UV slope β), environment/satellite clustering, EW, orientation/inclination, double-Gaussian peak separation & height ratio, burstiness (Hα vs. UV-timescale SFR — flagged as needing Paper 2's larger dataset), half-light radius (mass-normalized).
-- **Paper 2 (flux/photon budget):** Hβ-normalized escape fraction, core classification type (AGN/LAE/emitter/null/absorber), PSF-aware exponential scale length of Lyα itself.
-
-Not yet started as actual measurements — this is the scoped-and-prioritized plan, still the top open item in `TODO.md`.
-
-### 2.6 UV-continuum extraction pipeline (Part 3 of the fitting spec — new, untested)
-
-A full extraction pipeline for the sample's rest-frame UV continuum (`uv_profile.py`, 1400+ lines) was designed and written, intended to eventually be fit and compared directly against the Lyα h1/h2 result via the same fitting machinery. **Not yet run against real data** — no CFHT-LS mosaic is present in this workspace/session yet. Pipeline: per-galaxy cutout from CFHT-LS r-band imaging → 2D-Gaussian centroid (kept-but-flagged, never dropped, mirroring the pipeline's existing QC philosophy) → circular-annulus photometry with masked-median background and segmap-based neighbor masking → galaxy-axis coaddition (reusing the same `combine_fibers` machinery as the spectral side) → bootstrap. Default model is a single exponential (`I(r) = A·exp(-r/h_UV)`), with an optional Sersic generalization. The physical payoff once run: a clean, same-sample UV continuum scale length to compare h1 against, replacing the currently-borrowed Steidel continuum figure (3–4 kpc).
-
-### 2.7 Figures & plotting infrastructure
-
-A pass across `analysis.py`/`plotting.py`/`stack.py`/`single.py` added a per-sample/per-galaxy virial-radius-in-kpc convenience (to draw the R_vir reference line directly on flux/centroid plots) and standardized figure-saving filenames — groundwork for the "bring figures up to publication quality" TODO item, though this pass wasn't documented slide-by-slide and may be worth a closer look before finalizing paper figures.
-
-### 2.8 Open systematics / unresolved questions
-
-Carried forward as the honest caveats section, several of which now thread through multiple Discussion pillars at once:
-- **Correlated (not random) outer-bin background noise** — still an open systematic that could bias the exact cutoff radius; the background annulus radius and smoothing window both measurably affect outer-bin behavior (findings logged, root cause not yet closed).
-- **R_vir mass calibration** — currently assumes a KBSS/LBG-like ~10¹² M☉ halo; LAE clustering (ODIN/DESI) suggests lower masses (~10¹¹), which could shift what "1 R_vir" even means.
-- **Double-Gaussian noise-prefabrication question** — open null test: does fitting a double-Gaussian template to pure noise and stacking by the fit's own derived quantities (peak separation, flux ratio) produce a template-shaped stack purely as a selection artifact? Needed before the peak-separation subsample split (§2.5, item 9) can be trusted.
-- **r_c/γ degeneracy** in the proposed Option C model — current radial coverage (~1000 kpc) isn't wide enough to break it; would need ~1.5 Mpc.
-- **SMHM relation choice** (Moster et al. 2013) — not yet re-validated against the two alternative relations already coded up (Girelli+2020, Behroozi+2019).
+This project's specific methodological edge for answering the fourth question: MOSDEF supplies an
+**independent, systemic (rest-frame optical) redshift** for every galaxy, from Hα or [OIII].
+Comparable studies (e.g. Guo et al. 2024) can only measure a Lyα centroid shift *relative to the
+line itself* — a genuinely different, less direct quantity. Anchoring to systemic velocity means
+this analysis can state directly where the gas sits kinematically (blueshifted / redshifted / at
+rest), not just how the line shape changes.
 
 ---
 
-## Where this leaves things
+## 2. Dataset, Pipeline & Methods (brief)
 
-The June deck was pipeline-and-methods-forward: dataset, extraction, validation, a first look at the headline centroid result, and speculative next steps. The work since has turned two of those "next steps" into real, literature-grounded results (a validated PSF-aware fit with actual numbers, and a formal combined-significance treatment of the R_vir-beyond signal), organized the paper's Discussion section around three pillars built on top of them — with the R_vir cutoff and the flux-profile fit now merged into one, since the fit is the quantitative backbone of the cutoff claim rather than a separate topic — and scoped out, but not yet executed, the two biggest remaining pieces of work: the subsample-split analysis and the UV-continuum comparison.
+**Dataset.** MOSDEF galaxies (H≲24.5 at z~2, H≲25 at z~3) cross-matched to VDFI/VIRUS
+spectroscopy in the COSMOS and EGS fields — roughly 500 galaxies total, ~450 after excluding AGN
+(the reference sample for all R_vir-relative numbers below). Each galaxy has ~100–150 exposures,
+each contributing spectra from ~35,000 individually-positioned fibers.
+
+**Pipeline.** Per galaxy, per exposure: subtract a local sky background, bin fibers into radial
+annuli (angular, kpc, or virial-radius units), and coadd. Bins are then coadded again across the
+full galaxy sample (biweight) to produce one composite spectrum per radial bin — the spectrum of
+the "average galaxy" at that radius. The innermost bins are PSF-dominated and highly correlated;
+VIRUS's fiber size means this pipeline cannot recover a clean, resolved down-the-barrel spectrum
+of any single galaxy's ISM, which is why the composite radial stack — not individual objects — is
+the unit of measurement throughout.
+
+**Measurement.** A local continuum is fit and subtracted; Lyα line flux is integrated in a
+±4 Å window around rest-frame 1215.67 Å (set by the ~60 km/s precision of the MOSDEF redshifts);
+the centroid is measured as the flux-weighted 50% point (median-flux centroid), which is more
+noise-robust than a first-moment centroid. Errors are bootstrapped (galaxy resampling),
+cross-checked against independent methods in §4.
+
+---
+
+## 3. Core Results
+
+### 3.1 Radial flux (surface-brightness) profile
+
+The stacked Lyα flux as a function of radius, in both kpc and virial-radius units. Flux declines
+steeply near the galaxy and flattens at large radius rather than dropping to zero — the first
+qualitative sign of a two-component (core + extended) structure, quantified in §7.
+
+### 3.2 Centroid velocity vs. radius — the headline kinematic result
+
+The Lyα centroid, referenced to the true systemic velocity (not a relative line shift), as a
+function of radius: **red-dominated near the galaxy center, crossing systemic velocity near
+R_vir, then mildly negative (blueshifted) beyond it.** Candidate physical readings: a blueshift
+consistent with scattering off inflowing/accreting gas, a redshift consistent with outflows or
+satellite-clustering contamination.
+
+The signal beyond R_vir is real but modest, not a confident detection — quantified two
+independent ways: individual outer bins sit at ~1.2–1.35σ each; a covariance-aware combination
+across all bins beyond R_vir (accounting for the fact that bootstrap draws share galaxies across
+radii, so bins aren't statistically independent) gives **~1.7σ** (two-sided); an independent
+flux-level pooling cross-check reproduces the same central value (~−47 to −48 km/s) at **~1.5σ**.
+Agreement between two independently-constructed statistics is the strongest part of the case.
+
+### 3.3 Central & comparison spectral profiles — blue vs. total emission
+
+Beyond the single centroid number, the actual line shape at each radius is compared directly:
+blue-side flux and red-side flux tracked separately as a function of radius, alongside a
+biweight-normalized radius–velocity map showing how the whole line profile (not just its
+midpoint) evolves outward. This is the qualitative view that the centroid number in §3.2
+summarizes into one figure per bin.
+
+### 3.4 Blue-to-total flux ratio
+
+Not a headline result on its own, but a useful, literature-comparable quantitative companion to
+the centroid: the fraction of line flux on the blue side of systemic, B/(B+R), at each radius.
+**0.5 means symmetric (systemic); above 0.5 is blue-dominated, below is red-dominated.** This
+gives an independent, differently-constructed number that tracks the same physical transition as
+the centroid — both flip sign near the same radius (§7) — and is a more direct quantity to compare
+against studies that report flux ratios rather than velocity centroids.
+
+---
+
+## 4. Validation & Systematics (summary)
+
+A standard battery of checks was run to establish that the centroid and flux-profile results are
+real signal, not a pipeline artifact:
+
+- **Error consistency** — bootstrap, jackknife, and redshift-scramble error estimates agree with
+  each other and with propagated error spectra.
+- **Centroid-method consistency** — multiple centroid estimators (flux-weighted moment,
+  Gaussian-weighted moment, Gaussian fit, median-flux) agree.
+- **Instrumental checks** — a star-PSF comparison confirms the halo is genuinely more extended
+  than the instrumental PSF; an LSF simulation confirms the ±4 Å measurement window is not itself
+  dominated by instrumental line-spread broadening.
+- **Known open item** — outer-bin background noise is correlated rather than random; still under
+  investigation as a possible source of bias in the exact cutoff radius (see §7 caveats).
+
+**Headline validation: independent agreement with Niemeyer et al. 2022.** Both analyses use
+VIRUS/HETDEX data, but Niemeyer et al. 2022 is an independently reduced, independently analyzed
+3D-HST-based sample. The fact that this pipeline's centroid and flux measurements closely
+reproduce theirs — despite different samples, reduction, and methodology built independently — is
+the strongest available evidence that the result isn't an artifact of this specific pipeline.
+
+---
+
+## 5. Core Spectrum Extraction
+
+Before the subsample analysis, each galaxy's own core (innermost, PSF-dominated) Lyα spectrum is
+measured directly — line flux, velocity offset, and (where S/N allows) a single- vs. double-Gaussian
+decomposition of the line profile, giving peak separation and relative peak height as additional
+per-galaxy quantities. These per-galaxy numbers are what several of the subsample bins in §6 are
+actually built from: the Lyα velocity-offset self-split, the classification scheme (LAE / LAA /
+absorber / null / AGN), and the double-Gaussian peak-separation and peak-height splits all use a
+quantity measured here, not an external catalog value. One open methodological question flagged
+before trusting the peak-separation split specifically: whether fitting a double-Gaussian template
+to pure noise and stacking by the fit's own derived quantities could produce a template-shaped
+result purely as a selection artifact — a null test planned but not yet run.
+
+---
+
+## 6. Subsample Analysis
+
+This is the section expected to carry the most new weight going forward, and — once the updated
+splits land — could plausibly be reframed directly into a paper's Results/Discussion structure
+without much restructuring; the pieces already largely exist.
+
+**Framework.** Splits cost statistical power (~√N per split), so each candidate split earns its
+place by testing a specific, literature-motivated physical prediction rather than being explored
+opportunistically. Splits are divided by which physical question they answer:
+
+- **Kinematics-focused** (prioritized for the discovery paper): mass and SFR-normalized mass,
+  ΣSFR (feedback/outflow proxy), the Lyα velocity-offset self-split, redshift bin (z~2 vs. z~3,
+  mass-normalized — also a systematics check), dust attenuation, environment/satellite clustering,
+  equivalent width, orientation/inclination, double-Gaussian peak separation & height ratio,
+  burstiness, and mass-normalized half-light radius.
+- **Flux/photon-budget-focused** (second paper): Hβ-normalized escape fraction, core
+  classification type, and a PSF-aware exponential scale length fit to the Lyα emission itself.
+
+**Status.** *[PENDING — to be updated with the new subsample splits once ready.]* Even without
+the additional incoming dataset, the current sample already supports enough of these splits to
+give the presentation (and eventually a paper) real subsample-level results, not just a plan.
+
+**Presentation format for each split, once results are in:** for every subsample quantity, state
+(1) what the literature predicts, (2) what is actually observed, and (3) what that agreement or
+disagreement means — never present a figure without that three-part framing.
+
+---
+
+## 7. Profile Fitting Analysis
+
+The flux profile (§3.1) and the centroid turnover (§3.2) are two views of the same underlying
+transition; this section is where that transition gets a number attached to it.
+
+**Model.** A two-component exponential is fit to the radial flux profile,
+`I(r) = A1·exp(-r/h1) + A2·exp(-r/h2)`, using a PSF-aware forward model (ring-convolution) so the
+innermost, most PSF-affected bin can be included rather than discarded. Fit quality: χ²/dof = 1.17
+across all 10 bins.
+
+**Results:**
+- **Core scale length: h1 = 16.9 ± 1.1 kpc** — consistent with the range from comparable stacked
+  Lyα halo studies (Steidel et al. 2011: 20.8–28.4 kpc; Wisotzki et al. 2016: 1–7 kpc; Leclercq
+  et al. 2017: ~4.5 kpc).
+- **Outer scale length: h2 = 1552 ± 548 kpc** — well beyond the single-halo/CGM regime, and
+  (converted to comoving units) close to the only direct-imaging detections of the cosmic web in
+  Lyα emission published to date.
+- **Turnover radius: the fitted crossover between the core and outer terms sits at ≈76 kpc —
+  essentially exactly at the independently-derived virial radius, R_vir = 75 kpc** (AGN-excluded
+  sample). This is the fit converting the qualitative "profile bends here" observation into an
+  actual, physically anchored number.
+
+**The key connection to emphasize:** this turnover radius is not just where the flux profile
+flattens — it is *also*, independently, almost exactly where the centroid (§3.2) and blue/total
+ratio (§3.4) both flip sign. Three qualitative diagnostics and one quantitative fit are all
+converging on the same physical radius. That convergence — not any single measurement on its own —
+is the strongest evidence this is a real transition rather than a fitting or pipeline artifact,
+and it is the direct observational link to theoretical halo-scale gas-transition models, making it
+a central discussion point rather than a methods footnote.
+
+**Caveats to carry into discussion:** the outer term's physical origin (galaxy clustering vs.
+diffuse IGM optical depth) is genuinely open, not resolved (§8); the correlated outer-bin noise
+flagged in §4 could shift the exact turnover radius; fit errors are currently single-fit
+covariance, not yet bootstrapped.
+
+---
+
+## 8. Literature Context: One-Halo / Two-Halo Framework (brief)
+
+Just enough framing to connect the two-component fit to the field's existing vocabulary, not a
+full review (the full literature survey lives in `halo_gas_correlation_literature_review.md`).
+
+Standard halo-model language splits any galaxy–gas correlation into a **one-halo term** (gas
+belonging to the galaxy's own dark-matter halo — CGM proper, dominant from a few kpc out to
+~R_vir) and a **two-halo term** (gas correlated with *neighboring* halos — large-scale structure,
+dominant beyond R_vir). This maps directly onto the fitted h1/h2 decomposition. Key anchors:
+**Rakic et al. 2012** found an order-of-magnitude opacity drop at ~100 kpc (≈R_vir) in absorption,
+with distinct redshift-space anisotropies on either side — the field's cleanest precedent for "two
+physically distinct scales." **Byrohl et al. 2021**'s radiative-transfer simulations predict that
+outer-profile flattening in emission specifically comes from photons originating in *other* halos,
+not the galaxy's own diffuse gas — the physical interpretation this project's h2 term is now
+organized around. **Sorini et al. 2018** independently finds a galaxy's "sphere of influence"
+extends to ~7×R_vir in absorption, loosely consistent with this fit's r_c ≈ 6.5×R_vir.
+
+---
+
+## 9. UV Continuum Comparison
+
+A direct comparison of the Lyα halo's core scale length against the sample's own rest-frame UV
+continuum scale length — the classic way this kind of result is quantified in the literature
+(e.g. Steidel et al. 2011 report Lyα halos ~5–10× more extended than the UV continuum for the
+same galaxies).
+
+**Status: *[PENDING]*.** The extraction pipeline (CFHT-LS r-band cutout → centroid → annular
+photometry → coaddition → single-exponential PSF-aware fit, mirroring the same fitting machinery
+used for the Lyα profile in §7) is fully built but has not yet been run against real imaging data.
+Once run, the payoff is a single clean number: **how many times larger the Lyα-emitting region is
+than the galaxies' own starlight**, using the exact same sample and the exact same fitting
+convention as §7 — a same-sample comparison rather than borrowing another study's continuum figure.
+
+---
+
+## 10. Status & Synthesis
+
+What's ready now, in roughly the order it should appear in a presentation: the motivation (§1),
+a brief methods overview (§2), the core radial results with real numbers behind them (§3), a
+validated methodology backed by independent agreement with prior HETDEX/VIRUS work (§4), and a
+quantitative fit that ties the flux, centroid, and B/T turnover together at a single physically
+meaningful radius (§7), with just enough literature framing to place that result in context (§8).
+
+What's still pending: the updated subsample-split results (§6) and the UV-continuum comparison
+(§9). Both are scoped and largely built, not blocked on new ideas — just execution. Once those
+two land, this outline is close to a full paper's Results/Discussion structure, not just a talk.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             

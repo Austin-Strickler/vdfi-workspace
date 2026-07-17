@@ -274,10 +274,32 @@ class UVExtractConfig:
     #       and stores this beta per galaxy, so build_effective_psf_uv builds
     #       each galaxy's Moffat with its own field's measured core AND wing
     #       shape. Fields absent here fall back to header seeing + psf_beta.
+    #   psf_empirical : per-field MEASURED stellar-PSF curve, as
+    #       {field: {"r_arcsec": [...], "value": [...]}} -- the stacked-star
+    #       radial profile itself (from measure_stellar_psf), saved verbatim
+    #       instead of fitting a Moffat to it. This is the "measure once,
+    #       paste, done" path: a single Moffat can't match both a sharp core
+    #       and heavy wings, so the honest PSF is just the curve. When a field
+    #       has an entry here it takes PRECEDENCE over psf_moffat_params /
+    #       header seeing in build_effective_psf_uv, which INTERPOLATES this
+    #       curve (scaled to each galaxy's kpc via its own z) rather than
+    #       evaluating an analytic Moffat. Any normalization is fine (each
+    #       galaxy's curve is flux-normalized before averaging). Generate a
+    #       paste-ready block with psf_empirical_entry(field, r_mid, stack).
+    #   psf_sat_level / psf_sat_frac : the CORE-saturation reject for
+    #       measure_stellar_psf, as a FIXED constant instead of the header
+    #       SATURATE (inconsistent between fields: AEGIS ~30000, COSMOS ~3000).
+    #       A star is rejected if its core max reaches psf_sat_frac x
+    #       psf_sat_level. With shape-based clipping now doing the real cleaning
+    #       (log-residual vs the biweight stack), this cut is just a cheap guard
+    #       against a truly railed core, so it can be set loose/high here.
     psf_fwhm_arcsec: dict = _field(default_factory=dict)
     psf_seeing_header_keys: tuple = ("IQIMAGE", "FINALIQ")
     psf_beta: float = 3.0
     psf_moffat_params: dict = _field(default_factory=dict)
+    psf_empirical: dict = _field(default_factory=dict)
+    psf_sat_level: float = 5000.0
+    psf_sat_frac: float = 0.8
 
 
 # =======================================================================
@@ -1497,8 +1519,258 @@ def fit_and_plot_uv_coadd(coadd: dict, method: str = "biweight", *, boot: Option
     )
 
 
+def measure_stellar_psf(stars, image_path, uvcfg: UVExtractConfig, field, *,
+                        r_edges_arcsec=None, sat_core_arcsec=None,
+                        sky_r_in_arcsec=None, sky_r_out_arcsec=None,
+                        sat_frac=None, sat_level=None,
+                        combine_method: str = "biweight",
+                        core_norm_arcsec=None, clip_sigma: float = 4.0,
+                        clip_iters: int = 3, min_keep: int = 5,
+                        n_boot: int = 2000, rng_seed: int = 0,
+                        min_finite_frac: float = 0.7, stamp_pad_factor: float = 1.3,
+                        ra_col: str = "ra", dec_col: str = "dec", verbose: bool = True):
+    """
+    Measure the empirical stellar PSF for `field`: each star's radial profile
+    (in ARCSEC -- stars have no z) with source masking OFF (a star IS the
+    PSF), combined into one core-normalized BIWEIGHT stack -- the measured PSF
+    to save in uvcfg.psf_empirical (via psf_empirical_entry) or hand to
+    fit_moffat_psf.
+
+    Robustness (three layers, all attacking a bright/saturated survivor):
+      * Each star is normalized by its CORE INTEGRAL (area-weighted mean
+        surface brightness within core_norm_arcsec), not by its single peak
+        pixel. A saturated core has a clipped, flat top, so np.nanmax reads too
+        low and dividing by it inflates the whole curve upward -- the "stays
+        high with a bright tail" signature. A small-core integral is stable
+        against one clipped/noisy central pixel.
+      * Stars are combined with biweight_location (per bin), not a plain mean,
+        so a surviving outlier is downweighted rather than dragging the stack.
+      * SHAPE-BASED rejection: iterate clip_iters times -- build the biweight
+        stack, score each star by the RMS log-residual to it (over bins where
+        the stack is above 1e-3 of peak), and drop stars beyond clip_sigma x
+        MAD of that score. This catches saturated survivors an absolute-counts
+        cut misses (flat core / bright extended tail), which is exactly what is
+        visible by eye. Never drops below min_keep stars.
+
+    The per-bin ERROR is the BOOTSTRAP of the biweight stack: resample the kept
+    stars with replacement n_boot times, re-stack, take the per-bin std. This
+    is the uncertainty ON THE STACK (with the sqrt(N) shrinkage built in) for
+    the actual biweight estimator, not the outlier-driven np.nanstd population
+    spread. Returned as qc['stack_err'] -- feed THAT as fit_moffat_psf's sigma.
+
+    Fixes the two stamp-coupled artifacts of the earlier notebook loop, where
+    stamp_arcsec silently leaked into the result:
+
+      * SATURATION is checked ONLY in the core -- pixels within
+        sat_core_arcsec of the fitted centroid -- not np.nanmax over the whole
+        stamp. A saturated NEIGHBOR far out in a large stamp no longer rejects
+        an otherwise-clean star, so the surviving-star count stops depending
+        on stamp size (the cause of "51 stars at 5x, 12 at 30x").
+      * BACKGROUND is the sigma-clipped median of a fixed SKY ANNULUS
+        [sky_r_in, sky_r_out] around the centroid, not the whole-stamp median.
+        The subtracted sky no longer drifts with stamp size or with how much
+        of the stamp the star's own wings fill (the cause of the profile
+        SHAPE changing with stamp).
+
+    The stamp is sized INTERNALLY to just hold the sky annulus + pad, so it is
+    no longer a free knob. As long as it clears sky_r_out it cannot affect the
+    profile -- which is the whole point.
+
+    Defaults (all overridable): r_edges_arcsec = 0..4.5" in ~1.3-pixel bins
+    (>= 1 pixel so the core isn't sub-sampled); sat_core = 1.5 x header seeing
+    FWHM; sky annulus = [r_edges[-1], 1.5 x r_edges[-1]] -- just outside the
+    PSF (< ~1e-4 of peak there, i.e. clean sky).
+
+    sat_frac / sat_level : the core-saturation cut, defaulting to
+    uvcfg.psf_sat_frac / uvcfg.psf_sat_level (a FIXED constant, NOT the header
+    SATURATE, which is inconsistent between fields -- AEGIS ~30000, COSMOS
+    ~3000). A star is rejected if its core max reaches sat_frac x sat_level.
+    With the shape clip doing the real cleaning this is just a loose guard, so
+    it can be set high in the config. Pass either here to override per call.
+
+    Returns (r_mid_arcsec, stack, profiles, qc):
+      r_mid_arcsec : bin midpoints (len n_bins)
+      stack        : core-normalized BIWEIGHT PSF (len n_bins)
+      profiles     : (n_kept, n_bins) individual core-normalized profiles,
+                     AFTER shape-based clipping
+      qc           : counts (incl. shape_clipped) + resolved sat_core/sky/stamp
+                     + stack_err (bootstrap per-bin 1-sigma on the stack)
+    Feed (r_mid_arcsec, stack, qc['stack_err']) to fit_moffat_psf, or save
+    (r_mid_arcsec, stack) with psf_empirical_entry.
+    """
+    if sat_level is None:
+        sat_level = float(getattr(uvcfg, "psf_sat_level", 5000.0))
+    if sat_frac is None:
+        sat_frac = float(getattr(uvcfg, "psf_sat_frac", 0.8))
+    if r_edges_arcsec is None:
+        r_edges_arcsec = np.arange(0.0, 4.501, 0.15)
+    r_edges_arcsec = np.asarray(r_edges_arcsec, dtype=float)
+    r_mid = 0.5 * (r_edges_arcsec[:-1] + r_edges_arcsec[1:])
+    r_out = float(r_edges_arcsec[-1])
+
+    seeing_hdr = read_seeing_fwhm_arcsec(image_path, field, uvcfg, verbose=False)
+    if sat_core_arcsec is None:
+        sat_core_arcsec = 1.5 * seeing_hdr
+    if sky_r_in_arcsec is None:
+        sky_r_in_arcsec = r_out
+    if sky_r_out_arcsec is None:
+        sky_r_out_arcsec = 1.5 * r_out
+    stamp_arcsec = 2.0 * stamp_pad_factor * float(sky_r_out_arcsec)
+
+    # core-normalization radius (half the seeing FWHM), always >= the first
+    # bin so at least one bin is averaged; annulus areas (2*pi*r*dr) weight it.
+    if core_norm_arcsec is None:
+        core_norm_arcsec = max(0.5 * seeing_hdr, float(r_mid[0]))
+    dr = np.diff(r_edges_arcsec)
+    area_w = 2.0 * np.pi * r_mid * dr
+    core_bins = r_mid <= core_norm_arcsec
+    if not np.any(core_bins):
+        core_bins = np.zeros(len(r_mid), dtype=bool)
+        core_bins[0] = True
+
+    hdul, hdu = _open_image_hdu(image_path)
+    try:
+        image_data = np.asarray(hdu.data, dtype=float)
+        wcs = WCS(hdu.header)
+    finally:
+        hdul.close()
+
+    profiles = []
+    kept = n_sat = n_offimg = n_badfit = 0
+    for row in stars:
+        ra, dec = float(row[ra_col]), float(row[dec_col])
+        cutout = make_galaxy_cutout(image_data, wcs, ra, dec, stamp_arcsec)
+        data = np.asarray(cutout.data, dtype=float)
+        pixscale = get_pixscale_arcsec(cutout.wcs)[0]
+
+        cen = centroid_galaxy(cutout, ra, dec,
+                              window_arcsec=uvcfg.centroid_window_arcsec,
+                              offset_flag_arcsec=uvcfg.centroid_offset_flag_arcsec)
+        if not cen["fit_ok"]:
+            n_badfit += 1
+            continue
+        cx, cy = cutout.wcs.celestial.all_world2pix(cen["ra"], cen["dec"], 0)
+
+        ny, nx = data.shape
+        yy, xx = np.mgrid[0:ny, 0:nx]
+        rr = np.hypot(xx - float(cx), yy - float(cy)) * pixscale
+
+        # saturation: CORE only
+        core = data[(rr <= sat_core_arcsec) & np.isfinite(data)]
+        if len(core) == 0 or np.max(core) >= sat_frac * sat_level:
+            n_sat += 1
+            continue
+
+        # coverage: the measured region must be mostly on-image
+        meas = rr <= r_out
+        if not np.any(meas) or np.isfinite(data[meas]).mean() < min_finite_frac:
+            n_offimg += 1
+            continue
+
+        # background: sigma-clipped median of a FIXED sky annulus
+        sky_pix = data[(rr >= sky_r_in_arcsec) & (rr <= sky_r_out_arcsec) & np.isfinite(data)]
+        if len(sky_pix) < 10:
+            n_offimg += 1
+            continue
+        _, bg, _ = sigma_clipped_stats(sky_pix, sigma=3.0, maxiters=5)
+
+        prof = measure_uv_annuli(cutout, (float(cx), float(cy)), r_edges_arcsec,
+                                 background=float(bg), combine_method=combine_method,
+                                 neighbor_mask=None)
+        f = np.asarray(prof["flux_mean"], dtype=float)
+        # normalize by the CORE INTEGRAL (area-weighted mean surface brightness
+        # within core_norm_arcsec), robust to a clipped/noisy single peak pixel
+        norm = np.nansum((f * area_w)[core_bins]) / np.nansum(area_w[core_bins])
+        if not np.isfinite(norm) or norm <= 0:
+            n_badfit += 1
+            continue
+        profiles.append(f / norm)
+        kept += 1
+
+    profiles = np.array(profiles) if kept else np.zeros((0, len(r_mid)))
+
+    def _biw_stack(P):
+        """Per-bin biweight_location over rows (nan-safe; median if < 3 pts)."""
+        out = np.full(P.shape[1], np.nan)
+        for j in range(P.shape[1]):
+            col = P[:, j]
+            col = col[np.isfinite(col)]
+            if col.size >= 3:
+                out[j] = biweight_location(col)
+            elif col.size:
+                out[j] = np.median(col)
+        return out
+
+    # SHAPE-BASED rejection: iteratively drop stars whose profile is an outlier
+    # relative to the biweight stack. Score = RMS of log10(profile) - log10(stack)
+    # over bins where the stack is above 1e-3 of peak (the mid/wing bins that
+    # actually discriminate; the core is ~1 for everyone by construction). A
+    # saturated survivor -- flat core inflated by normalization, bright tail --
+    # is a multi-bin high outlier and clips out; robust MAD threshold, and never
+    # below min_keep stars.
+    keep = np.ones(len(profiles), dtype=bool)
+    n_shape = 0
+    for _ in range(int(clip_iters)):
+        if keep.sum() < max(min_keep, 3):
+            break
+        S = _biw_stack(profiles[keep])
+        good_bins = np.isfinite(S) & (S > 1e-3 * np.nanmax(S))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            logres = np.log10(profiles) - np.log10(S)
+        metric = np.full(len(profiles), np.nan)
+        for j in range(len(profiles)):
+            v = logres[j][good_bins]
+            v = v[np.isfinite(v)]
+            if v.size:
+                metric[j] = np.sqrt(np.mean(v ** 2))
+        med = np.nanmedian(metric[keep])
+        mad = 1.4826 * np.nanmedian(np.abs(metric[keep] - med))
+        if not np.isfinite(mad) or mad <= 0:
+            break
+        new_keep = keep & np.isfinite(metric) & (metric <= med + float(clip_sigma) * mad)
+        if new_keep.sum() < min_keep or new_keep.sum() == keep.sum():
+            break
+        keep = new_keep
+    n_shape = int((~keep).sum())
+    profiles = profiles[keep]
+    kept = len(profiles)
+
+    stack = _biw_stack(profiles) if kept else np.full(len(r_mid), np.nan)
+
+    # per-bin error = BOOTSTRAP of the biweight stack over STARS (resample with
+    # replacement, re-stack, take per-bin std). Robust estimator -> a surviving
+    # bright star can't blow this up the way np.nanstd did.
+    if kept >= 2 and int(n_boot) > 0:
+        rng = np.random.default_rng(rng_seed)
+        boot = np.empty((int(n_boot), len(r_mid)), dtype=float)
+        for b in range(int(n_boot)):
+            boot[b] = _biw_stack(profiles[rng.integers(0, kept, kept)])
+        stack_err = np.nanstd(boot, axis=0)
+    else:
+        stack_err = np.full(len(r_mid), np.nan)
+
+    qc = {"kept": kept, "saturated": n_sat, "off_image": n_offimg,
+          "bad_centroid": n_badfit, "shape_clipped": n_shape,
+          "seeing_hdr_arcsec": float(seeing_hdr),
+          "sat_core_arcsec": float(sat_core_arcsec), "sat_level": float(sat_level),
+          "sat_frac": float(sat_frac), "core_norm_arcsec": float(core_norm_arcsec),
+          "sky_annulus_arcsec": (float(sky_r_in_arcsec), float(sky_r_out_arcsec)),
+          "stamp_arcsec": float(stamp_arcsec), "stack_err": stack_err}
+    if verbose:
+        print(f"measure_stellar_psf [{field}]: kept {kept} stars (rejected "
+              f"{n_sat} saturated-core, {n_offimg} off-image/low-coverage, "
+              f"{n_badfit} bad centroid, {n_shape} shape-outlier). biweight "
+              f"stack, bootstrap err (n_boot={int(n_boot)}). "
+              f"sat_core={sat_core_arcsec:.2f}\" (>= {sat_frac * sat_level:.0f} "
+              f"cts rejects), core_norm={core_norm_arcsec:.2f}\", "
+              f"sky=[{sky_r_in_arcsec:.2f},{sky_r_out_arcsec:.2f}]\", "
+              f"stamp={stamp_arcsec:.1f}\" (internal).")
+    return r_mid, stack, profiles, qc
+
+
 def fit_moffat_psf(r_arcsec, psf_profile, *, sigma=None, fwhm0: float = 0.8,
-                   beta0: float = 3.0, fit_log: bool = True, verbose: bool = True):
+                   beta0: float = 3.0, seeds=None, fit_log: bool = True,
+                   verbose: bool = True):
     """
     Fit an analytic Moffat -- BOTH FWHM and beta FREE -- to a measured PSF
     profile (e.g. a stacked-star curve), giving the citable per-field PSF
@@ -1523,9 +1795,15 @@ def fit_moffat_psf(r_arcsec, psf_profile, *, sigma=None, fwhm0: float = 0.8,
     rather than given infinite weight), so a raw np.nanstd weight is safe to
     pass as-is.
 
+    seeds : optional list of (fwhm0, beta0) starting points. The fit is run
+    from each, plus the explicit (fwhm0, beta0), and the LOWEST-cost converged
+    result is kept -- guards against settling in a shallow local minimum along
+    the FWHM<->beta degeneracy. None -> a diverse default grid (narrow..broad
+    cores x light..heavy wings).
+
     Returns dict: fwhm, beta (best fit), fwhm_err, beta_err (1-sigma from the
     covariance), A, r_arcsec, model (fitted curve sampled on r_arcsec),
-    n_points, success. Drop fwhm/beta straight into
+    n_points, cost, n_seeds_ok, success. Drop fwhm/beta straight into
     uvcfg.psf_moffat_params[field].
     """
     from scipy.optimize import curve_fit
@@ -1553,22 +1831,46 @@ def fit_moffat_psf(r_arcsec, psf_profile, *, sigma=None, fwhm0: float = 0.8,
             return logA + np.log10(moffat_1d(rr, fwhm=fwhm, beta=beta))
         ydata = np.log10(yg)
         s = (sg / (yg * np.log(10.0))) if sg is not None else None
-        p0 = [float(np.log10(np.nanmax(yg))), fwhm0, beta0]
+        amp0 = float(np.log10(np.nanmax(yg)))
         bounds = ([-np.inf, 0.05, 1.05], [np.inf, 5.0, 15.0])
     else:
         def model(rr, A, fwhm, beta):
             return A * moffat_1d(rr, fwhm=fwhm, beta=beta)
         ydata = yg
         s = sg
-        p0 = [float(np.nanmax(yg)), fwhm0, beta0]
+        amp0 = float(np.nanmax(yg))
         bounds = ([0.0, 0.05, 1.05], [np.inf, 5.0, 15.0])
 
-    try:
-        popt, pcov = curve_fit(model, rg, ydata, p0=p0, sigma=s,
-                               absolute_sigma=False, bounds=bounds, maxfev=20000)
-    except Exception as e:
-        return {"success": False, "reason": f"curve_fit failed: {e}"}
+    # Multi-seed: try a diverse grid of (FWHM, beta) starts and keep the
+    # lowest-cost converged fit. A single Moffat's log-space cost surface can
+    # have shallow local minima along the FWHM<->beta degeneracy (a sharper
+    # core with heavier wings trades off against a broader core with lighter
+    # wings), so one start can settle short of the best compromise -- exactly
+    # the "I could clearly do better by hand" feeling. Seeds span narrow/broad
+    # cores and light/heavy wings; the explicit (fwhm0, beta0) is always tried.
+    if seeds is None:
+        seeds = [(fw, be) for fw in (0.5, 0.7, 0.9, 1.2) for be in (1.5, 2.5, 3.5, 5.0)]
+    seeds = list(seeds) + [(fwhm0, beta0)]
 
+    best = None
+    n_ok = 0
+    for fw0, be0 in seeds:
+        fw0 = float(np.clip(fw0, bounds[0][1] * 1.01, bounds[1][1] * 0.99))
+        be0 = float(np.clip(be0, bounds[0][2] * 1.01, bounds[1][2] * 0.99))
+        try:
+            popt, pcov = curve_fit(model, rg, ydata, p0=[amp0, fw0, be0], sigma=s,
+                                   absolute_sigma=False, bounds=bounds, maxfev=20000)
+        except Exception:
+            continue
+        resid = model(rg, *popt) - ydata
+        cost = float(np.sum((resid / s) ** 2)) if s is not None else float(np.sum(resid ** 2))
+        n_ok += 1
+        if best is None or cost < best["cost"]:
+            best = {"popt": popt, "pcov": pcov, "cost": cost}
+
+    if best is None:
+        return {"success": False, "reason": "all seeds failed to converge"}
+    popt, pcov = best["popt"], best["pcov"]
     perr = np.sqrt(np.diag(pcov))
     A = 10.0 ** popt[0] if fit_log else float(popt[0])
     fwhm, beta = float(popt[1]), float(popt[2])
@@ -1576,11 +1878,43 @@ def fit_moffat_psf(r_arcsec, psf_profile, *, sigma=None, fwhm0: float = 0.8,
     if verbose:
         print(f"fit_moffat_psf: FWHM = {fwhm:.4f} +/- {fwhm_err:.4f}\"   "
               f"beta = {beta:.3f} +/- {beta_err:.3f}   "
-              f"({'log' if fit_log else 'linear'} fit over {int(good.sum())} bins)")
+              f"({'log' if fit_log else 'linear'} fit over {int(good.sum())} bins, "
+              f"best of {n_ok}/{len(seeds)} seeds)")
     return {"success": True, "fwhm": fwhm, "beta": beta,
             "fwhm_err": fwhm_err, "beta_err": beta_err, "A": float(A),
             "r_arcsec": r, "model": A * moffat_1d(r, fwhm=fwhm, beta=beta),
-            "n_points": int(good.sum())}
+            "n_points": int(good.sum()), "cost": best["cost"], "n_seeds_ok": n_ok}
+
+
+def psf_empirical_entry(field, r_arcsec, value, *, printout: bool = True):
+    """
+    Turn a MEASURED stellar-PSF curve into a paste-ready entry for
+    uvcfg.psf_empirical[field] -- the "measure once, paste, done" path.
+
+    Run measure_stellar_psf to get (r_mid, stack_stars), pass them here, and
+    paste the printed block into the config. No Moffat is fitted: the saved
+    curve IS the PSF, and build_effective_psf_uv interpolates it (scaled to
+    each galaxy's kpc) instead of evaluating an analytic model. Store it as
+    measured -- normalization is irrelevant because each galaxy's curve is
+    flux-normalized before averaging.
+
+    Only finite bins are kept. Returns {"r_arcsec": [...], "value": [...]};
+    by default also prints the config block.
+    """
+    r = np.asarray(r_arcsec, dtype=float)
+    v = np.asarray(value, dtype=float)
+    good = np.isfinite(r) & np.isfinite(v)
+    r, v = r[good], v[good]
+    entry = {"r_arcsec": [float(x) for x in r], "value": [float(x) for x in v]}
+    if printout:
+        rr = ", ".join(f"{x:.4f}" for x in r)
+        vv = ", ".join(f"{x:.6e}" for x in v)
+        print(f'# {field}: {len(r)} bins -- paste into uvcfg.psf_empirical')
+        print(f'psf_empirical["{field}"] = {{')
+        print(f'    "r_arcsec": [{rr}],')
+        print(f'    "value":    [{vv}],')
+        print('}')
+    return entry
 
 
 def build_effective_psf_uv(results: list, uvcfg: UVExtractConfig, *,
@@ -1621,32 +1955,54 @@ def build_effective_psf_uv(results: list, uvcfg: UVExtractConfig, *,
 
     Returns (psf_r, psf_vals) -- both length n_grid, psf_r in kpc.
     """
-    pairs = [(float(r[psf_key]), float(r.get("psf_beta", uvcfg.psf_beta)))
-             for r in results if np.isfinite(r.get(psf_key, np.nan))]
-    if len(pairs) == 0:
+    usable = [r for r in results if np.isfinite(r.get(psf_key, np.nan))]
+    if len(usable) == 0:
         raise ValueError(
             f"No finite '{psf_key}' in results -- run extract_uv_profiles_for_field "
             f"with a seeing value first (see read_seeing_fwhm_arcsec).")
-    fwhm_kpc = np.array([p[0] for p in pairs], dtype=float)
-    betas = np.array([p[1] for p in pairs], dtype=float)
+    fwhm_kpc = np.array([float(r[psf_key]) for r in usable], dtype=float)
 
     if r_max_kpc is None:
         r_max_kpc = 20.0 * float(np.max(fwhm_kpc))
     psf_r = np.linspace(0.0, float(r_max_kpc), n_grid)
 
-    # Each galaxy's Moffat uses ITS OWN field's (kpc FWHM, beta), so a
-    # multi-field sample with different seeing AND different wing shapes
-    # (e.g. COSMOS beta!=AEGIS beta from fit_moffat_psf) is averaged
-    # correctly rather than forced onto one global beta.
+    # Per galaxy: if its FIELD has a measured empirical PSF curve
+    # (uvcfg.psf_empirical[field]), interpolate THAT curve -- the honest
+    # stacked-star profile -- instead of an analytic Moffat. The curve is in
+    # arcsec, so it is scaled to this galaxy's kpc by its own arcsec->kpc
+    # factor (psf_fwhm_kpc / psf_fwhm_arcsec, i.e. its z) before interpolating
+    # onto the shared kpc grid; beyond the measured outer radius the PSF is
+    # taken as 0. Fields WITHOUT an empirical entry fall back to their own
+    # (kpc FWHM, beta) Moffat, so a mixed sample averages correctly. Every
+    # galaxy's curve is flux-normalized (unit 2*pi*r integral) before
+    # averaging, so narrow and broad PSFs weigh equally.
     acc = np.zeros_like(psf_r)
-    for f, b in zip(fwhm_kpc, betas):
-        acc += normalize_psf_flux(psf_r, moffat_1d(psf_r, fwhm=f, beta=b))
-    psf_vals = acc / len(fwhm_kpc)
+    betas, n_emp, n_moffat = [], 0, 0
+    for r in usable:
+        emp = uvcfg.psf_empirical.get(r.get("field")) if uvcfg.psf_empirical else None
+        if emp is not None:
+            fwhm_arcsec = float(r.get("psf_fwhm_arcsec", np.nan))
+            kpc_per_arcsec = float(r["psf_fwhm_kpc"]) / fwhm_arcsec
+            r_emp = np.asarray(emp["r_arcsec"], dtype=float) * kpc_per_arcsec
+            v_emp = np.asarray(emp["value"], dtype=float)
+            prof = np.interp(psf_r, r_emp, v_emp, left=float(v_emp[0]), right=0.0)
+            acc += normalize_psf_flux(psf_r, prof)
+            n_emp += 1
+        else:
+            b = float(r.get("psf_beta", uvcfg.psf_beta))
+            acc += normalize_psf_flux(
+                psf_r, moffat_1d(psf_r, fwhm=float(r[psf_key]), beta=b))
+            betas.append(b)
+            n_moffat += 1
+    psf_vals = acc / len(usable)
 
     if verbose:
-        ub = np.unique(np.round(betas, 3))
-        print(f"build_effective_psf_uv: averaged {len(fwhm_kpc)} flux-normalized "
-              f"per-galaxy Moffats (beta value(s) {ub}); kpc FWHM "
+        ub = np.unique(np.round(np.array(betas), 3)) if betas else np.array([])
+        emp_fields = sorted({r.get("field") for r in usable
+                             if uvcfg.psf_empirical and r.get("field") in uvcfg.psf_empirical})
+        print(f"build_effective_psf_uv: averaged {len(usable)} flux-normalized "
+              f"per-galaxy PSFs -- {n_emp} empirical (fields {emp_fields}), "
+              f"{n_moffat} Moffat (beta value(s) {ub}); kpc FWHM "
               f"min/median/max = {fwhm_kpc.min():.2f}/{np.median(fwhm_kpc):.2f}/"
               f"{fwhm_kpc.max():.2f}; grid 0..{r_max_kpc:.1f} kpc, {n_grid} pts.")
     return psf_r, psf_vals

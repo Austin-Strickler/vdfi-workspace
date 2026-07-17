@@ -8,13 +8,15 @@ Option A/B spec, written before any of this existed) and
 `specs/psf-exponential-fit-recovery.md` (the Phase-1 synthetic testbed that
 validated the approach before it touched real data).
 
-**Status: Part 1 (below) describes shipped code
-(`utils_lya_halo/fitting.py`). Part 2 describes a proposed, not-started
-extension (Option C). Part 3 describes a proposed, not-started extension to
-measure/fit the UV-continuum radial decline from CFHT-LS r-band imaging — a
-genuinely different data product (broadband imaging, not VIRUS fiber spectra)
-that has to be extracted from scratch before any of Part 1/2's fitting
-machinery can be pointed at it.**
+**Status: DONE (real-data validated).** Part 1 (below) describes shipped code
+(`utils_lya_halo/fitting.py`), now run against real data — the PSF-aware
+two-exponential fit gives **χ²/dof = 1.17, inner scale h1 ≈ 16–17 kpc**,
+outer h2 ≈ 1552 kpc; the inner scale is finalized and in the pipeline. Part 2
+(Option C — exponential core + cored power-law halo) remains an optional,
+not-started variant. Part 3 (UV-continuum radial decline from CFHT-LS r-band
+imaging) is now **implemented and validated** — the measured **UV scale length
+≈ 1.55 kpc** gives a **halo/UV scale ratio ≈ 10:1** — with its own settled
+workflow documented in the companion `uv-flux-fitting.md`.
 
 ## Part 1 — what's implemented (`fitting.py`)
 

@@ -101,6 +101,60 @@ def _psf_interpolator(psf_r, psf_vals):
                      bounds_error=False, fill_value=0.0)
 
 
+def moffat_encircled_energy_fraction(r_aperture, fwhm, beta=3.0, *,
+                                     r_max_factor=50.0, n=4000):
+    """
+    Fraction of a POINT SOURCE's total flux landing within a circular
+    aperture of radius r_aperture, for a Moffat PSF of the given fwhm/beta
+    (SAME radial unit as r_aperture -- e.g. both already in kpc, the PSF
+    width converted per-galaxy from a fixed angular FWHM via
+    cosmo.angular_diameter_distance). This is `EE_i` in
+    subsample-derived-properties.md Part 3's per-galaxy point-source
+    aperture correction (measure.measure_psf_corrected_core_luminosity):
+    the fraction of an unresolved source's flux the innermost radial bin
+    actually captures, so 1/EE_i is the correction factor that rescales a
+    galaxy's flux back up to its true total.
+
+        EE(r_aperture) = integral_0^r_aperture Moffat(r)*2*pi*r dr
+                         / integral_0^r_max     Moffat(r)*2*pi*r dr
+
+    Built the same way normalize_psf_flux/moffat_1d already normalize a PSF
+    elsewhere in this module (sample out to r_max_factor*fwhm, trapz), so
+    this is trivially consistent with this module's own "total PSF flux"
+    convention rather than a separately-derived closed-form Moffat
+    encircled-energy formula.
+
+    r_aperture, fwhm : scalar or array; if both are arrays they must
+        broadcast together (the intended real use: ONE fixed r_aperture --
+        the innermost bin's fixed kpc aperture, same for every galaxy under
+        bin_mode='kpc' -- against a (ngal,) array of per-galaxy fwhm_kpc,
+        since the PSF's ANGULAR size is fixed but its kpc size differs per
+        galaxy's own redshift).
+    r_max_factor : PSF sampled out to r_max_factor*fwhm before normalizing
+        (default 50 -- generous; a Moffat's power-law wings mean a small
+        r_max_factor measurably undercounts the normalization integral).
+    n : radial grid points per galaxy's integral.
+
+    Returns EE, same broadcast shape as r_aperture/fwhm (scalar in, scalar
+    out), each clipped to [0, 1].
+    """
+    r_arr = np.asarray(r_aperture, dtype=float)
+    f_arr = np.asarray(fwhm, dtype=float)
+    scalar_out = (r_arr.ndim == 0) and (f_arr.ndim == 0)
+    r_b, f_b = np.broadcast_arrays(r_arr, f_arr)
+    flat_r, flat_f = r_b.ravel(), f_b.ravel()
+
+    ee = np.empty(flat_r.shape, dtype=float)
+    for i in range(flat_r.size):
+        r_max = r_max_factor * flat_f[i]
+        r_grid = np.linspace(0.0, r_max, n)
+        psf_vals_n = normalize_psf_flux(r_grid, moffat_1d(r_grid, fwhm=flat_f[i], beta=beta))
+        cum = integrate.cumulative_trapezoid(psf_vals_n * 2 * np.pi * r_grid, r_grid, initial=0.0)
+        ee[i] = np.interp(flat_r[i], r_grid, cum, left=0.0, right=cum[-1])
+    ee = np.clip(ee, 0.0, 1.0).reshape(r_b.shape)
+    return float(ee) if scalar_out else ee
+
+
 # =======================================================================
 # 2. Intrinsic two-component exponential model
 # =======================================================================
@@ -977,12 +1031,13 @@ def _best_of_seeds_expcore(*args, **kwargs):
 # for the expcore model.
 # ---------------------------------------------------------------------
 def fit_naive_expcore(r_mid, r_edges, r_fine, y, yerr, *, fit_skip_inner=1,
-                       gamma_fixed=None, p0=None, verbose=False):
+                       gamma_fixed=0.8, p0=None, verbose=False):
     """
     Expcore analogue of fit_naive: no PSF correction, drops fit_skip_inner
     innermost bin(s), fits bin_average_no_psf_expcore against the rest.
     See fit_naive's docstring for why the bin-AVERAGE (not point-eval)
-    model is used, and fit_psf_aware_expcore's docstring for gamma_fixed.
+    model is used, and fit_psf_aware_expcore's docstring for gamma_fixed
+    (default 0.8, same rationale -- pass None to let gamma float).
     """
     r_mid = np.asarray(r_mid, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -1048,7 +1103,7 @@ def fit_naive_expcore(r_mid, r_edges, r_fine, y, yerr, *, fit_skip_inner=1,
     return result
 
 
-def fit_psf_aware_expcore(r_mid, y, yerr, R, r_fine, r_edges, *, gamma_fixed=None,
+def fit_psf_aware_expcore(r_mid, y, yerr, R, r_fine, r_edges, *, gamma_fixed=0.8,
                           p0=None, verbose=False):
     """
     Expcore analogue of fit_psf_aware: full PSF forward model, all bins fit
@@ -1058,13 +1113,20 @@ def fit_psf_aware_expcore(r_mid, y, yerr, R, r_fine, r_edges, *, gamma_fixed=Non
     Part 1 model -- it's independent of the intrinsic profile's functional
     form, so nothing about building R changes for this model.
 
-    gamma_fixed : None (default) -> gamma floats as a free parameter,
-        bounded per _data_driven_bounds_expcore. Pass a float (e.g. 1.8, or
-        projected_slope_from_3d(1.8) == 0.8) to hold gamma fixed at that
-        literature value and fit only (A1,h1,A2,r_c) -- the direct way to
-        test "does the data prefer this specific slope" via chi2/AIC
-        instead of hoping a floating fit converges near it (open question 3
-        in halo-flux-fitting.md Part 2).
+    gamma_fixed : 0.8 (default) -- projected_slope_from_3d(1.8), the
+        Limber-projected z~2-3 clustering slope (LITERATURE_GAMMA_3D). r_c
+        and gamma are strongly degenerate when both float, and on real data
+        (even the highest-S/N ALL stack) the free-gamma fit is essentially
+        unconstrained (r_c and gamma errors comparable to or larger than
+        the values themselves) AND compare_models_aic_bic prefers the
+        plain two-exponential model over expcore either way -- so floating
+        gamma buys nothing and actively destabilizes r_c, especially in
+        lower-S/N subsamples. Pass None to let gamma float anyway (bounded
+        per _data_driven_bounds_expcore), or another float (e.g. 1.8, the
+        raw unprojected slope) to test a different literature value
+        directly via chi2/AIC (open question 3 in halo-flux-fitting.md
+        Part 2) -- either way, fewer free parameters than the None case,
+        which is the point.
     """
     r_mid = np.asarray(r_mid, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -1319,6 +1381,91 @@ def crossover_radius_expcore(A1, h1, A2, r_c, gamma, r_max=None):
     return float(optimize.brentq(diff, lo, hi))
 
 
+# ---------------------------------------------------------------------
+# subsample-derived-properties.md Part 1 -- the core/halo boundary a
+# per-subsample table row uses for BOTH the velocity split (Part 2) and the
+# luminosity split (Part 3): "wherever the fit itself says core hands off to
+# halo," generalized across whichever model (two-exponential today, expcore
+# once/if it ships) was actually fit for that row -- see crossover_radius_
+# twoexp / crossover_radius_expcore above for the two model-specific
+# closed-form/root-find implementations this just dispatches between.
+# ---------------------------------------------------------------------
+def find_core_halo_boundary(fit_result, *, fallback_fit_result=None,
+                            fallback_radius=None, r_max=None):
+    """
+    The core/halo boundary for ONE subsample's fit_result: the radius where
+    its own fitted core term and halo term are equal. Dispatches purely on
+    fit_result's shape -- fit_result.get('model')=='expcore' (has
+    (A1,h1,A2,r_c,gamma), e.g. from fit_psf_aware_expcore/fit_naive_expcore
+    or plot_flux_profile_two(fit=True)) routes to crossover_radius_expcore;
+    anything else (no 'model' key, (A1,h1,A2,h2) instead -- the two-
+    exponential fits from fit_psf_aware/fit_naive/plot_flux_profile_fit)
+    routes to crossover_radius_twoexp. Callers never need to know or track
+    which model was actually fit.
+
+    Accepted risk, per the spec: this is NOT a fixed radius across every
+    subsample row -- each row's own fit has its own crossover, so a
+    low-mass row's boundary and a high-mass row's boundary can legitimately
+    differ. That's the deliberate tradeoff (see the spec's "Accepted risk,
+    stated plainly").
+
+    Fallback (real risk on a noisier half-sample split, per the spec):
+    when fit_result's own fit doesn't converge, OR it converges but the two
+    terms never actually cross anywhere in the searched range (both are
+    genuine failure modes, not hypothetical -- a two-exponential/expcore fit
+    on ~10 sparse bins is prone to local minima, worse on half the sample),
+    fall back in this order and flag boundary_from_own_fit=False:
+        1. fallback_fit_result's OWN crossover (typically the full-stack
+           fit on the SAME model -- already known to converge and cross),
+           if given.
+        2. fallback_radius, an explicit number (e.g. a previously computed
+           full-stack boundary, or R_vir) if given.
+    Never invents a boundary from nothing: if fit_result needs a fallback
+    and neither is given, boundary_radius comes back None with
+    source="none" -- the caller decides what to do (e.g. skip that row, or
+    flag it in the eventual table per the spec's `boundary_from_own_fit`
+    column).
+
+    r_max : forwarded to crossover_radius_expcore's own root-search bracket
+        (ignored for the two-exponential closed-form case, which needs no
+        bracket). None -> that function's own default
+        (max(50*h1, 5*r_c)).
+
+    Returns
+    -------
+    dict: boundary_radius (float or None), boundary_from_own_fit (bool),
+        source ("own" | "fallback_fit" | "fallback_radius" | "none"),
+        model (the model actually used for the returned boundary_radius,
+        "expcore" or "twoexp").
+    """
+    def _crossover(fr):
+        if not fr.get("success"):
+            return None, fr.get("model", "twoexp")
+        m = fr.get("model", "twoexp")
+        if m == "expcore":
+            return (crossover_radius_expcore(fr["A1"], fr["h1"], fr["A2"],
+                                             fr["r_c"], fr["gamma"], r_max=r_max), m)
+        return (crossover_radius_twoexp(fr["A1"], fr["h1"], fr["A2"], fr["h2"]), m)
+
+    own_radius, own_model = _crossover(fit_result)
+    if own_radius is not None:
+        return {"boundary_radius": own_radius, "boundary_from_own_fit": True,
+               "source": "own", "model": own_model}
+
+    if fallback_fit_result is not None:
+        fb_radius, fb_model = _crossover(fallback_fit_result)
+        if fb_radius is not None:
+            return {"boundary_radius": fb_radius, "boundary_from_own_fit": False,
+                   "source": "fallback_fit", "model": fb_model}
+
+    if fallback_radius is not None:
+        return {"boundary_radius": float(fallback_radius), "boundary_from_own_fit": False,
+               "source": "fallback_radius", "model": own_model}
+
+    return {"boundary_radius": None, "boundary_from_own_fit": False,
+           "source": "none", "model": own_model}
+
+
 def sphere_of_influence_kpc(rvir_kpc, factor=7.0):
     """Sorini, Onorbe, Hennawi & Lukic 2018 (ApJ 859, 125)'s
     observationally-calibrated 'sphere of influence' scale: the mean Lya
@@ -1454,7 +1601,7 @@ def plot_expcore_fit(
     r_edges=None,
     method: str = "psf",
     fit_skip_inner: int = 1,
-    gamma_fixed=None,
+    gamma_fixed=0.8,
     psf_r=None,
     psf_vals=None,
     psf_fwhm: float = 3.0,
@@ -1497,13 +1644,14 @@ def plot_expcore_fit(
         midpoints of edges starting at r=0), so nothing has to be clipped
         the way r_fine's r=0 point already is.
 
-    gamma_fixed : None (default) lets gamma float. Pass a literature value
-        to test it directly instead -- e.g. LITERATURE_GAMMA_3D["z~2-3
-        galaxy clustering (typical)"] (1.8, a raw 3D clustering slope) or
-        projected_slope_from_3d(1.8) (0.8, that same slope fully
-        projected). Run both and compare fit_result['chi2'] to see which
-        the data actually prefers (open question 3 in the spec) rather
-        than assuming the projection direction without checking.
+    gamma_fixed : 0.8 (default) -- projected_slope_from_3d(1.8), the
+        Limber-projected z~2-3 clustering slope; see
+        fit_psf_aware_expcore's docstring for why floating gamma is not
+        the default (r_c/gamma degeneracy, AIC/BIC preferring two-exp
+        anyway). Pass None to let gamma float, or another literature value
+        -- e.g. LITERATURE_GAMMA_3D["z~2-3 galaxy clustering (typical)"]
+        (1.8, raw/unprojected) -- and compare fit_result['chi2'] to see
+        which the data actually prefers (open question 3 in the spec).
     rvir_kpc : optional vertical reference line -- lets you see by eye
         whether the fitted r_c sits near R_vir (open question 2: should
         r_c be a free parameter, as it is here, or pinned to R_vir?).

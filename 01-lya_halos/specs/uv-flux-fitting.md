@@ -4,8 +4,18 @@ Companion to `halo-flux-fitting.md` Part 3. Documents how the UV-continuum
 radial profile (CFHT-LS r-band, `uv_profile.py`) is measured, PSF-corrected,
 and fit — the settled workflow to reuse from here on.
 
-**Status: implemented in `utils_lya_halo/uv_profile.py` (+ the PSF forward
-model in `fitting.py`).**
+**Status: DONE — implemented in `utils_lya_halo/uv_profile.py` (+ the PSF
+forward model in `fitting.py`) and validated on real CFHT-LS r-band data.
+Measured result: UV-continuum scale length ≈ 1.55 kpc, vs. Lyα ≈ 16–17 kpc
+→ halo/UV scale ratio ≈ 10:1.**
+
+**PSF caveat / fallback.** The CFHT-LS PSF correction is the hard part of the
+UV measurement — the ground-based seeing (~0.73–0.79″, see below) is broad
+relative to the compact UV continuum. The current fit is trusted, but if the
+PSF-corrected UV scale ever looks unreliable, the fallback is to remeasure the
+UV profile on **3D-HST (HST/WFC3) imaging** — much sharper PSF, at the cost of
+a new extraction against a different dataset. Not needed for now; noted here so
+the option isn't forgotten.
 
 ---
 

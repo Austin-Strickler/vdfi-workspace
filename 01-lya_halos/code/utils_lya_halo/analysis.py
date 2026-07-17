@@ -77,9 +77,11 @@ from __future__ import annotations
 
 import warnings
 import numpy as np
+import astropy.units as u
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
+from .virial import cosmo   # arcsec->kpc PSF conversion (Lujan Niemeyer FWHM default)
 from .measure import (
     measure_all_bins, bootstrap_measurements, bootstrap_stack_error, bootstrap_all,
     measure_centroid, line_moments, get_continuum_model,
@@ -91,7 +93,6 @@ from .plotting import (
     _setup_radius_axis, _resolve_bin_mode, _get_vr_biweight_v, _get_vr_biweight_e,
     _safe_yerr,
     plot_centroid_vs_radius, plot_blue_red_vs_radius,
-    plot_centroid_comparison, plot_radial_overlay,
     _mark_lines,
 )
 from . import fitting
@@ -125,6 +126,37 @@ def _resolve_measure_defaults(config=None, *, bounds=None, cont_bounds=None,
 # sentinel distinguishing "use the auto-generated title" (default) from
 # "no title at all" (title=None, an explicit user choice)
 _AUTO = object()
+
+
+def _psf_fwhm_arcsec_to_kpc(fwhm_arcsec: float, z_median, *, sample_label: str) -> float:
+    """
+    Convert a FIXED angular PSF FWHM (arcsec -- e.g. the Lujan Niemeyer 2022
+    literature default, 1.2-1.4" fiducial 1.3") to a kpc width for ONE
+    sample, using that sample's own representative redshift (z_median, as
+    stored on the Stage-2 stacks dict by stack.build_stacks). Same
+    kpc-per-arcsec conversion stack.convert_avg_fiber_bin already uses per
+    galaxy; here it's applied ONCE per SAMPLE (a single representative z),
+    since the PSF-aware fit in plot_flux_profile_fit/plot_flux_profile_two
+    works on the already-stacked profile, not per-galaxy.
+
+    Deliberately per-SAMPLE, not shared across both samples in a two-sample
+    comparison: a low-z vs. high-z split is exactly the case where sharing
+    one converted kpc value between the two samples would be wrong (the
+    same 1.3" PSF is physically WIDER in kpc for the higher-z sample), so
+    plot_flux_profile_two converts each sample's PSF separately using its
+    own stacks_a/stacks_b z_median.
+
+    Raises a clear error (not a silent fallback) if z_median is unavailable,
+    since guessing here would silently build the wrong-width PSF.
+    """
+    if z_median is None:
+        raise ValueError(
+            f"psf_fwhm_arcsec needs a redshift to convert to kpc ({sample_label}), "
+            f"but no z_median was found/given. Pass the corresponding `stacks` dict "
+            f"(build_stacks stores z_median on it automatically), an explicit "
+            f"z_median override, or your own psf_r/psf_vals curve already in kpc.")
+    kpc_per_arcsec = cosmo.angular_diameter_distance(float(z_median)).to(u.kpc).value / 206265.0
+    return float(fwhm_arcsec) * kpc_per_arcsec
 
 
 def _resolve_savename(save_name: str | None, default: str) -> str:
@@ -1043,8 +1075,9 @@ def plot_flux_profile_fit(
     fit_skip_inner: int = 1,
     psf_r=None,
     psf_vals=None,
-    psf_fwhm: float = 3.0,
+    psf_fwhm_arcsec: float = 1.3,
     psf_beta: float = 3.0,
+    z_median: float | None = None,
     p0=None,
     r_fine=None,
     logy: bool = True,
@@ -1086,12 +1119,30 @@ def plot_flux_profile_fit(
              `bin_mode` (typically kpc -- pass r_edges/bin_mode='kpc' for a
              physically meaningful h1/h2 when fitting with a PSF). Only used
              for method="psf". If not given, falls back to an analytic
-             Moffat PSF built from psf_fwhm/psf_beta (fitting.moffat_1d) --
-             psf_fwhm must then also be in that same radial unit.
-    psf_fwhm, psf_beta : Moffat PSF parameters used ONLY when psf_r/psf_vals
-             are not given. Defaults (fwhm=3.0, beta=3.0) are a generic
-             VIRUS-like core in kpc-scale units -- sized for your actual
-             data/instrument if fitting in a different unit.
+             Moffat PSF built from psf_fwhm_arcsec/psf_beta, converted to
+             kpc (see next) -- skips that conversion entirely if you pass
+             your own curve here.
+    psf_fwhm_arcsec, psf_beta : Moffat PSF parameters used ONLY when
+             psf_r/psf_vals are not given. Default 1.3"/beta=3, the Lujan
+             Niemeyer (2022) literature fiducial (1.2-1.4" range) shown to
+             fit VIRUS stellar profiles well -- superseding the earlier
+             generic fwhm=3.0-kpc placeholder per halo-flux-fitting.md's
+             recommendation to use ONE PSF convention across this pipeline's
+             fits rather than a second, divergent default. Converted to kpc
+             via z_median (below) using the SAME angular-diameter-distance
+             conversion stack.convert_avg_fiber_bin uses per galaxy -- here
+             applied ONCE for the whole (already-stacked) sample. NOTE:
+             this changes the fitted h1/h2 slightly relative to the
+             previous fwhm=3.0-kpc default (real-data check: h1 shifts from
+             16.9 to ~15-16 kpc-ish territory depending on the sample's own
+             z_median) -- re-quote any already-written h1/h2/chi2 numbers
+             after switching to this default.
+    z_median : the sample's representative redshift, used ONLY to convert
+             psf_fwhm_arcsec to kpc. None (default) -> read from
+             stacks['z_median'] (set automatically by stack.build_stacks).
+             Raises a clear error if unavailable from either source and
+             method="psf" with no explicit psf_r/psf_vals -- guessing a
+             redshift here would silently build the wrong-width PSF.
     p0      : optional explicit (A1, h1, A2, h2) starting guess, passed
              through to fitting.fit_naive/fit_psf_aware. None -> a handful
              of automatic seeds (fitting._default_seeds) are tried and the
@@ -1147,8 +1198,8 @@ def plot_flux_profile_fit(
     vr  = _get_vr_biweight_v(VR_biweight_v, stacks or boot)
     vr_e = _get_vr_biweight_e(VR_biweight_error, stacks or boot)
     if method == "psf" and bm != "kpc" and psf_r is None and verbose:
-        print(f"plot_flux_profile_fit: bin_mode={bm!r} but psf_fwhm/psf_beta "
-              f"build a Moffat assumed to be in the SAME unit as bin_mode -- "
+        print(f"plot_flux_profile_fit: bin_mode={bm!r} but psf_fwhm_arcsec/psf_beta "
+              f"build a Moffat converted assuming bin_mode is kpc -- "
               f"pass r_edges/bin_mode='kpc' (or your own psf_r/psf_vals in "
               f"{bm} units) for a physically meaningful PSF-aware fit.")
 
@@ -1168,8 +1219,13 @@ def plot_flux_profile_fit(
             psf_r_use = np.asarray(psf_r, dtype=float)
             psf_vals_use = np.asarray(psf_vals, dtype=float)
         else:
-            psf_r_use = np.linspace(0.0, 20.0 * psf_fwhm, 400)
-            psf_vals_use = fitting.moffat_1d(psf_r_use, fwhm=psf_fwhm, beta=psf_beta)
+            z_med = z_median if z_median is not None else (stacks or {}).get("z_median")
+            fwhm_kpc = _psf_fwhm_arcsec_to_kpc(psf_fwhm_arcsec, z_med, sample_label="this fit")
+            if verbose:
+                print(f"plot_flux_profile_fit: PSF FWHM = {psf_fwhm_arcsec:.2f}\" -> "
+                      f"{fwhm_kpc:.3g} kpc (z_median={z_med:.3g}, beta={psf_beta:g})")
+            psf_r_use = np.linspace(0.0, 20.0 * fwhm_kpc, 400)
+            psf_vals_use = fitting.moffat_1d(psf_r_use, fwhm=fwhm_kpc, beta=psf_beta)
         R = fitting.ring_convolution_matrix(r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
         fit_result = fitting.fit_psf_aware(r_mid, y, sigma, R, r_fine_arr, radial_bins,
                                            p0=p0, verbose=verbose)
@@ -1574,7 +1630,11 @@ def plot_asymmetry_profile(
 # These put two boot/stacks pairs (e.g. low-mass vs high-mass) on ONE figure,
 # instead of calling the single-stack version twice. Same native-unit radius
 # axis as the single-stack figures, so they drop straight into the two-stack
-# notebook.
+# notebook. Self-contained (no longer thin wrappers around the shared
+# plotting.py multi-sample engines) so every color/marker/font-size is a
+# keyword argument here, same philosophy as plot_line_panels. NO TITLE is
+# drawn by default (paper-figure friendly, drop straight into a manuscript
+# grid) -- pass a string to title/title1/title2 to add one back.
 
 def plot_centroid_profile_two(
     boot_a: dict,
@@ -1585,34 +1645,107 @@ def plot_centroid_profile_two(
     r_edges=None,
     bin_mode=None,
     VR_biweight_v=None,
+    VR_biweight_error: float | None = None,
     vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    show_vr: bool = True,
     ylims=(-250, 250),
     xlims=None,
     jitter: float = 0.04,
+    colors=("tab:blue", "tab:red"),
+    fmts=("o-", "s--"),
+    markersize: float = 6,
+    linewidth: float = 1.5,
+    capsize: float = 3.5,
+    sample_b_alpha: float = 0.7,
+    zero_color: str = "tomato",
+    zero_alpha: float = 0.4,
+    zero_lw: float = 1.0,
     figsize=(7.6, 4.9),
-    title=r"Ly$\alpha$ centroid vs. radius (half-sample comparison)",
+    ylabel_text: str = r"Ly$\alpha$ centroid velocity [km s$^{-1}$]",
+    title: str | None = None,
+    legend_title: str | None = "sample",
+    legend_fontsize: float = 9,
+    legend_loc: str = "best",
+    tick_fontsize: float = 10,
+    label_fontsize: float = 11,
+    title_fontsize: float = 13,
+    grid_alpha: float = 0.15,
     save_fig: bool = False,
+    save_name: str | None = None,
 ):
     """
-    Overlay the bootstrapped centroid profiles of TWO samples on one axis.
-    Replaces calling plot_centroid_profile twice. Thin wrapper around
-    plotting.plot_centroid_comparison (the shared multi-sample engine).
+    Overlay the bootstrapped centroid profiles of TWO samples on one axis
+    (half-sample comparison, e.g. low-M vs high-M). Replaces calling
+    plot_centroid_profile twice.
 
-        analysis.plot_centroid_profile_two(boot_lm, boot_hm,
-                                            stacks_low_m, stacks_high_m,
-                                            labels=("low-M", "high-M"))
+    Self-contained (not a plotting.py engine wrapper) so every color, marker,
+    and font size below is a keyword argument -- fully restylable without
+    touching the function body. Sample A is drawn solid/filled, sample B
+    open/dashed (colors, fmts, sample_b_alpha all overridable).
+
+    title     : axis title; None (default) -> no title at all. Pass a string
+                to add one back.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_centroid_profile_two.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks_a['VR_biweight_e'] if present.
+
+    Example
+    -------
+        analysis.plot_centroid_profile_two(
+            boot_lm, boot_hm, stacks_low_m, stacks_high_m,
+            labels=("low-M", "high-M"),
+            xlims=(3, 3000), bin_mode="kpc",
+            ylims=(-300, 300), figsize=(9, 5),
+            colors=("tab:blue", "tab:red"), jitter=0.05,
+            title="Centroid comparison, low-M vs high-M",
+        )
+
+    Returns (fig, ax).
     """
-    boots = {labels[0]: boot_a, labels[1]: boot_b}
-    if r_edges is None:
-        r_edges = (boot_a.get("r_edges")
-                   if boot_a.get("r_edges") is not None
-                   else (stacks_a["r_edges"] if stacks_a else None))
-    return plot_centroid_comparison(
-        boots, radial_bins=r_edges, VR_biweight_v=VR_biweight_v,
-        stacks_result=stacks_a or boot_a, bin_mode=bin_mode,
-        vr_ticks=vr_ticks, figsize=figsize, ylims=ylims, xlims=xlims,
-        jitter=jitter, title=title, save_fig=save_fig,
-    )
+    radial_bins = np.asarray(r_edges if r_edges is not None
+                             else boot_a.get("r_edges",
+                             stacks_a["r_edges"] if stacks_a else []))
+    bm   = _resolve_bin_mode(bin_mode, stacks_a or boot_a)
+    vr   = _get_vr_biweight_v(VR_biweight_v, stacks_a or boot_a)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks_a or boot_a)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    r_mid, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                     show_vr=show_vr, VR_biweight_error=vr_e)
+
+    K = 2
+    for k, (lab, b, col) in enumerate(((labels[0], boot_a, colors[0]),
+                                        (labels[1], boot_b, colors[1]))):
+        v  = np.asarray(b["centroid_v_med"])
+        lo = np.asarray(b["centroid_v_lo"]); hi = np.asarray(b["centroid_v_hi"])
+        jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
+        yerr, unstable = _safe_yerr(v, lo, hi)
+        ax.errorbar(jit, v, xerr=xerr, yerr=yerr, fmt=fmts[k],
+                    color=col, capsize=capsize, ms=markersize, lw=linewidth,
+                    alpha=1.0 if k == 0 else sample_b_alpha,
+                    markerfacecolor=(col if k == 0 else "none"),
+                    label=lab)
+        if np.any(unstable):
+            ax.scatter(jit[unstable], v[unstable], s=70, facecolors="none",
+                       edgecolors=col, linewidths=1.3, zorder=5)
+
+    ax.axhline(0, color=zero_color, alpha=zero_alpha, lw=zero_lw)
+    ax.set_ylim(ylims)
+    ax.set_ylabel(ylabel_text, fontsize=label_fontsize)
+    ax.tick_params(axis="both", which="major", labelsize=tick_fontsize)
+    if title:
+        ax.set_title(title, fontsize=title_fontsize)
+    ax.legend(frameon=False, fontsize=legend_fontsize, loc=legend_loc, title=legend_title)
+    ax.grid(alpha=grid_alpha)
+    plt.tight_layout()
+    if save_fig:
+        plt.savefig(_resolve_savename(save_name, "Figure_centroid_profile_two.png"),
+                    dpi=300, bbox_inches="tight")
+    plt.show()
+    return fig, ax
 
 
 def plot_flux_profile_two(
@@ -1624,70 +1757,329 @@ def plot_flux_profile_two(
     r_edges=None,
     bin_mode=None,
     VR_biweight_v=None,
+    VR_biweight_error: float | None = None,
     vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    show_vr: bool = True,
     logy: bool = True,
     ylims=None,
     xlims=None,
+    jitter: float = 0.04,
+    colors=("tab:blue", "tab:red"),
+    fmts=("o-", "s--"),
+    markersize: float = 6,
+    linewidth: float = 1.5,
+    capsize: float = 3.5,
+    sample_b_alpha: float = 0.7,
+    zero_color: str = "0.7",
+    zero_lw: float = 0.7,
+    fit: bool = False,
+    fit_method: str = "psf",
+    fit_skip_inner: int = 1,
+    gamma_fixed: float | None = 0.8,
+    psf_r=None,
+    psf_vals=None,
+    psf_fwhm_arcsec: float = 1.3,
+    psf_beta: float = 3.0,
+    z_median_a: float | None = None,
+    z_median_b: float | None = None,
+    fit_p0=None,
+    fit_r_fine=None,
+    fit_show_components: bool = True,
+    fit_verbose: bool = True,
     figsize=(7.6, 4.9),
+    ylabel_text: str | None = None,
+    title: str | None = None,
+    legend_title: str | None = "sample",
+    legend_fontsize: float = 9,
+    legend_loc: str = "best",
+    tick_fontsize: float = 10,
+    label_fontsize: float = 11,
+    title_fontsize: float = 13,
+    grid_alpha: float = 0.15,
     save_fig: bool = False,
-    savename: str = "Figure_flux_profile_two.png",
+    save_name: str | None = None,
 ):
     """
-    Overlay integrated Lyα flux ± bootstrap 16/84 for TWO samples on one axis.
+    Overlay integrated Lyα flux +/- bootstrap 16/84 for TWO samples on one axis.
     Replaces calling plot_flux_profile twice. logy=True by default (faint outer
-    bins). Built on plotting.plot_radial_overlay so the radius axis matches every
-    other figure.
+    bins). Requires compute_side_ratio=True in the bootstrap (the default).
 
-    For a LINEAR axis (logy=False) the y-limits are taken from BOTH samples
-    (union of their finite ranges) so neither is clipped; on the log axis the
-    scale already spans both.
+    Self-contained (not a plotting.py engine wrapper) so every color, marker,
+    and font size below is a keyword argument. For a LINEAR axis (logy=False)
+    with ylims=None, the y-limits are taken from BOTH samples (union of their
+    finite ranges) so neither is clipped; on the log axis the scale already
+    spans both.
 
-        analysis.plot_flux_profile_two(boot_lm, boot_hm,
-                                        stacks_low_m, stacks_high_m,
-                                        labels=("low-M", "high-M"))
+    title     : axis title; None (default) -> no title at all. Pass a string
+                to add one back.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_flux_profile_two.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks_a['VR_biweight_e'] if present.
+
+    Fitting overlay (subsample-derived-properties.md, Part 4)
+    -----------------------------------------------------------
+    fit : False (default, unchanged behavior) -- pass True to independently
+        fit EACH sample's flux profile and overlay the fitted curve on this
+        same comparison figure, instead of only drawing the two error-bar
+        series. Uses the PSF-aware exponential-core + cored-power-law model
+        (fitting.intrinsic_profile_expcore / fit_psf_aware_expcore --
+        halo-flux-fitting.md Part 2/"Option C"), NOT the older validated
+        two-exponential model plot_flux_profile_fit uses -- deliberately, per
+        the explicit ask that drove this extension ("fit with a PSF-aware
+        exponential core with a power law"). Each sample is fit completely
+        independently (its own popt, its own chi2/dof); nothing about the
+        fit is shared between samples except the model form.
+    fit_method : "psf" (default) -- full PSF forward model, all bins fit
+        (inner bin kept). "naive" -- no PSF correction, drops fit_skip_inner
+        innermost bin(s). Same semantics as plot_flux_profile_fit's `method`.
+    gamma_fixed : 0.8 (default) -- fitting.projected_slope_from_3d(1.8), the
+        Limber-projected z~2-3 clustering slope. r_c and a floating gamma are
+        strongly degenerate on real data (even the highest-S/N ALL stack
+        fits gamma essentially unconstrained, and compare_models_aic_bic
+        prefers the plain two-exponential model over expcore regardless),
+        so a free gamma mainly adds noise -- and does so worse in lower-S/N
+        per-subsample fits (this is what motivated the change from a
+        floating default). Pass None to let gamma float anyway, or another
+        literature value (e.g. 1.8, unprojected) to test it directly via
+        chi2/AIC -- see fitting.fit_psf_aware_expcore's docstring.
+    psf_r, psf_vals : explicit shared (r, vals) PSF curve, in kpc -- if
+        given, used for BOTH samples as-is (skips the arcsec->kpc
+        conversion below entirely). None (default) -> built per SAMPLE from
+        psf_fwhm_arcsec/psf_beta instead (see next).
+    psf_fwhm_arcsec, psf_beta : the fixed literature Moffat PSF -- default
+        1.3" / beta=3, the Lujan Niemeyer (2022) fiducial (1.2-1.4" range)
+        that fits VIRUS stellar profiles well, per subsample-derived-
+        properties.md Part 3's recommendation to use ONE literature PSF
+        convention everywhere in this pipeline rather than a second,
+        divergent default just for this fit. Converted to kpc SEPARATELY
+        for each sample using that sample's own z_median (stacks_a/
+        stacks_b['z_median'], as stored by build_stacks -- or explicit
+        z_median_a/z_median_b if you don't have the stacks dicts handy) --
+        deliberately per-sample, not shared: a low-z vs. high-z split is
+        exactly the case where the same fixed angular PSF corresponds to a
+        physically different kpc width for each sample. Raises a clear
+        error (rather than silently guessing) if a sample's z_median isn't
+        available from either source. Requires bin_mode='kpc' (a warning is
+        printed, same as plot_flux_profile_fit, if bin_mode != 'kpc').
+    z_median_a, z_median_b : explicit override for the arcsec->kpc PSF
+        conversion above; None (default) -> read from stacks_a['z_median']
+        / stacks_b['z_median'].
+    fit_p0 : optional explicit (A1, h1, A2, r_c[, gamma]) starting guess per
+        sample (SAME seed used for both samples); None (default) -> automatic
+        multi-seed search (fitting._default_seeds_expcore) per sample.
+    fit_r_fine : optional shared fine radial grid for both fits (
+        fitting.default_fine_grid(radial_bins) used if not given).
+    fit_show_components : True (default) -- in addition to each sample's
+        combined fitted curve, overplot its core term alone (dashed) and halo
+        term alone (dash-dot), in that sample's own color -- mirrors
+        plot_flux_profile_fit's show_components, applied per sample here.
+    fit_verbose : print each sample's fitting.describe_fit_expcore summary.
+
+    Example
+    -------
+        analysis.plot_flux_profile_two(
+            boot_lm, boot_hm, stacks_low_m, stacks_high_m,
+            labels=("low-M", "high-M"),
+            xlims=(3, 3000), bin_mode="kpc",
+            logy=True, figsize=(9, 5),
+            colors=("tab:blue", "tab:red"),
+            fit=True, gamma_fixed=0.8,   # Limber-projected z~2-3 clustering slope (default)
+        )
+
+    Returns
+    -------
+    (fig, ax) when fit=False (unchanged from before this extension).
+    (fig, ax, fit_result_a, fit_result_b) when fit=True -- each fit_result is
+    the dict from fitting.fit_psf_aware_expcore / fit_naive_expcore for that
+    sample (success, A1/h1/A2/r_c/gamma (+ _err), popt, pcov, chi2, dof,
+    model_binned, mask, ...), plus r_edges/r_mid/r_fine/y/y_lo/y_hi/sigma
+    stashed for later inspection. This is exactly the dict
+    fitting.find_core_halo_boundary / measure.measure_outer_properties /
+    measure.measure_psf_corrected_core_luminosity consume for the
+    core/halo-boundary and derived-property pipeline in
+    subsample-derived-properties.md -- so the SAME fit call backs both this
+    figure and that downstream table, never two independent fits.
     """
     for b in (boot_a, boot_b):
         if "total_flux_fid" not in b:
             raise KeyError("boot missing total_flux_fid; re-run with "
                            "compute_side_ratio=True (the default).")
-    if r_edges is None:
-        r_edges = (boot_a.get("r_edges")
-                   if boot_a.get("r_edges") is not None
-                   else (stacks_a["r_edges"] if stacks_a else None))
+    if fit and fit_method not in ("psf", "naive"):
+        raise ValueError(f"fit_method must be 'psf' or 'naive' (got {fit_method!r})")
+
+    radial_bins = np.asarray(r_edges if r_edges is not None
+                             else boot_a.get("r_edges",
+                             stacks_a["r_edges"] if stacks_a else []))
+    bm   = _resolve_bin_mode(bin_mode, stacks_a or boot_a)
+    vr   = _get_vr_biweight_v(VR_biweight_v, stacks_a or boot_a)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks_a or boot_a)
+    if fit and fit_method == "psf" and bm != "kpc" and psf_r is None and fit_verbose:
+        print(f"plot_flux_profile_two: bin_mode={bm!r} but psf_fwhm/psf_beta "
+              f"build a Moffat assumed to be in the SAME unit as bin_mode -- "
+              f"pass r_edges/bin_mode='kpc' (or your own psf_r/psf_vals in "
+              f"{bm} units) for a physically meaningful PSF-aware fit.")
 
     series = []
-    for lab, b in ((labels[0], boot_a), (labels[1], boot_b)):
+    for lab, b, col in ((labels[0], boot_a, colors[0]), (labels[1], boot_b, colors[1])):
         series.append(dict(
-            label=lab,
-            y=np.asarray(b["total_flux_fid"]),
-            lo=np.asarray(b["total_flux_lo"]),
-            hi=np.asarray(b["total_flux_hi"]),
+            label=lab, color=col,
+            y=np.asarray(b["total_flux_fid"], float),
+            lo=np.asarray(b["total_flux_lo"], float),
+            hi=np.asarray(b["total_flux_hi"], float),
         ))
 
-    # union y-limits for the LINEAR case (log auto-ranges over both already)
-    if ylims is None and not logy:
-        lows, highs = [], []
-        for s in series:
-            for arr in (s["y"], s["lo"], s["hi"]):
-                a = np.asarray(arr, float)
-                a = a[np.isfinite(a)]
-                if a.size:
-                    lows.append(a.min()); highs.append(a.max())
-        if lows:
-            lo, hi = min(lows), max(highs)
-            pad = 0.1 * (hi - lo if hi > lo else abs(hi) or 1)
-            ylims = (min(lo - pad, 0), hi + pad)
+    fig, ax = plt.subplots(figsize=figsize)
+    r_mid, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                     show_vr=show_vr, VR_biweight_error=vr_e)
+
+    K = 2
+    for k, s in enumerate(series):
+        jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
+        yerr, unstable = _safe_yerr(s["y"], s["lo"], s["hi"])
+        ax.errorbar(jit, s["y"], xerr=xerr, yerr=yerr, fmt=fmts[k],
+                    color=s["color"], capsize=capsize, ms=markersize, lw=linewidth,
+                    alpha=1.0 if k == 0 else sample_b_alpha,
+                    markerfacecolor=(s["color"] if k == 0 else "none"),
+                    label=s["label"])
+        if np.any(unstable):
+            ax.scatter(jit[unstable], s["y"][unstable], s=70, facecolors="none",
+                       edgecolors=s["color"], linewidths=1.3, zorder=5)
+
+    fit_results = []
+    if fit:
+        # LINEAR bin midpoints for the fit itself (matches
+        # plot_flux_profile_fit exactly -- fitting.py's model is evaluated/
+        # bin-integrated against r_edges, not the geometric r_mid used only
+        # for the errorbar x-position above); the fitted curve is then drawn
+        # against r_fine and its predicted-bin-mean markers against the same
+        # geometric r_mid (jittered) the data points use, so everything lines
+        # up visually on one axis.
+        r_mid_linear = 0.5 * (radial_bins[:-1] + radial_bins[1:])
+        r_fine_arr = (np.asarray(fit_r_fine, dtype=float) if fit_r_fine is not None
+                     else fitting.default_fine_grid(radial_bins))
+        # Build the PSF-aware forward model's R matrix PER SAMPLE (not
+        # shared) when it's derived from the fixed literature FWHM -- see
+        # _psf_fwhm_arcsec_to_kpc's docstring for why a low-z/high-z split
+        # specifically needs two different kpc widths from the same one
+        # angular PSF. An explicit psf_r/psf_vals curve, in contrast, IS
+        # shared as-is between both samples (it's already in kpc and the
+        # caller presumably built it deliberately that way).
+        R_by_sample = {}
+        if fit_method == "psf":
+            if psf_r is not None and psf_vals is not None:
+                psf_r_use = np.asarray(psf_r, dtype=float)
+                psf_vals_use = np.asarray(psf_vals, dtype=float)
+                R_shared = fitting.ring_convolution_matrix(r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
+                R_by_sample[0] = R_shared
+                R_by_sample[1] = R_shared
+            else:
+                z_meds = (
+                    z_median_a if z_median_a is not None else (stacks_a or {}).get("z_median"),
+                    z_median_b if z_median_b is not None else (stacks_b or {}).get("z_median"),
+                )
+                for kk, z_med in enumerate(z_meds):
+                    fwhm_kpc = _psf_fwhm_arcsec_to_kpc(psf_fwhm_arcsec, z_med, sample_label=labels[kk])
+                    psf_r_use = np.linspace(0.0, 20.0 * fwhm_kpc, 400)
+                    psf_vals_use = fitting.moffat_1d(psf_r_use, fwhm=fwhm_kpc, beta=psf_beta)
+                    R_by_sample[kk] = fitting.ring_convolution_matrix(
+                        r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
+                    if fit_verbose:
+                        print(f"plot_flux_profile_two: {labels[kk]} PSF FWHM = "
+                              f"{psf_fwhm_arcsec:.2f}\" -> {fwhm_kpc:.3g} kpc "
+                              f"(z_median={z_med:.3g}, beta={psf_beta:g})")
+
+        for k, s in enumerate(series):
+            sigma = ((s["hi"] - s["y"]) + (s["y"] - s["lo"])) / 2.0
+            if fit_method == "psf":
+                R = R_by_sample[k]
+                fr = fitting.fit_psf_aware_expcore(
+                    r_mid_linear, s["y"], sigma, R, r_fine_arr, radial_bins,
+                    gamma_fixed=gamma_fixed, p0=fit_p0, verbose=False)
+                fr["R"] = R
+            else:
+                fr = fitting.fit_naive_expcore(
+                    r_mid_linear, radial_bins, r_fine_arr, s["y"], sigma,
+                    fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed,
+                    p0=fit_p0, verbose=False)
+            fr.update({"method": fit_method, "r_edges": radial_bins, "r_mid": r_mid_linear,
+                      "r_fine": r_fine_arr, "y": s["y"], "y_lo": s["lo"], "y_hi": s["hi"],
+                      "sigma": sigma, "bin_mode": bm, "label": s["label"]})
+            fit_results.append(fr)
+
+            if fr.get("success"):
+                popt = fr["popt"]
+                A1_f, h1_f, A2_f, r_c_f = popt[0], popt[1], popt[2], popt[3]
+                gamma_f = fr["gamma"]
+                params_for_curve = popt if gamma_fixed is None else np.append(popt, gamma_fixed)
+                chi2_txt = (f", $\\chi^2$/dof={fr['chi2']/max(fr['dof'],1):.2f}"
+                           if "chi2" in fr else "")
+                gtag = f"$\\gamma$={gamma_f:.2g}" + (" (fixed)" if fr["gamma_fixed"] else "")
+                alpha_k = 1.0 if k == 0 else sample_b_alpha
+                jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
+                ax.plot(r_fine_arr, fitting.intrinsic_profile_expcore(r_fine_arr, *params_for_curve),
+                        "-", color=s["color"], lw=1.8, alpha=alpha_k, zorder=3,
+                        label=f"  {s['label']} fit (h1={h1_f:.2g}, r_c={r_c_f:.2g}, {gtag}{chi2_txt})")
+                model_binned = fitting.binned_model_from_result_expcore(
+                    fr, r_fine_arr, radial_bins, fr.get("R"))
+                if model_binned is not None:
+                    ax.plot(jit, model_binned, "D" if fit_method == "psf" else "^",
+                            color=s["color"], ms=6, alpha=alpha_k,
+                            mfc="none" if k == 1 else s["color"], zorder=4)
+                if fit_show_components:
+                    ax.plot(r_fine_arr, A1_f * np.exp(-r_fine_arr / h1_f), "--",
+                            color=s["color"], lw=1.2, alpha=alpha_k * 0.65, zorder=2)
+                    ax.plot(r_fine_arr, A2_f * (1.0 + (r_fine_arr / r_c_f) ** 2) ** (-gamma_f / 2.0),
+                            "-.", color=s["color"], lw=1.2, alpha=alpha_k * 0.65, zorder=2)
+            elif fit_verbose:
+                print(f"plot_flux_profile_two: {s['label']} fit FAILED -- {fr.get('reason')}")
+
+        if fit_verbose:
+            for fr in fit_results:
+                fitting.describe_fit_expcore(fr, label=f"{fr['label']} ({fit_method})")
+
+    if logy:
+        pos = np.concatenate([s["y"][s["y"] > 0] for s in series])
+        if pos.size:
+            ax.set_yscale("log")
+            ymax = max(np.nanmax(s["hi"]) for s in series)
+            ax.set_ylim(pos.min() * 0.3, ymax * 3)
+    else:
+        ax.axhline(0, color=zero_color, lw=zero_lw)
+        if ylims is not None:
+            ax.set_ylim(ylims)
+        else:
+            # union y-limits over BOTH samples so neither is clipped
+            lows, highs = [], []
+            for s in series:
+                for arr in (s["y"], s["lo"], s["hi"]):
+                    a = arr[np.isfinite(arr)]
+                    if a.size:
+                        lows.append(a.min()); highs.append(a.max())
+            if lows:
+                lo, hi = min(lows), max(highs)
+                pad = 0.1 * (hi - lo if hi > lo else abs(hi) or 1)
+                ax.set_ylim(min(lo - pad, 0), hi + pad)
 
     unit = (boot_a.get("unit_info") or {}).get("y_unit", "")
-    ylabel = f"Integrated Lyα flux [{unit}]" if unit else "Integrated Lyα flux"
-    return plot_radial_overlay(
-        series, radial_bins=r_edges, bin_mode=bin_mode,
-        VR_biweight_v=VR_biweight_v, stacks_result=stacks_a or boot_a,
-        vr_ticks=vr_ticks, figsize=figsize, ylims=ylims, xlims=xlims,
-        ylabel=ylabel, title="Integrated Lyα flux vs. radius (half-sample comparison)",
-        zero_line=None if logy else 0.0, legend_title="sample",
-        logy=logy, save_fig=save_fig, savename=savename,
-    )
+    ylabel_final = (ylabel_text if ylabel_text is not None
+                    else (f"Integrated Lyα flux [{unit}]" if unit else "Integrated Lyα flux"))
+    ax.set_ylabel(ylabel_final, fontsize=label_fontsize)
+    ax.tick_params(axis="both", which="major", labelsize=tick_fontsize)
+    if title:
+        ax.set_title(title, fontsize=title_fontsize)
+    ax.legend(frameon=False, fontsize=legend_fontsize, loc=legend_loc, title=legend_title)
+    ax.grid(alpha=grid_alpha)
+    plt.tight_layout()
+    if save_fig:
+        plt.savefig(_resolve_savename(save_name, "Figure_flux_profile_two.png"),
+                    dpi=300, bbox_inches="tight")
+    plt.show()
+    if fit:
+        return fig, ax, fit_results[0], fit_results[1]
+    return fig, ax
 
 
 def plot_asymmetry_profile_two(
@@ -1699,96 +2091,181 @@ def plot_asymmetry_profile_two(
     r_edges=None,
     bin_mode=None,
     VR_biweight_v=None,
+    VR_biweight_error: float | None = None,
     vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    show_vr: bool = True,
     xlims=None,
     jitter: float = 0.04,
-    figsize=(7.6, 8.0),
+    panels: str = "both",
+    fmts=("o-", "s--"),
+    markersize: float = 6,
+    linewidth: float = 1.5,
+    capsize: float = 3.5,
+    sample_b_alpha: float = 0.65,
+    frac_color: str = "tab:purple",
+    symmetric_color: str = "0.5",
+    blue_color: str = "royalblue",
+    red_color: str = "tomato",
+    zero_color: str = "0.7",
+    figsize=None,
+    title1: str | None = None,
+    title2: str | None = None,
+    legend_fontsize: float = 9,
+    tick_fontsize: float = 10,
+    label_fontsize: float = 11,
+    title_fontsize: float = 13,
+    grid_alpha: float = 0.15,
     save_fig: bool = False,
-    savename: str = "Figure_asymmetry_profile_two.png",
+    save_name: str | None = None,
 ):
     """
     Two-sample asymmetry overlay. Same two-panel layout as plot_asymmetry_profile
-    (top: blue/red ratio; bottom: absolute blue & red flux), but both samples are
-    drawn on each panel so the comparison is read on one figure.
+    (top: blue fraction B/(B+R); bottom: absolute blue & red flux), but both
+    samples are drawn on each panel so the comparison is read on one figure.
 
-    Sample A is solid markers, sample B is open/dashed; blue and red keep their
-    colours. Per-panel y-limits use BOTH samples so neither is clipped.
+    Self-contained (not a plotting.py engine wrapper) so every color, marker,
+    and font size below is a keyword argument. Sample A is solid/filled
+    markers, sample B is open/dashed (sample_b_alpha controls how faded B
+    looks); blue and red keep their own colors. Per-panel y-limits use BOTH
+    samples so neither is clipped.
 
-        analysis.plot_asymmetry_profile_two(boot_lm, boot_hm,
-                                             stacks_low_m, stacks_high_m,
-                                             labels=("low-M", "high-M"))
+    panels    : "both" (default, two stacked panels) | "fraction" (blue-fraction
+                panel only) | "flux" (blue/red flux panel only) -- grab just
+                one of the two images as its own standalone figure, same as
+                the single-sample plot_asymmetry_profile.
+    title1    : blue-fraction panel title; None (default) -> no title.
+    title2    : blue/red-flux panel title; None (default) -> no title.
+    figsize   : None -> (7.6, 8.0) for panels="both", (7.6, 4.5) for a single
+                panel.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_asymmetry_profile_two.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks_a['VR_biweight_e'] if present.
+
+    Example
+    -------
+        analysis.plot_asymmetry_profile_two(
+            boot_lm, boot_hm, stacks_low_m, stacks_high_m,
+            labels=("low-M", "high-M"),
+            xlims=(3, 3000), bin_mode="kpc", figsize=(9, 8),
+            panels="both",
+        )
+
+    Returns (fig, (ax1, ax2)) for panels="both", else (fig, ax).
     """
     for b in (boot_a, boot_b):
         if "blue_over_red_fid" not in b:
             raise KeyError("boot missing blue/red keys; re-run with "
                            "compute_side_ratio=True.")
+    if panels not in ("both", "fraction", "flux"):
+        raise ValueError("panels must be 'both', 'fraction', or 'flux'")
+
     radial_bins = np.asarray(r_edges if r_edges is not None
                              else boot_a.get("r_edges",
                              stacks_a["r_edges"] if stacks_a else []))
-    bm = _resolve_bin_mode(bin_mode, stacks_a or boot_a)
-    vr = _get_vr_biweight_v(VR_biweight_v, stacks_a or boot_a)
+    bm   = _resolve_bin_mode(bin_mode, stacks_a or boot_a)
+    vr   = _get_vr_biweight_v(VR_biweight_v, stacks_a or boot_a)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks_a or boot_a)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    if figsize is None:
+        figsize = (7.6, 8.0) if panels == "both" else (7.6, 4.5)
 
-    # panel 1: blue/red ratio, both samples
-    r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims)
+    if panels == "both":
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    elif panels == "fraction":
+        fig, ax1 = plt.subplots(figsize=figsize)
+        ax2 = None
+    else:
+        fig, ax2 = plt.subplots(figsize=figsize)
+        ax1 = None
+
     K = 2
-    fmts = ("o-", "s--")
-    for k, (lab, b) in enumerate(((labels[0], boot_a), (labels[1], boot_b))):
-        bor    = np.asarray(b["blue_over_red_fid"])
-        bor_lo = np.asarray(b["blue_over_red_lo"])
-        bor_hi = np.asarray(b["blue_over_red_hi"])
-        jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
-        bor_yerr, bor_unstable = _safe_yerr(bor, bor_lo, bor_hi)
-        ax1.errorbar(jit, bor, yerr=bor_yerr,
-                     fmt=fmts[k], capsize=3.5, ms=6, lw=1.5,
-                     color="tab:purple", alpha=1.0 if k == 0 else 0.65,
-                     markerfacecolor=("tab:purple" if k == 0 else "none"),
-                     label=f"{lab}  (B/R)")
-        if np.any(bor_unstable):
-            ax1.scatter(jit[bor_unstable], bor[bor_unstable], s=70, facecolors="none",
-                        edgecolors="tab:purple", linewidths=1.3, zorder=5)
-    ax1.axhline(1.0, color="0.5", lw=0.8, ls="--", label="symmetric (B/R = 1)")
-    ax1.set_ylabel("Blue / Red flux ratio")
-    ax1.set_title("Lyα asymmetry: blue/red side ratio (half-sample comparison)")
-    ax1.legend(frameon=False, fontsize=9)
-    ax1.grid(alpha=0.15)
+
+    # panel 1: blue fraction, both samples (per-draw fraction -> correct 16/84)
+    if ax1 is not None:
+        r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                         show_vr=show_vr, VR_biweight_error=vr_e)
+        for k, (lab, b) in enumerate(((labels[0], boot_a), (labels[1], boot_b))):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                bf_fid = np.asarray(b["blue_flux_fid"], float)
+                rf_fid = np.asarray(b["red_flux_fid"], float)
+                bfrac_fid = bf_fid / (bf_fid + rf_fid)
+                if "blue_flux_all" in b and "red_flux_all" in b:
+                    ball = np.asarray(b["blue_flux_all"], float)
+                    rall = np.asarray(b["red_flux_all"], float)
+                    bfrac_all = ball / (ball + rall)
+                    bfrac_lo = np.nanpercentile(bfrac_all, 16, axis=0)
+                    bfrac_hi = np.nanpercentile(bfrac_all, 84, axis=0)
+                else:
+                    warnings.warn(f"{lab}: blue_flux_all/red_flux_all not in boot; "
+                                  "approximating B/total error bars from blue_flux_lo/hi.")
+                    bl = np.asarray(b["blue_flux_lo"], float); bh = np.asarray(b["blue_flux_hi"], float)
+                    rl = np.asarray(b["red_flux_lo"],  float); rh = np.asarray(b["red_flux_hi"],  float)
+                    bfrac_lo = bl / (bl + rh)
+                    bfrac_hi = bh / (bh + rl)
+            jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
+            yerr, unstable = _safe_yerr(bfrac_fid, bfrac_lo, bfrac_hi)
+            ax1.errorbar(jit, bfrac_fid, yerr=yerr, fmt=fmts[k],
+                        color=frac_color, capsize=capsize, ms=markersize, lw=linewidth,
+                        alpha=1.0 if k == 0 else sample_b_alpha,
+                        markerfacecolor=(frac_color if k == 0 else "none"),
+                        label=f"{lab}  B/(B+R)")
+            if np.any(unstable):
+                ax1.scatter(jit[unstable], bfrac_fid[unstable], s=70, facecolors="none",
+                            edgecolors=frac_color, linewidths=1.3, zorder=5)
+        ax1.axhline(0.5, color=symmetric_color, lw=0.8, ls="--", label="symmetric (B/total = 0.5)")
+        ax1.set_ylim(0, 1)
+        ax1.set_ylabel("Blue fraction  B / (B+R)", fontsize=label_fontsize)
+        ax1.tick_params(axis="both", which="major", labelsize=tick_fontsize)
+        if title1:
+            ax1.set_title(title1, fontsize=title_fontsize)
+        ax1.legend(frameon=False, fontsize=legend_fontsize)
+        ax1.grid(alpha=grid_alpha)
 
     # panel 2: absolute blue & red flux, both samples
-    r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims)
-    dx = (r_mid2[1] - r_mid2[0]) * 0.05 if len(r_mid2) > 1 else 0
-    for k, (lab, b) in enumerate(((labels[0], boot_a), (labels[1], boot_b))):
-        jit = r_mid2 * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid2
-        bf = np.asarray(b["blue_flux_fid"]); rf = np.asarray(b["red_flux_fid"])
-        bf_lo = np.asarray(b["blue_flux_lo"]); bf_hi = np.asarray(b["blue_flux_hi"])
-        rf_lo = np.asarray(b["red_flux_lo"]);  rf_hi = np.asarray(b["red_flux_hi"])
-        mfc_b = "royalblue" if k == 0 else "none"
-        mfc_r = "tomato"    if k == 0 else "none"
-        bf_yerr, bf_unstable = _safe_yerr(bf, bf_lo, bf_hi)
-        rf_yerr, rf_unstable = _safe_yerr(rf, rf_lo, rf_hi)
-        ax2.errorbar(jit - dx, bf, yerr=bf_yerr,
-                     fmt=fmts[k], capsize=3, ms=5, lw=1.3, color="royalblue",
-                     markerfacecolor=mfc_b, label=f"{lab} blue")
-        ax2.errorbar(jit + dx, rf, yerr=rf_yerr,
-                     fmt=fmts[k], capsize=3, ms=5, lw=1.3, color="tomato",
-                     markerfacecolor=mfc_r, label=f"{lab} red")
-        if np.any(bf_unstable):
-            ax2.scatter((jit - dx)[bf_unstable], bf[bf_unstable], s=60, facecolors="none",
-                        edgecolors="royalblue", linewidths=1.3, zorder=5)
-        if np.any(rf_unstable):
-            ax2.scatter((jit + dx)[rf_unstable], rf[rf_unstable], s=60, facecolors="none",
-                        edgecolors="tomato", linewidths=1.3, zorder=5)
-    ax2.axhline(0, color="0.7", lw=0.6)
-    ax2.set_ylabel("Flux")
-    ax2.set_title("Blue and red side flux vs. radius")
-    ax2.legend(frameon=False, fontsize=8, ncol=2)
-    ax2.grid(alpha=0.15)
+    if ax2 is not None:
+        r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                           show_vr=show_vr, VR_biweight_error=vr_e)
+        dx = (r_mid2[1] - r_mid2[0]) * 0.05 if len(r_mid2) > 1 else 0
+        for k, (lab, b) in enumerate(((labels[0], boot_a), (labels[1], boot_b))):
+            jit = r_mid2 * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid2
+            bf = np.asarray(b["blue_flux_fid"]); rf = np.asarray(b["red_flux_fid"])
+            bf_lo = np.asarray(b["blue_flux_lo"]); bf_hi = np.asarray(b["blue_flux_hi"])
+            rf_lo = np.asarray(b["red_flux_lo"]);  rf_hi = np.asarray(b["red_flux_hi"])
+            mfc_b = blue_color if k == 0 else "none"
+            mfc_r = red_color  if k == 0 else "none"
+            bf_yerr, bf_unstable = _safe_yerr(bf, bf_lo, bf_hi)
+            rf_yerr, rf_unstable = _safe_yerr(rf, rf_lo, rf_hi)
+            ax2.errorbar(jit - dx, bf, yerr=bf_yerr, fmt=fmts[k],
+                        capsize=capsize, ms=max(markersize - 1, 1), lw=max(linewidth - 0.2, 0.5),
+                        color=blue_color, markerfacecolor=mfc_b, label=f"{lab} blue")
+            ax2.errorbar(jit + dx, rf, yerr=rf_yerr, fmt=fmts[k],
+                        capsize=capsize, ms=max(markersize - 1, 1), lw=max(linewidth - 0.2, 0.5),
+                        color=red_color, markerfacecolor=mfc_r, label=f"{lab} red")
+            if np.any(bf_unstable):
+                ax2.scatter((jit - dx)[bf_unstable], bf[bf_unstable], s=60, facecolors="none",
+                            edgecolors=blue_color, linewidths=1.3, zorder=5)
+            if np.any(rf_unstable):
+                ax2.scatter((jit + dx)[rf_unstable], rf[rf_unstable], s=60, facecolors="none",
+                            edgecolors=red_color, linewidths=1.3, zorder=5)
+        ax2.axhline(0, color=zero_color, lw=0.6)
+        ax2.set_ylabel("Flux", fontsize=label_fontsize)
+        ax2.tick_params(axis="both", which="major", labelsize=tick_fontsize)
+        if title2:
+            ax2.set_title(title2, fontsize=title_fontsize)
+        ax2.legend(frameon=False, fontsize=max(legend_fontsize - 1, 6), ncol=2)
+        ax2.grid(alpha=grid_alpha)
 
     plt.tight_layout()
     if save_fig:
-        plt.savefig(savename, dpi=300, bbox_inches="tight")
+        plt.savefig(_resolve_savename(save_name, "Figure_asymmetry_profile_two.png"),
+                    dpi=300, bbox_inches="tight")
     plt.show()
-    return fig, (ax1, ax2)
+    if panels == "both":
+        return fig, (ax1, ax2)
+    return fig, (ax1 if ax1 is not None else ax2)
 
 
 def run_all_plots_two(

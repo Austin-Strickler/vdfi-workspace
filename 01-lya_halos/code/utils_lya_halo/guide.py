@@ -326,6 +326,12 @@ _ENTRIES = [
        "Integrated Lya flux +/- bootstrap 16/84 vs radius (log-y by default, to "
        "see the faint outer bins). The radial surface-brightness profile.",
        "plot_flux_profile(boot, stacks)"),
+    _e("plot_flux_profile_fit", "analysis", "plotting", "Radial profiles",
+       "The flux profile with the fitting.py two-component (A1*exp(-r/h1) + "
+       "A2*exp(-r/h2)) model overlaid -- naive or PSF-aware (method='psf'), "
+       "drawing the fitted intrinsic profile and per-component scale lengths on "
+       "the measured bins. The figure behind the h1/h2 fit result.",
+       "plot_flux_profile_fit(boot, stacks, method='psf')"),
     _e("plot_flux_curve_of_growth", "analysis", "plotting", "Radial profiles",
        "Two-panel curve of growth: cumulative Lya luminosity (top, log-y) and "
        "flux fraction L(<r)/L(<r_max) (bottom) vs radius, with bootstrap "
@@ -482,6 +488,19 @@ _ENTRIES = [
        "per-bin structure for the integrated flux. The input to the synthesis "
        "and calibration plots.",
        "nulls = collect_null_ensembles(cfg, stacks, product)"),
+    _e("combined_bin_significance", "validation", "validation", "Combined significance",
+       "Combine several radial bins into ONE 'is the mean centroid offset "
+       "across this range really nonzero' test, using the covariance across "
+       "bins induced by shared galaxies in the bootstrap draws already in "
+       "real_boot -- so correlated neighboring bins aren't double-counted. The "
+       "covariance-aware beyond-R_vir significance number (~1.7 sigma).",
+       "combined_bin_significance(boot, r_min=1.0)"),
+    _e("pool_bins_and_bootstrap", "validation", "validation", "Combined significance",
+       "The flux-level counterpart: merge several radial bins into ONE wide bin "
+       "BEFORE measuring a centroid, then bootstrap that single pooled bin "
+       "fresh. Independent cross-check on combined_bin_significance (~1.5 "
+       "sigma flux-pooled).",
+       "pool_bins_and_bootstrap(stacks, r_min=1.0)"),
     _e("injection_recovery", "validation", "validation", "Injection-recovery",
        "Inject a synthetic Lya line of KNOWN velocity into the empty "
        "z-scrambled cube at fixed S/N, then recover it with each estimator. "
