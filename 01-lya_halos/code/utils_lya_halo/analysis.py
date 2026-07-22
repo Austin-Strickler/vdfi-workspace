@@ -1071,8 +1071,10 @@ def plot_flux_profile_fit(
     bin_mode=None,
     VR_biweight_v=None,
     vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    model: str = "expcore",
     method: str = "psf",
     fit_skip_inner: int = 1,
+    gamma_fixed: float | None = 0.8,
     psf_r=None,
     psf_vals=None,
     psf_fwhm_arcsec: float = 1.3,
@@ -1081,11 +1083,18 @@ def plot_flux_profile_fit(
     p0=None,
     r_fine=None,
     logy: bool = True,
+    logx: bool = False,
     ylims=None,
     xlims=None,
     show_vr: bool = True,
     VR_biweight_error: float | None = None,
     show_components: bool = True,
+    rvir_kpc: float | None = None,
+    show_crossover: bool = True,
+    show_sphere_of_influence: bool = True,
+    slope_frac: float = 0.9,
+    show_slope_diagnostic: bool = False,
+    compare_result: dict | None = None,
     figsize=(10, 5),
     title: str | None = _AUTO,
     save_fig: bool = False,
@@ -1093,12 +1102,35 @@ def plot_flux_profile_fit(
     verbose: bool = True,
 ):
     """
-    Same headline figure as plot_flux_profile (integrated/mean Lyα flux ±
-    bootstrap 16-84 vs radius) but with a two-component exponential
-    I(r) = A1*exp(-r/h1) + A2*exp(-r/h2) fit overlaid, using the fitting.py
-    infrastructure (see fitting.py's module docstring -- the same code this
-    fits with is validated against known-truth synthetic data in
-    ../psf_exponential_recovery.py).
+    THE fit powerhouse: headline figure (integrated/mean Lyα flux +/-
+    bootstrap 16-84 vs radius) with a two-component radial model overlaid,
+    using the fitting.py infrastructure. Handles BOTH shipped models via
+    `model` -- this supersedes fitting.plot_expcore_fit (removed 2026-07-18;
+    that function was a notebook-testing staging area for the expcore model
+    while it was still proposed/unvalidated -- now that it's earned its way
+    in (compare_models_aic_bic, real-data testing) and is Austin's preferred
+    model, it belongs in the same pipeline entry point as the two-exponential
+    fit, not a separate one).
+
+    model : "expcore" (default -- Austin's preferred model, most consistent
+             with the literature: A1*exp(-r/h1) + A2*(1+(r/r_c)^2)^(-gamma/2),
+             an exponential core plus a cored power-law halo standing in for
+             the clustering/two-halo-term signal) or "twoexp" (the original
+             shipped model: A1*exp(-r/h1) + A2*exp(-r/h2)). Changing this is
+             the ONLY thing that changes which fitting.py fit_* function gets
+             called and which curve gets drawn -- every other argument below
+             (method, PSF handling, bootstrap error bars, plotting cosmetics)
+             works identically for both. NOTE: this default changed from the
+             implicit twoexp-only behavior on 2026-07-18 -- old notebook
+             cells that don't pass model= will now get expcore, not
+             two-exponential; pass model="twoexp" explicitly to keep the old
+             behavior.
+    gamma_fixed : 0.8 (default, Limber-projected z~2-3 clustering slope) --
+             ONLY used when model="expcore". See
+             fitting.fit_psf_aware_expcore's docstring for why floating gamma
+             is not the default (r_c/gamma degeneracy, AIC/BIC preferring
+             two-exp on a free-gamma fit anyway). Ignored when
+             model="twoexp".
 
     boot['total_flux_fid'] is treated as a per-bin AVERAGE flux (not a sum;
     see fitting.bin_average_no_psf / bin_average_psf), matching how the real
@@ -1114,77 +1146,102 @@ def plot_flux_profile_fit(
              smeared by the PSF core for a naive/no-PSF fit; pass
              fit_skip_inner=0 to keep every bin).
 
-    psf_r, psf_vals : explicit PSF curve (e.g. from
-             starpsf.psf_profiles_for_lines), in the SAME radial unit as
-             `bin_mode` (typically kpc -- pass r_edges/bin_mode='kpc' for a
-             physically meaningful h1/h2 when fitting with a PSF). Only used
-             for method="psf". If not given, falls back to an analytic
+    psf_r, psf_vals : explicit PSF curve -- e.g. an empirically MEASURED one
+             (starpsf.psf_profiles_for_lines, converted to kpc via this
+             sample's z_median) instead of the literature Moffat -- in the
+             SAME radial unit as `bin_mode` (typically kpc -- pass
+             r_edges/bin_mode='kpc' for a physically meaningful fit). Only
+             used for method="psf". If not given, falls back to an analytic
              Moffat PSF built from psf_fwhm_arcsec/psf_beta, converted to
              kpc (see next) -- skips that conversion entirely if you pass
-             your own curve here.
+             your own curve here. This is the override point for swapping
+             the "optimistic" literature PSF for a real measured one later;
+             nothing else in this function (or fitting.py's fit_psf_aware/
+             fit_psf_aware_expcore, which only ever see the final R matrix)
+             needs to change either way.
     psf_fwhm_arcsec, psf_beta : Moffat PSF parameters used ONLY when
              psf_r/psf_vals are not given. Default 1.3"/beta=3, the Lujan
              Niemeyer (2022) literature fiducial (1.2-1.4" range) shown to
-             fit VIRUS stellar profiles well -- superseding the earlier
-             generic fwhm=3.0-kpc placeholder per halo-flux-fitting.md's
-             recommendation to use ONE PSF convention across this pipeline's
-             fits rather than a second, divergent default. Converted to kpc
-             via z_median (below) using the SAME angular-diameter-distance
-             conversion stack.convert_avg_fiber_bin uses per galaxy -- here
-             applied ONCE for the whole (already-stacked) sample. NOTE:
-             this changes the fitted h1/h2 slightly relative to the
-             previous fwhm=3.0-kpc default (real-data check: h1 shifts from
-             16.9 to ~15-16 kpc-ish territory depending on the sample's own
-             z_median) -- re-quote any already-written h1/h2/chi2 numbers
-             after switching to this default.
+             fit VIRUS stellar profiles well. Converted to kpc via z_median
+             (below) using the SAME angular-diameter-distance conversion
+             stack.convert_avg_fiber_bin uses per galaxy -- here applied
+             ONCE for the whole (already-stacked) sample.
     z_median : the sample's representative redshift, used ONLY to convert
              psf_fwhm_arcsec to kpc. None (default) -> read from
              stacks['z_median'] (set automatically by stack.build_stacks).
              Raises a clear error if unavailable from either source and
              method="psf" with no explicit psf_r/psf_vals -- guessing a
              redshift here would silently build the wrong-width PSF.
-    p0      : optional explicit (A1, h1, A2, h2) starting guess, passed
-             through to fitting.fit_naive/fit_psf_aware. None -> a handful
-             of automatic seeds (fitting._default_seeds) are tried and the
-             lowest-chi2 one kept -- see fitting.estimate_truth_from_profile
-             for a quick standalone ballpark if you want to inspect a seed
-             first.
+    p0      : optional explicit starting guess (A1,h1,A2,h2 for twoexp;
+             A1,h1,A2,r_c[,gamma] for expcore), passed through to the
+             matching fitting.py fit_* function. None -> a handful of
+             automatic seeds are tried and the lowest-chi2 one kept.
     r_fine  : optional fine radial grid (fitting.default_fine_grid used if
              not given) that the fit integrates over internally.
     logy    : log-y axis (default True, recommended for the faint outer
              bins -- matches plot_flux_profile's default).
+    logx    : log-x axis (default False). Useful for model="expcore" --
+             the core/halo TRANSITION near r_c is usually squeezed into a
+             couple of pixels on a linear axis spanning ~10 to ~1000+ kpc.
     title   : axis title; the default (_AUTO sentinel) auto-generates one
-             from `method`; pass a string to override, or None for no title.
+             from `model`/`method`; pass a string to override, or None for
+             no title.
     save_name : filename (with or without extension) used when save_fig=True.
              None -> "Figure_flux_profile_fit.png".
     show_vr, VR_biweight_error : same Rvir reference-line behavior as
              plot_flux_profile.
-    show_components : True (default) -- in addition to the combined
-             I(r)=A1*exp(-r/h1)+A2*exp(-r/h2) curve already drawn, overplot
-             each exponential term ALONE (A1*exp(-r/h1) dashed, A2*exp(-r/h2)
-             dash-dot) from the SAME fitted popt. Purely a visualization
-             addition -- the fit itself (this module's validated model) is
-             completely unchanged; this only draws two extra lines so it's
-             visually obvious which term dominates at a given radius, rather
-             than only seeing the sum (where the steep core term dying out
-             and the shallow halo term taking over can look like one smooth
-             curve instead of two distinct physical components handing off).
-    verbose : print the fitted (A1,h1,A2,h2) +/- errors and chi2/dof via
-             fitting.describe_fit.
+    show_components : True (default) -- in addition to the combined curve
+             already drawn, overplot each term ALONE (dashed / dash-dot)
+             from the SAME fitted popt. Purely a visualization addition --
+             the fit itself is completely unchanged. For model="expcore",
+             also marks the radius where the halo term's own local slope
+             reaches slope_frac (default 90%) of its asymptotic value --
+             NOT the same radius as r_c itself (see
+             fitting.radius_of_slope_fraction's docstring).
+    rvir_kpc : optional vertical reference line -- lets you see by eye
+             whether the fitted r_c (model="expcore") sits near R_vir.
+    show_crossover : True (default) -- if the fit (and compare_result, if
+             given) converged, mark the radius where its own core/halo
+             terms are equal (fitting.find_core_halo_boundary -- dispatches
+             on model automatically, so this works identically for either
+             model or when comparing one of each).
+    show_sphere_of_influence : True (default) -- if rvir_kpc is given, also
+             mark Sorini et al. 2018's ~7x-R_vir "sphere of influence" scale
+             (fitting.sphere_of_influence_kpc) -- the literature comparison
+             point for r_c itself (model="expcore").
+    slope_frac : 0.9 (default) -- see show_components above.
+    show_slope_diagnostic : False (default, model="expcore" only) -- add a
+             second panel below the main plot showing the TOTAL model's
+             local log-log slope vs radius, with reference lines at the
+             Limber-projected (-0.8) and raw (-1.8) z~2-3 clustering slopes.
+             When True, the return shape changes: ax becomes (ax, ax_slope)
+             instead of a single Axes (mirrors the old plot_expcore_fit's
+             return-shape convention).
+    compare_result : optional SECOND fit_result dict to overlay (e.g. a
+             twoexp fit next to this call's expcore fit, or vice versa) --
+             its own curve is drawn and fitting.compare_models_aic_bic is
+             printed, so you can see whether the extra parameter(s) are
+             actually earning their keep on THIS data rather than assuming
+             it from a different sample. Dispatches on
+             compare_result['model'] automatically.
+    verbose : print the fitted parameters +/- errors and chi2/dof via
+             fitting.describe_fit / describe_fit_expcore (model-dependent).
 
     Returns
     -------
-    (fig, ax, fit_result) : fit_result is the dict from fitting.fit_naive /
-        fit_psf_aware (success, A1/h1/A2/h2 + _err, popt, pcov, chi2, dof,
-        mask, model_binned, ...), plus a few extra keys stashed here for
-        later inspection without recomputing anything:
-            method, r_edges, r_mid, r_fine, y, y_lo, y_hi, sigma, bin_mode,
-            and (method="psf" only) R, psf_r, psf_vals.
-        Keep this around to see exactly how the fit did against your real
-        data -- e.g. fit_result['chi2'] / fit_result['dof'],
-        fit_result['h1'] +/- fit_result['h1_err'], or re-plot
-        fitting.intrinsic_profile(r, *fit_result['popt']) yourself.
+    (fig, ax, fit_result) -- or (fig, (ax, ax_slope), fit_result) if
+        show_slope_diagnostic=True. fit_result is the dict from the
+        matching fitting.py fit_* function (success, fitted params + _err,
+        popt, pcov, chi2, dof, mask, model_binned, model, ...), plus a few
+        extra keys stashed here for later inspection without recomputing
+        anything: method, r_edges, r_mid, r_fine, y, y_lo, y_hi, sigma,
+        bin_mode, and (method="psf" only) R, psf_r, psf_vals. Keep this
+        around to see exactly how the fit did against your real data, or
+        feed R/r_edges/r_fine straight into analysis.bootstrap_fit_profile
+        for refit-per-draw error bars.
     """
+    if model not in ("twoexp", "expcore"):
+        raise ValueError(f"model must be 'twoexp' or 'expcore' (got {model!r})")
     if method not in ("psf", "naive"):
         raise ValueError(f"method must be 'psf' or 'naive' (got {method!r})")
     if "total_flux_fid" not in boot:
@@ -1227,15 +1284,24 @@ def plot_flux_profile_fit(
             psf_r_use = np.linspace(0.0, 20.0 * fwhm_kpc, 400)
             psf_vals_use = fitting.moffat_1d(psf_r_use, fwhm=fwhm_kpc, beta=psf_beta)
         R = fitting.ring_convolution_matrix(r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
-        fit_result = fitting.fit_psf_aware(r_mid, y, sigma, R, r_fine_arr, radial_bins,
-                                           p0=p0, verbose=verbose)
+        if model == "expcore":
+            fit_result = fitting.fit_psf_aware_expcore(r_mid, y, sigma, R, r_fine_arr, radial_bins,
+                                                       gamma_fixed=gamma_fixed, p0=p0, verbose=verbose)
+        else:
+            fit_result = fitting.fit_psf_aware(r_mid, y, sigma, R, r_fine_arr, radial_bins,
+                                               p0=p0, verbose=verbose)
         fit_result["R"] = R
         fit_result["psf_r"] = psf_r_use
         fit_result["psf_vals"] = psf_vals_use
     else:
-        fit_result = fitting.fit_naive(r_mid, radial_bins, r_fine_arr, y, sigma,
-                                       fit_skip_inner=fit_skip_inner, p0=p0,
-                                       verbose=verbose)
+        if model == "expcore":
+            fit_result = fitting.fit_naive_expcore(r_mid, radial_bins, r_fine_arr, y, sigma,
+                                                    fit_skip_inner=fit_skip_inner,
+                                                    gamma_fixed=gamma_fixed, p0=p0, verbose=verbose)
+        else:
+            fit_result = fitting.fit_naive(r_mid, radial_bins, r_fine_arr, y, sigma,
+                                           fit_skip_inner=fit_skip_inner, p0=p0,
+                                           verbose=verbose)
 
     fit_result["method"] = method
     fit_result["r_edges"] = radial_bins
@@ -1247,7 +1313,14 @@ def plot_flux_profile_fit(
     fit_result["sigma"] = sigma
     fit_result["bin_mode"] = bm
 
-    fig, ax = plt.subplots(figsize=figsize)
+    if show_slope_diagnostic and model == "expcore":
+        fig, (ax, ax_slope) = plt.subplots(
+            2, 1, figsize=(figsize[0], figsize[1] * 1.7), sharex=True,
+            gridspec_kw={"height_ratios": [2.2, 1], "hspace": 0.06})
+    else:
+        fig, ax = plt.subplots(figsize=figsize)
+        ax_slope = None
+
     r_mid_native, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims,
                                             show_vr=show_vr, VR_biweight_error=vr_e)
     yerr, unstable = _safe_yerr(y, y_lo, y_hi)
@@ -1266,38 +1339,121 @@ def plot_flux_profile_fit(
                        edgecolors="tab:blue", linewidths=1.6, zorder=7,
                        label=f"dropped by naive fit (inner {fit_skip_inner})")
 
+    color = "tab:purple" if model == "expcore" else ("tab:green" if method == "psf" else "tab:orange")
+    total_curve = None
+    r_c_f = gamma_f = h1_f = None
     if fit_result.get("success"):
         popt = fit_result["popt"]
-        A1_f, h1_f, A2_f, h2_f = popt
-        color = "tab:green" if method == "psf" else "tab:orange"
         chi2_txt = (f", $\\chi^2$/dof={fit_result['chi2']/max(fit_result['dof'],1):.2f}"
                     if "chi2" in fit_result else "")
-        ax.plot(r_fine_arr, fitting.intrinsic_profile(r_fine_arr, *popt), "-",
-                color=color, lw=1.8, zorder=3,
-                label=(f"{'PSF-aware' if method == 'psf' else 'naive'} fit (sum)  "
-                       f"(h1={h1_f:.2g}, h2={h2_f:.2g}{chi2_txt})"))
-        model_binned = fitting.binned_model_from_result(
-            fit_result, r_fine_arr, radial_bins, fit_result.get("R"))
+        if model == "expcore":
+            A1_f, h1_f, A2_f, r_c_f = popt[0], popt[1], popt[2], popt[3]
+            gamma_f = fit_result["gamma"]
+            params_for_curve = popt if gamma_fixed is None else np.append(popt, gamma_fixed)
+            gtag = f"gamma={gamma_f:.2f}" + (" (fixed)" if fit_result["gamma_fixed"] else "")
+            total_curve = fitting.intrinsic_profile_expcore(r_fine_arr, *params_for_curve)
+            ax.plot(r_fine_arr, total_curve, "-", color=color, lw=1.8, zorder=3,
+                    label=(f"{'PSF-aware' if method == 'psf' else 'naive'} expcore fit (sum)  "
+                           f"(h1={h1_f:.2g}, r_c={r_c_f:.2g}, {gtag}{chi2_txt})"))
+            model_binned = fitting.binned_model_from_result_expcore(
+                fit_result, r_fine_arr, radial_bins, fit_result.get("R"))
+        else:
+            A1_f, h1_f, A2_f, h2_f = popt
+            ax.plot(r_fine_arr, fitting.intrinsic_profile(r_fine_arr, *popt), "-",
+                    color=color, lw=1.8, zorder=3,
+                    label=(f"{'PSF-aware' if method == 'psf' else 'naive'} fit (sum)  "
+                           f"(h1={h1_f:.2g}, h2={h2_f:.2g}{chi2_txt})"))
+            model_binned = fitting.binned_model_from_result(
+                fit_result, r_fine_arr, radial_bins, fit_result.get("R"))
         if model_binned is not None:
             ax.plot(r_mid_native, model_binned,
                     "^" if method == "psf" else "s",
                     color=color, ms=7, mfc="none" if method == "naive" else color,
                     zorder=4, label="fit predicted bin mean")
         if show_components:
-            # Each exponential term alone, from the SAME fitted popt -- no
-            # new fitting here, just splitting the already-drawn sum back
-            # into its two physical pieces so it's visible which one is
-            # actually doing the work at a given radius (rather than only
-            # seeing one smooth combined curve where the steep term dies
-            # out and the shallow term takes over).
-            ax.plot(r_fine_arr, A1_f * np.exp(-r_fine_arr / h1_f), "--",
-                    color=color, lw=1.3, alpha=0.65, zorder=2,
-                    label=f"  core term alone (h1={h1_f:.2g})")
-            ax.plot(r_fine_arr, A2_f * np.exp(-r_fine_arr / h2_f), "-.",
-                    color=color, lw=1.3, alpha=0.65, zorder=2,
-                    label=f"  halo term alone (h2={h2_f:.2g})")
+            # Each term alone, from the SAME fitted popt -- no new fitting
+            # here, just splitting the already-drawn sum back into its two
+            # physical pieces so it's visible which one is actually doing
+            # the work at a given radius.
+            if model == "expcore":
+                core_curve = A1_f * np.exp(-r_fine_arr / h1_f)
+                halo_curve = A2_f * (1.0 + (r_fine_arr / r_c_f) ** 2) ** (-gamma_f / 2.0)
+                ax.plot(r_fine_arr, core_curve, "--", color=color, lw=1.3, alpha=0.65,
+                        zorder=2, label=f"  core term alone (h1={h1_f:.2g})")
+                ax.plot(r_fine_arr, halo_curve, "-.", color=color, lw=1.3, alpha=0.65,
+                        zorder=2, label=f"  halo term alone (r_c={r_c_f:.2g}, gamma={gamma_f:.2g})")
+                r_frac = fitting.radius_of_slope_fraction(r_c_f, gamma_f, frac=slope_frac)
+                ax.axvline(r_frac, color=color, ls=(0, (4, 1, 1, 1)), lw=1.2, alpha=0.8,
+                           label=(f"halo reaches {slope_frac*100:.0f}% of asymptotic slope "
+                                  f"(-{gamma_f:.2g}) at r={r_frac:.0f}"))
+            else:
+                ax.plot(r_fine_arr, A1_f * np.exp(-r_fine_arr / h1_f), "--",
+                        color=color, lw=1.3, alpha=0.65, zorder=2,
+                        label=f"  core term alone (h1={h1_f:.2g})")
+                ax.plot(r_fine_arr, A2_f * np.exp(-r_fine_arr / h2_f), "-.",
+                        color=color, lw=1.3, alpha=0.65, zorder=2,
+                        label=f"  halo term alone (h2={h2_f:.2g})")
     elif verbose:
         print(f"plot_flux_profile_fit: fit FAILED -- {fit_result.get('reason')}")
+
+    if compare_result is not None and compare_result.get("success"):
+        cmodel = compare_result.get("model", "twoexp")
+        ccolor = "tab:green" if model == "expcore" else "tab:purple"
+        if cmodel == "expcore":
+            cpopt = compare_result["popt"]
+            cparams = (np.append(cpopt, compare_result["gamma"])
+                      if compare_result.get("gamma_fixed") else cpopt)
+            ax.plot(r_fine_arr, fitting.intrinsic_profile_expcore(r_fine_arr, *cparams),
+                    "--", color=ccolor, lw=1.5, zorder=2,
+                    label=(f"expcore fit (sum) (h1={compare_result['h1']:.2g}, "
+                           f"r_c={compare_result['r_c']:.2g})"))
+        else:
+            cA1, ch1 = compare_result["A1"], compare_result["h1"]
+            cA2, ch2 = compare_result["A2"], compare_result["h2"]
+            ax.plot(r_fine_arr, fitting.intrinsic_profile(r_fine_arr, cA1, ch1, cA2, ch2),
+                    "--", color=ccolor, lw=1.5, zorder=2,
+                    label=(f"two-exp fit (sum) (h1={ch1:.2g}, h2={ch2:.2g})"))
+        if fit_result.get("success"):
+            fitting.compare_models_aic_bic(
+                compare_result, fit_result, label_a=cmodel,
+                label_b=fit_result.get("model", model), verbose=verbose)
+
+    if ax_slope is not None and fit_result.get("success") and total_curve is not None:
+        pos = r_fine_arr > 0
+        slope_total = fitting.local_loglog_slope(r_fine_arr[pos], total_curve[pos])
+        ax_slope.plot(r_fine_arr[pos], slope_total, color=color, lw=1.6,
+                      label="total fitted profile, local slope")
+        ax_slope.plot(r_fine_arr[pos], fitting.effective_slope_expcore(r_fine_arr[pos], r_c_f, gamma_f),
+                      color=color, lw=1.1, ls=":", alpha=0.6,
+                      label="halo term alone, analytic slope")
+        ax_slope.axhline(-0.8, color="0.35", ls="--", lw=1.1,
+                         label="Limber-projected z~2-3 clustering (-0.8)")
+        ax_slope.axhline(-1.8, color="0.35", ls=":", lw=1.1,
+                         label="raw 3D clustering slope (-1.8)")
+        ax_slope.axhline(-gamma_f, color=color, ls="-.", lw=1.0, alpha=0.5,
+                         label=f"this fit's asymptotic slope (-{gamma_f:.2g})")
+        ax_slope.set_ylabel("local slope\n" + r"$d\ln I / d\ln r$")
+        ax_slope.legend(frameon=False, fontsize=7.5, loc="lower right")
+        ax_slope.grid(alpha=0.15)
+
+    if rvir_kpc is not None:
+        ax.axvline(rvir_kpc, color="0.4", ls=":", lw=1.2, label=f"R_vir = {rvir_kpc:.0f}")
+        if show_sphere_of_influence:
+            soi = fitting.sphere_of_influence_kpc(rvir_kpc)
+            ax.axvline(soi, color="0.4", ls="-.", lw=1.2,
+                       label=f"~7x R_vir sphere of influence (Sorini+18) = {soi:.0f}")
+
+    if show_crossover and fit_result.get("success"):
+        bnd = fitting.find_core_halo_boundary(fit_result)
+        if bnd["boundary_radius"] is not None and bnd["boundary_from_own_fit"]:
+            ax.axvline(bnd["boundary_radius"], color=color, ls=":", lw=1.3, alpha=0.8,
+                       label=f"{bnd['model']} term1=term2 crossover = {bnd['boundary_radius']:.0f}")
+    if show_crossover and compare_result is not None and compare_result.get("success"):
+        bnd2 = fitting.find_core_halo_boundary(compare_result)
+        if bnd2["boundary_radius"] is not None and bnd2["boundary_from_own_fit"]:
+            ccolor2 = "tab:green" if model == "expcore" else "tab:purple"
+            ax.axvline(bnd2["boundary_radius"], color=ccolor2, ls=":", lw=1.3, alpha=0.8,
+                       label=f"{bnd2['model']} term1=term2 crossover = {bnd2['boundary_radius']:.0f}")
 
     ax.axhline(0, color="0.7", lw=0.7)
     if logy:
@@ -1307,13 +1463,25 @@ def plot_flux_profile_fit(
             ax.set_ylim(pos.min() * 0.3, y.max() * 3)
     elif ylims is not None:
         ax.set_ylim(ylims)
+    if logx:
+        ax.set_xscale("log")
+        if xlims is None:
+            ax.set_xlim(0.5 * r_mid[0], radial_bins[-1] * 1.2)
+        if ax_slope is not None:
+            ax_slope.set_xscale("log")
+
     unit = (boot.get("unit_info") or {}).get("y_unit", "")
     ax.set_ylabel(f"Integrated Lyα flux [{unit}]" if unit else "Integrated Lyα flux")
-    title_final = (f"{'PSF-aware' if method == 'psf' else 'Naive'} double-exponential fit"
+    if ax_slope is not None:
+        plt.setp(ax.get_xticklabels(), visible=False)
+        r_unit = (boot.get("unit_info") or {}).get("r_unit", "")
+        ax_slope.set_xlabel(f"radius [{r_unit}]" if r_unit else "radius")
+    model_tag = "exp-core + cored power-law" if model == "expcore" else "double-exponential"
+    title_final = (f"{'PSF-aware' if method == 'psf' else 'Naive'} {model_tag} fit"
                    if title is _AUTO else title)
     if title_final:
         ax.set_title(title_final)
-    ax.legend(frameon=False, fontsize=9)
+    ax.legend(frameon=False, fontsize=8.5 if model == "expcore" else 9)
     ax.grid(alpha=0.15)
     plt.tight_layout()
     if save_fig:
@@ -1322,9 +1490,12 @@ def plot_flux_profile_fit(
     plt.show()
 
     if verbose:
-        fitting.describe_fit(fit_result, label=f"{method} fit vs real data")
+        if model == "expcore":
+            fitting.describe_fit_expcore(fit_result, label=f"{method} expcore fit vs real data")
+        else:
+            fitting.describe_fit(fit_result, label=f"{method} fit vs real data")
 
-    return fig, ax, fit_result
+    return fig, (ax, ax_slope) if ax_slope is not None else ax, fit_result
 
 
 def plot_flux_curve_of_growth(
@@ -1719,7 +1890,7 @@ def plot_centroid_profile_two(
     K = 2
     for k, (lab, b, col) in enumerate(((labels[0], boot_a, colors[0]),
                                         (labels[1], boot_b, colors[1]))):
-        v  = np.asarray(b["centroid_v_med"])
+        v  = np.asarray(b["centroid_v_fid"])
         lo = np.asarray(b["centroid_v_lo"]); hi = np.asarray(b["centroid_v_hi"])
         jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
         yerr, unstable = _safe_yerr(v, lo, hi)
@@ -1773,6 +1944,7 @@ def plot_flux_profile_two(
     zero_color: str = "0.7",
     zero_lw: float = 0.7,
     fit: bool = False,
+    fit_model: str = "expcore",
     fit_method: str = "psf",
     fit_skip_inner: int = 1,
     gamma_fixed: float | None = 0.8,
@@ -1824,14 +1996,19 @@ def plot_flux_profile_two(
     fit : False (default, unchanged behavior) -- pass True to independently
         fit EACH sample's flux profile and overlay the fitted curve on this
         same comparison figure, instead of only drawing the two error-bar
-        series. Uses the PSF-aware exponential-core + cored-power-law model
-        (fitting.intrinsic_profile_expcore / fit_psf_aware_expcore --
-        halo-flux-fitting.md Part 2/"Option C"), NOT the older validated
-        two-exponential model plot_flux_profile_fit uses -- deliberately, per
-        the explicit ask that drove this extension ("fit with a PSF-aware
-        exponential core with a power law"). Each sample is fit completely
-        independently (its own popt, its own chi2/dof); nothing about the
-        fit is shared between samples except the model form.
+        series. Each sample is fit completely independently (its own popt,
+        its own chi2/dof); nothing about the fit is shared between samples
+        except the model form and (for method="psf") each sample's own
+        z-converted PSF.
+    fit_model : "expcore" (default -- Austin's preferred model, matches
+        plot_flux_profile_fit's default) -- exponential core + cored
+        power-law halo (fitting.intrinsic_profile_expcore /
+        fit_psf_aware_expcore, halo-flux-fitting.md Part 2/"Option C").
+        "twoexp" -- the original double-exponential model
+        (fitting.intrinsic_profile / fit_psf_aware), matching
+        plot_flux_profile_fit's model="twoexp". Both samples are always fit
+        with the SAME model (comparing a twoexp low-z fit against an
+        expcore high-z fit would make h1/r_c not apples-to-apples).
     fit_method : "psf" (default) -- full PSF forward model, all bins fit
         (inner bin kept). "naive" -- no PSF correction, drops fit_skip_inner
         innermost bin(s). Same semantics as plot_flux_profile_fit's `method`.
@@ -1909,6 +2086,8 @@ def plot_flux_profile_two(
                            "compute_side_ratio=True (the default).")
     if fit and fit_method not in ("psf", "naive"):
         raise ValueError(f"fit_method must be 'psf' or 'naive' (got {fit_method!r})")
+    if fit and fit_model not in ("twoexp", "expcore"):
+        raise ValueError(f"fit_model must be 'twoexp' or 'expcore' (got {fit_model!r})")
 
     radial_bins = np.asarray(r_edges if r_edges is not None
                              else boot_a.get("r_edges",
@@ -1995,15 +2174,25 @@ def plot_flux_profile_two(
             sigma = ((s["hi"] - s["y"]) + (s["y"] - s["lo"])) / 2.0
             if fit_method == "psf":
                 R = R_by_sample[k]
-                fr = fitting.fit_psf_aware_expcore(
-                    r_mid_linear, s["y"], sigma, R, r_fine_arr, radial_bins,
-                    gamma_fixed=gamma_fixed, p0=fit_p0, verbose=False)
+                if fit_model == "expcore":
+                    fr = fitting.fit_psf_aware_expcore(
+                        r_mid_linear, s["y"], sigma, R, r_fine_arr, radial_bins,
+                        gamma_fixed=gamma_fixed, p0=fit_p0, verbose=False)
+                else:
+                    fr = fitting.fit_psf_aware(
+                        r_mid_linear, s["y"], sigma, R, r_fine_arr, radial_bins,
+                        p0=fit_p0, verbose=False)
                 fr["R"] = R
             else:
-                fr = fitting.fit_naive_expcore(
-                    r_mid_linear, radial_bins, r_fine_arr, s["y"], sigma,
-                    fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed,
-                    p0=fit_p0, verbose=False)
+                if fit_model == "expcore":
+                    fr = fitting.fit_naive_expcore(
+                        r_mid_linear, radial_bins, r_fine_arr, s["y"], sigma,
+                        fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed,
+                        p0=fit_p0, verbose=False)
+                else:
+                    fr = fitting.fit_naive(
+                        r_mid_linear, radial_bins, r_fine_arr, s["y"], sigma,
+                        fit_skip_inner=fit_skip_inner, p0=fit_p0, verbose=False)
             fr.update({"method": fit_method, "r_edges": radial_bins, "r_mid": r_mid_linear,
                       "r_fine": r_fine_arr, "y": s["y"], "y_lo": s["lo"], "y_hi": s["hi"],
                       "sigma": sigma, "bin_mode": bm, "label": s["label"]})
@@ -2011,34 +2200,51 @@ def plot_flux_profile_two(
 
             if fr.get("success"):
                 popt = fr["popt"]
-                A1_f, h1_f, A2_f, r_c_f = popt[0], popt[1], popt[2], popt[3]
-                gamma_f = fr["gamma"]
-                params_for_curve = popt if gamma_fixed is None else np.append(popt, gamma_fixed)
                 chi2_txt = (f", $\\chi^2$/dof={fr['chi2']/max(fr['dof'],1):.2f}"
                            if "chi2" in fr else "")
-                gtag = f"$\\gamma$={gamma_f:.2g}" + (" (fixed)" if fr["gamma_fixed"] else "")
                 alpha_k = 1.0 if k == 0 else sample_b_alpha
                 jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
-                ax.plot(r_fine_arr, fitting.intrinsic_profile_expcore(r_fine_arr, *params_for_curve),
-                        "-", color=s["color"], lw=1.8, alpha=alpha_k, zorder=3,
-                        label=f"  {s['label']} fit (h1={h1_f:.2g}, r_c={r_c_f:.2g}, {gtag}{chi2_txt})")
-                model_binned = fitting.binned_model_from_result_expcore(
-                    fr, r_fine_arr, radial_bins, fr.get("R"))
+                if fit_model == "expcore":
+                    A1_f, h1_f, A2_f, r_c_f = popt[0], popt[1], popt[2], popt[3]
+                    gamma_f = fr["gamma"]
+                    params_for_curve = popt if gamma_fixed is None else np.append(popt, gamma_fixed)
+                    gtag = f"$\\gamma$={gamma_f:.2g}" + (" (fixed)" if fr["gamma_fixed"] else "")
+                    ax.plot(r_fine_arr, fitting.intrinsic_profile_expcore(r_fine_arr, *params_for_curve),
+                            "-", color=s["color"], lw=1.8, alpha=alpha_k, zorder=3,
+                            label=f"  {s['label']} fit (h1={h1_f:.2g}, r_c={r_c_f:.2g}, {gtag}{chi2_txt})")
+                    model_binned = fitting.binned_model_from_result_expcore(
+                        fr, r_fine_arr, radial_bins, fr.get("R"))
+                else:
+                    A1_f, h1_f, A2_f, h2_f = popt
+                    ax.plot(r_fine_arr, fitting.intrinsic_profile(r_fine_arr, *popt),
+                            "-", color=s["color"], lw=1.8, alpha=alpha_k, zorder=3,
+                            label=f"  {s['label']} fit (h1={h1_f:.2g}, h2={h2_f:.2g}{chi2_txt})")
+                    model_binned = fitting.binned_model_from_result(
+                        fr, r_fine_arr, radial_bins, fr.get("R"))
                 if model_binned is not None:
                     ax.plot(jit, model_binned, "D" if fit_method == "psf" else "^",
                             color=s["color"], ms=6, alpha=alpha_k,
                             mfc="none" if k == 1 else s["color"], zorder=4)
                 if fit_show_components:
-                    ax.plot(r_fine_arr, A1_f * np.exp(-r_fine_arr / h1_f), "--",
-                            color=s["color"], lw=1.2, alpha=alpha_k * 0.65, zorder=2)
-                    ax.plot(r_fine_arr, A2_f * (1.0 + (r_fine_arr / r_c_f) ** 2) ** (-gamma_f / 2.0),
-                            "-.", color=s["color"], lw=1.2, alpha=alpha_k * 0.65, zorder=2)
+                    if fit_model == "expcore":
+                        ax.plot(r_fine_arr, A1_f * np.exp(-r_fine_arr / h1_f), "--",
+                                color=s["color"], lw=1.2, alpha=alpha_k * 0.65, zorder=2)
+                        ax.plot(r_fine_arr, A2_f * (1.0 + (r_fine_arr / r_c_f) ** 2) ** (-gamma_f / 2.0),
+                                "-.", color=s["color"], lw=1.2, alpha=alpha_k * 0.65, zorder=2)
+                    else:
+                        ax.plot(r_fine_arr, A1_f * np.exp(-r_fine_arr / h1_f), "--",
+                                color=s["color"], lw=1.2, alpha=alpha_k * 0.65, zorder=2)
+                        ax.plot(r_fine_arr, A2_f * np.exp(-r_fine_arr / h2_f), "-.",
+                                color=s["color"], lw=1.2, alpha=alpha_k * 0.65, zorder=2)
             elif fit_verbose:
                 print(f"plot_flux_profile_two: {s['label']} fit FAILED -- {fr.get('reason')}")
 
         if fit_verbose:
             for fr in fit_results:
-                fitting.describe_fit_expcore(fr, label=f"{fr['label']} ({fit_method})")
+                if fit_model == "expcore":
+                    fitting.describe_fit_expcore(fr, label=f"{fr['label']} ({fit_method})")
+                else:
+                    fitting.describe_fit(fr, label=f"{fr['label']} ({fit_method})")
 
     if logy:
         pos = np.concatenate([s["y"][s["y"] > 0] for s in series])
@@ -2080,6 +2286,228 @@ def plot_flux_profile_two(
     if fit:
         return fig, ax, fit_results[0], fit_results[1]
     return fig, ax
+
+
+# ---------------------------------------------------------------------
+# STANDALONE / EXPENSIVE -- run manually, NOT part of the standard per-run
+# workflow (plot_flux_profile_fit/plot_flux_profile_two do a single fit to
+# the fiducial profile and report curve_fit's covariance-based errors; that
+# stays the default path). Moved here from fitting.py 2026-07-18 (was
+# fitting.bootstrap_fit_expcore, expcore-only) now that fitting.py is a pure
+# model/fit-math helper module and this -- pipeline orchestration: looping
+# over bootstrap draws, refitting, aggregating -- belongs in analysis.py
+# alongside plot_flux_profile_fit/plot_flux_profile_two, which it's designed
+# to be used with directly (feed it the r_edges/r_fine/R those functions
+# already stash on their returned fit_result).
+# ---------------------------------------------------------------------
+def bootstrap_fit_profile(boot, r_edges, r_fine, *, model="expcore", method="psf", R=None,
+                          gamma_fixed=0.8, fit_skip_inner=1, p0=None,
+                          nboot=None, seed=None, verbose=True):
+    """
+    Refit-per-draw parameter uncertainty, as an alternative to reading
+    h1/r_c (or h1/h2)/etc. errors off curve_fit's covariance matrix from a
+    single fit to boot['total_flux_fid']. Works for EITHER model
+    (generalizes the old expcore-only fitting.bootstrap_fit_expcore).
+
+    Why this exists: covariance-based errors assume the chi2 surface is
+    locally quadratic (Gaussian) around the best fit. For model="expcore",
+    r_c is known to be poorly approximated that way even with gamma pinned
+    (see fitting.fit_psf_aware_expcore's docstring -- this is exactly why
+    gamma_fixed defaults to 0.8 now instead of floating). Refitting
+    independently to each of boot['total_flux_all']'s nboot rows and taking
+    the 16/84 percentile spread of each resulting parameter -- INCLUDING
+    the derived, non-fit-parameter core/halo crossover radius
+    (fitting.find_core_halo_boundary), which has no analytic error
+    propagation at all otherwise -- captures the real, possibly
+    skewed/non-Gaussian distribution instead of assuming one.
+
+    Also doubles as the direct way to test model="psf" vs the cheaper
+    method="naive", fit_skip_inner=0 (so the naive fit isn't just discarding
+    the innermost bin -- discarding it lets the model extrapolate inward
+    unconstrained, which tends to imply MORE core flux than is actually
+    observed, not less) head to head: same k (free parameter count) either
+    way for a fixed model, so chi2_fid is directly comparable, no AIC/BIC
+    needed. Can ALSO compare model="expcore" vs model="twoexp" this way if
+    you want refit-per-draw error bars on both to put alongside
+    fitting.compare_models_aic_bic's point-estimate verdict.
+
+    COST WARNING: this is nboot separate nonlinear fits, each running the
+    same multi-seed-then-lowest-chi2 strategy as a single point-estimate
+    fit call -- much more expensive than this pipeline's flux-resampling-
+    only bootstraps. Sanity-check with a small nboot (~100-200, via the
+    nboot argument) before running the full nboot the fiducial boot was
+    built with. If method="psf", build R ONCE (ring_convolution_matrix,
+    outside this call -- or just reuse plot_flux_profile_fit's returned
+    fit_result["R"], which is exactly this) and pass it in here -- it
+    depends only on the PSF and geometry, not on any individual draw's
+    flux, so it must NOT be rebuilt inside the loop.
+
+    Parameters
+    ----------
+    boot : Stage-3 bootstrap_all/measure_all_bins summary -- needs
+        total_flux_all (nboot, nrad) and total_flux_fid; meta{seed, nboot}
+        used as the default draw count/seed (pass nboot/seed explicitly to
+        override, e.g. nboot=100 for a quick check).
+    r_edges, r_fine : same radial grids used for the fiducial fit -- e.g.
+        plot_flux_profile_fit's returned fit_result["r_edges"]/["r_fine"].
+    model : "expcore" (default) or "twoexp" -- must match whatever
+        point-estimate fit you're attaching these errors to.
+    method : "psf" (default, requires R) or "naive".
+    R : ring_convolution_matrix output (or plot_flux_profile_fit's
+        fit_result["R"]); required if method="psf", ignored for "naive".
+    gamma_fixed : passed straight through when model="expcore" (ignored for
+        model="twoexp"); use the SAME value as whatever headline fit you're
+        attaching these errors to (default 0.8).
+    fit_skip_inner : "naive" method only -- forwarded to the underlying
+        fit_naive/fit_naive_expcore.
+    p0 : optional shared starting guess for every draw's fit (None ->
+        each draw runs its own automatic multi-seed search).
+    nboot : None (default) -> use ALL of boot['total_flux_all']'s rows
+        (boot['meta']['nboot']). Pass a smaller int to only use the first
+        `nboot` draws -- for a quick, cheap sanity check before running the
+        rest.
+    seed : unused for resampling (this refits boot's ALREADY-drawn flux
+        rows, it doesn't draw new galaxy resamples) -- accepted only so a
+        seed can be recorded in the returned meta for provenance.
+
+    Returns
+    -------
+    dict with, for each fitted parameter (A1/h1/A2/r_c/gamma for
+    model="expcore", A1/h1/A2/h2 for model="twoexp") PLUS crossover_radius:
+        {param}_fid   -- point estimate from a single fit to total_flux_fid
+                          (same value the matching point-estimate fit call
+                          would report)
+        {param}_med/_lo/_hi -- median, 16th, 84th percentile ACROSS THE
+                          PER-DRAW REFITS (the actual upgrade this function
+                          provides)
+    draws : dict of raw (n_success,) arrays per parameter, for custom
+        percentiles/plotting/joint-significance tests.
+    n_success, n_failed : how many of the nboot per-draw fits converged.
+    crossover_radius draws are excluded for any draw where
+    find_core_halo_boundary found no boundary from that draw's own fit
+    (one term dominates throughout) -- counted separately in
+    meta['n_no_crossover'].
+    meta : model, method, gamma_fixed, fit_skip_inner, nboot_used, seed.
+    """
+    if model not in ("twoexp", "expcore"):
+        raise ValueError(f"model must be 'twoexp' or 'expcore' (got {model!r})")
+    if method not in ("psf", "naive"):
+        raise ValueError(f"method must be 'psf' or 'naive' (got {method!r})")
+    if method == "psf" and R is None:
+        raise ValueError("method='psf' requires R (build ring_convolution_matrix "
+                         "ONCE outside this call and pass it in -- do not rebuild "
+                         "it per draw).")
+    if "total_flux_all" not in boot or "total_flux_fid" not in boot:
+        raise KeyError("boot needs total_flux_all (nboot, nrad) and total_flux_fid "
+                       "-- re-run Stage 3 with compute_side_ratio=True (the default) "
+                       "if these are missing.")
+
+    r_edges = np.asarray(r_edges, dtype=float)
+    r_fine = np.asarray(r_fine, dtype=float)
+    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
+
+    y_fid = np.asarray(boot["total_flux_fid"], dtype=float)
+    y_lo = np.asarray(boot["total_flux_lo"], dtype=float)
+    y_hi = np.asarray(boot["total_flux_hi"], dtype=float)
+    sigma = ((y_hi - y_fid) + (y_fid - y_lo)) / 2.0
+
+    flux_all = np.asarray(boot["total_flux_all"], dtype=float)
+    boot_meta = boot.get("meta", {}) or {}
+    n_available = flux_all.shape[0]
+    n_use = int(nboot) if nboot is not None else int(boot_meta.get("nboot", n_available))
+    n_use = min(n_use, n_available)
+    seed_record = seed if seed is not None else boot_meta.get("seed")
+
+    def _one_fit(y_row):
+        if model == "expcore":
+            if method == "psf":
+                return fitting.fit_psf_aware_expcore(r_mid, y_row, sigma, R, r_fine, r_edges,
+                                                      gamma_fixed=gamma_fixed, p0=p0, verbose=False)
+            return fitting.fit_naive_expcore(r_mid, r_edges, r_fine, y_row, sigma,
+                                             fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed,
+                                             p0=p0, verbose=False)
+        if method == "psf":
+            return fitting.fit_psf_aware(r_mid, y_row, sigma, R, r_fine, r_edges,
+                                         p0=p0, verbose=False)
+        return fitting.fit_naive(r_mid, r_edges, r_fine, y_row, sigma,
+                                 fit_skip_inner=fit_skip_inner, p0=p0, verbose=False)
+
+    param_names = ("A1", "h1", "A2", "r_c", "gamma") if model == "expcore" else ("A1", "h1", "A2", "h2")
+
+    def _crossover(result):
+        if not result.get("success"):
+            return None
+        bnd = fitting.find_core_halo_boundary(result)
+        return bnd["boundary_radius"] if bnd["boundary_from_own_fit"] else None
+
+    fid_result = _one_fit(y_fid)
+    fid_vals = {p: fid_result.get(p, np.nan) for p in param_names}
+    fid_vals["crossover_radius"] = _crossover(fid_result)
+    # chi2/dof/k on the fiducial fit -- exposed here (not just fid parameter
+    # values) so a "psf" call and a "naive" call (or an expcore vs. twoexp
+    # call, same bins/method) can be compared head-to-head without a
+    # separate plain fit call.
+    fid_chi2 = fid_result.get("chi2")
+    fid_dof = fid_result.get("dof")
+    fid_k = (fid_result.get("k_params", len(fid_result["popt"]))
+             if fid_result.get("success") else None)
+
+    params = param_names + ("crossover_radius",)
+    draws = {p: [] for p in params}
+    n_success, n_failed, n_no_crossover = 0, 0, 0
+
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(range(n_use), disable=not verbose,
+                        desc=f"bootstrap_fit_profile [{model}/{method}, gamma_fixed={gamma_fixed}]")
+    except ImportError:
+        iterator = range(n_use)
+        if verbose:
+            print(f"bootstrap_fit_profile: refitting {n_use} draws "
+                  f"[{model}/{method}, gamma_fixed={gamma_fixed}] (tqdm not installed, no progress bar)")
+
+    for b in iterator:
+        result = _one_fit(flux_all[b])
+        if not result.get("success"):
+            n_failed += 1
+            continue
+        n_success += 1
+        for p in param_names:
+            draws[p].append(result[p])
+        rx = _crossover(result)
+        if rx is None:
+            n_no_crossover += 1
+        else:
+            draws["crossover_radius"].append(rx)
+
+    out = {"meta": {"model": model, "method": method,
+                    "gamma_fixed": gamma_fixed if model == "expcore" else None,
+                    "fit_skip_inner": fit_skip_inner if method == "naive" else None,
+                    "nboot_used": n_use, "seed": seed_record},
+           "n_success": n_success, "n_failed": n_failed,
+           "n_no_crossover": n_no_crossover,
+           "chi2_fid": fid_chi2, "dof_fid": fid_dof, "k_params_fid": fid_k,
+           "draws": {}}
+    for p in params:
+        arr = np.asarray(draws[p], dtype=float)
+        out["draws"][p] = arr
+        out[f"{p}_fid"] = fid_vals[p]
+        if arr.size:
+            out[f"{p}_med"] = float(np.nanmedian(arr))
+            out[f"{p}_lo"] = float(np.nanpercentile(arr, 16))
+            out[f"{p}_hi"] = float(np.nanpercentile(arr, 84))
+        else:
+            out[f"{p}_med"] = out[f"{p}_lo"] = out[f"{p}_hi"] = np.nan
+
+    if verbose:
+        print(f"bootstrap_fit_profile: {n_success}/{n_use} draws converged "
+              f"({n_failed} failed fits, {n_no_crossover} converged fits with "
+              f"no core/halo crossover found)")
+        for p in ("h1", "r_c" if model == "expcore" else "h2", "crossover_radius"):
+            print(f"  {p:>17} : fid={out[f'{p}_fid']!s:>8}   "
+                  f"refit med={out[f'{p}_med']:.3g}  "
+                  f"[{out[f'{p}_lo']:.3g}, {out[f'{p}_hi']:.3g}] (16/84)")
+    return out
 
 
 def plot_asymmetry_profile_two(
@@ -2706,3 +3134,236 @@ def compare_core_stacks(stack_dict, method="inv_var", normalize="lya_peak",
     ax[0].set_title(f"core stacks - {method}"); ax[0].legend(fontsize=9)
     ax[1].set_title("AGN diagnostic region (N V, Si IV, C IV, He II)")
     plt.tight_layout(); plt.show()
+
+
+# =====================================================================
+# subsample-derived-properties.md Part 5 -- the printed, paper-ready
+# summary of every derived number Parts 1-3b can produce for ONE
+# subsample. Added 2026-07-18 alongside Part 3b's new measure.py functions
+# (measure_onehalo_luminosity, measure_three_zone_ratios); additive only,
+# nothing above this block was touched.
+# =====================================================================
+
+def _fmt_val_lohi(fid, lo=None, hi=None, fmt="10.4g") -> str:
+    """Format one `fid [16,84]`-style value for describe_subsample_properties,
+    the same value-with-error convention fitting.describe_fit uses (`key =
+    value +/- err`), just with an explicit [lo, hi] band instead of a
+    symmetric +/- since every number this feeds comes from a bootstrap
+    percentile, not a covariance-matrix sigma. 'n/a' for a missing/non-finite
+    fid (the whole section wasn't computed); '[no error band]' when fid is
+    finite but lo/hi aren't (e.g. a boot dict with no total_flux_all -- see
+    measure_onehalo_luminosity/measure_halo_luminosity's own fallback)."""
+    if fid is None or not np.isfinite(fid):
+        return "n/a"
+    if lo is not None and hi is not None and np.isfinite(lo) and np.isfinite(hi):
+        return f"{fid:{fmt}}  [{lo:{fmt}}, {hi:{fmt}}]"
+    return f"{fid:{fmt}}  [no error band]"
+
+
+def describe_subsample_properties(
+    *,
+    label: str = "subsample",
+    n_gal: int | None = None,
+    base_sample: str | None = None,
+    fit_result: dict | None = None,
+    boundary_info=None,
+    vel: dict | None = None,
+    core_lum: dict | None = None,
+    onehalo_lum: dict | None = None,
+    halo_lum: dict | None = None,
+    ratios: dict | None = None,
+    boot_fit: dict | None = None,
+    truth=None,
+) -> None:
+    """
+    subsample-derived-properties.md Part 5 -- one printed summary of every
+    derived number Parts 1-3b can produce for ONE subsample: the fit, the
+    core/halo boundary, core-vs-halo velocity, and the core/one-halo/
+    two-halo luminosity split with ratios. Mirrors the house convention
+    fitting.describe_fit/describe_fit_expcore already use for a single fit
+    result (label header, `key = value [lo, hi]` rows) -- the "clean enough
+    to read off and drop straight into the paper" printer the spec calls
+    for, extended to cover Part 3b's three-way luminosity split alongside
+    the original Parts 2-3 velocity/luminosity numbers.
+
+    Purely a reporting function: every argument is an ALREADY-COMPUTED
+    result dict from measure.py/fitting.py (this does no new computation
+    and returns nothing). Every argument is optional and independently
+    omittable -- pass whichever pieces you've actually run for this
+    subsample; anything left None prints a one-line "(not computed)"
+    placeholder instead of raising, since a typical exploratory run won't
+    always have every piece yet (core_lum especially -- see
+    measure_psf_corrected_core_luminosity -- is the expensive one and is
+    often skipped on a first pass).
+
+    Example
+    -------
+        boundary = fitting.find_core_halo_boundary(fit_result)
+        vel  = measure.measure_core_halo_velocity(boot, boundary)
+        oh   = measure.measure_onehalo_luminosity(boot, boundary)
+        halo = measure.measure_halo_luminosity(boot, boundary)   # 2-halo term
+        core = measure.measure_psf_corrected_core_luminosity(cfg, product, stacks, boot)
+        rat  = measure.measure_three_zone_ratios(core, oh, halo)
+        analysis.describe_subsample_properties(
+            label="low-z", n_gal=len(product.catalog), base_sample="AGN-excluded",
+            fit_result=fit_result, boundary_info=boundary, vel=vel,
+            core_lum=core, onehalo_lum=oh, halo_lum=halo, ratios=rat,
+            boot_fit=boot_fit)   # optional -- see boot_fit param below
+
+    Parameters
+    ----------
+    label : subsample name for the header line, e.g. "low-z" / "high-mass
+        AGN-excluded".
+    n_gal, base_sample : galaxy count + which base sample it's drawn from
+        (e.g. AGN-excluded ~450 vs AGN-included ~500 -- per the spec's
+        explicit warning that Paper 1 uses more than one base N). Both
+        optional, printed on the header line if given.
+    fit_result : a fitting.py fit result dict (fit_psf_aware/fit_naive,
+        twoexp or expcore, or their expcore counterparts) -- printed by
+        DELEGATING to fitting.describe_fit_expcore or fitting.describe_fit
+        (dispatched on fit_result['model']) rather than reimplementing that
+        formatting here, so this section always stays in sync with
+        whichever model was actually fit.
+    boundary_info : fitting.find_core_halo_boundary's return dict, or a bare
+        float boundary radius -- prints boundary_radius plus, when a dict,
+        the model/source/boundary_from_own_fit flags the spec calls for.
+    vel : measure_core_halo_velocity (or measure_outer_properties, which
+        includes it) result -- core_v/halo_v/diff with 16/84 errors.
+    core_lum : measure_psf_corrected_core_luminosity result.
+    onehalo_lum : measure_onehalo_luminosity result (Part 3b) -- the
+        genuine one-halo/CGM zone, core bin < r <= boundary.
+    halo_lum : measure_halo_luminosity result (r > boundary). NOTE, per
+        Part 3b: despite its key names (halo_lum_fid etc, left unchanged on
+        purpose -- see Part 3b's "as implemented" note), this zone is
+        physically the TWO-HALO/clustering-term contribution (random
+        density correlations + cosmic-web filaments along the line of
+        sight), not this galaxy's own halo gas -- printed here under a
+        "2-halo" label for clarity even though the dict itself still says
+        "halo".
+    ratios : measure_three_zone_ratios result (Part 3b) -- halo/core,
+        2-halo/halo, 2-halo/total, and the reconciled total luminosity.
+    boot_fit : OPTIONAL analysis.bootstrap_fit_profile result for this SAME
+        subsample/fit_result -- adds a supplementary "fit parameters
+        (bootstrap-refit)" section reporting h1 (exponential/CGM scale
+        length), r_c (2-halo scale length, expcore only) or h2 (twoexp),
+        and the crossover_radius itself, each with REFIT-PER-DRAW 16/84
+        errors -- the errors this pipeline actually trusts for h1/r_c (see
+        [[lya-halos-bootstrap-fit-expcore]]: curve_fit's covariance-based
+        errors, printed in the "-- fit --" section above from fit_result
+        alone, are known unreliable for r_c/gamma given their non-Gaussian
+        chi2 surface even with gamma pinned). Deliberately does NOT change
+        which bins count as core/halo/2-halo -- that split still uses the
+        fixed point-estimate boundary_info, per the "cheap and honest"
+        convention (report the boundary's own uncertainty as context,
+        don't re-partition every luminosity/velocity bootstrap draw by a
+        per-draw refit boundary, which bootstrap_fit_profile doesn't even
+        keep row-aligned with total_flux_all today). None (default) skips
+        this section entirely -- every luminosity/velocity/ratio number
+        above already has correct errors from the ordinary flux-resampling
+        bootstrap regardless of whether boot_fit is supplied.
+    truth : forwarded to the fit_result describer only (synthetic-recovery
+        runs); no effect on any other section.
+    """
+    hdr = f"[{label}]"
+    if n_gal is not None:
+        hdr += f"  N={n_gal}" + (f" ({base_sample})" if base_sample else "")
+    print(hdr)
+    print("=" * len(hdr))
+
+    print("\n-- fit (covariance-based errors) --")
+    if fit_result is not None:
+        model = fit_result.get("model", "twoexp")
+        describer = fitting.describe_fit_expcore if model == "expcore" else fitting.describe_fit
+        describer(fit_result, label=f"{label} fit", truth=truth)
+    else:
+        print("  (not computed)")
+
+    print("\n-- fit parameters (bootstrap-refit 16/84 -- trust these over the"
+          "\n   covariance errors above for h1/r_c, per known r_c/gamma"
+          "\n   non-Gaussian degeneracy) --")
+    if boot_fit is not None:
+        bmeta = boot_fit.get("meta", {}) or {}
+        bmodel = bmeta.get("model", "expcore")
+        n_use = bmeta.get("nboot_used", "?")
+        n_succ = boot_fit.get("n_success", "?")
+        n_fail = boot_fit.get("n_failed", "?")
+        print(f"  ({n_succ}/{n_use} draws converged, {n_fail} failed fits)")
+        print(f"  h1  (exponential/CGM scale length) = "
+              f"{_fmt_val_lohi(boot_fit.get('h1_fid'), boot_fit.get('h1_lo'), boot_fit.get('h1_hi'), '9.4g')}")
+        if bmodel == "expcore":
+            print(f"  r_c (2-halo scale length)          = "
+                  f"{_fmt_val_lohi(boot_fit.get('r_c_fid'), boot_fit.get('r_c_lo'), boot_fit.get('r_c_hi'), '9.4g')}")
+            gfixed = bmeta.get("gamma_fixed")
+            if gfixed is None:
+                print(f"  gamma (2-halo slope)               = "
+                      f"{_fmt_val_lohi(boot_fit.get('gamma_fid'), boot_fit.get('gamma_lo'), boot_fit.get('gamma_hi'), '9.4g')}")
+            else:
+                print(f"  gamma (2-halo slope)               = {gfixed:.3g}  (fixed, not refit)")
+        else:
+            print(f"  h2  (halo scale length)            = "
+                  f"{_fmt_val_lohi(boot_fit.get('h2_fid'), boot_fit.get('h2_lo'), boot_fit.get('h2_hi'), '9.4g')}")
+    else:
+        print("  (not computed -- run analysis.bootstrap_fit_profile and pass boot_fit=)")
+
+    print("\n-- core/halo boundary --")
+    if boundary_info is not None:
+        if isinstance(boundary_info, dict):
+            b = boundary_info.get("boundary_radius")
+            model = boundary_info.get("model", "?")
+            src = boundary_info.get("source", "?")
+            own = boundary_info.get("boundary_from_own_fit")
+            b_str = f"{b:.4g}" if (b is not None and np.isfinite(b)) else "n/a"
+            print(f"  boundary_radius = {b_str}  (model={model}, source={src}"
+                  + (f", boundary_from_own_fit={own}" if own is not None else "") + ")")
+        else:
+            print(f"  boundary_radius = {float(boundary_info):.4g}  (externally supplied)")
+        if boot_fit is not None and boot_fit.get("crossover_radius_fid") is not None:
+            n_use = (boot_fit.get("meta", {}) or {}).get("nboot_used", "?")
+            n_succ = boot_fit.get("n_success", 0) or 0
+            n_no_x = boot_fit.get("n_no_crossover", 0) or 0
+            n_with_x = n_succ - n_no_x
+            cr_str = _fmt_val_lohi(boot_fit.get("crossover_radius_fid"),
+                                   boot_fit.get("crossover_radius_lo"),
+                                   boot_fit.get("crossover_radius_hi"), "9.4g")
+            print(f"    bootstrap-refit  = {cr_str}"
+                  f"  ({n_with_x}/{n_use} draws had a crossover; this is CONTEXT ONLY --"
+                  f" the zones above still split at the fixed point estimate)")
+    else:
+        print("  (not computed)")
+
+    print("\n-- velocity: core vs. halo (one-halo/CGM zone) --")
+    if vel is not None:
+        print(f"  core_v          = {_fmt_val_lohi(vel['core_v_fid'], vel['core_v_lo'], vel['core_v_hi'], '8.2f')}  km/s")
+        print(f"  halo_v          = {_fmt_val_lohi(vel['halo_v_fid'], vel['halo_v_lo'], vel['halo_v_hi'], '8.2f')}  km/s"
+              f"  ({vel.get('n_outer_bins', '?')} bins, {vel.get('halo_combine', '?')} combine)")
+        print(f"  core - halo     = {_fmt_val_lohi(vel['diff_fid'], vel['diff_lo'], vel['diff_hi'], '8.2f')}  km/s")
+    else:
+        print("  (not computed)")
+
+    print("\n-- luminosity: core / halo (one-halo) / 2-halo -- erg/s --")
+    if core_lum is not None:
+        print(f"  core    = {_fmt_val_lohi(core_lum['core_lum_fid'], core_lum['core_lum_lo'], core_lum['core_lum_hi'])}"
+              f"  (PSF-corrected, bin {core_lum.get('inner_bin_index', '?')})")
+    else:
+        print("  core    = (not computed)")
+    if onehalo_lum is not None:
+        print(f"  halo    = {_fmt_val_lohi(onehalo_lum['onehalo_lum_fid'], onehalo_lum['onehalo_lum_lo'], onehalo_lum['onehalo_lum_hi'])}"
+              f"  ({onehalo_lum.get('n_zone_bins', '?')} bins, core<r<=boundary -- one-halo/CGM term)")
+    else:
+        print("  halo    = (not computed)")
+    if halo_lum is not None:
+        print(f"  2-halo  = {_fmt_val_lohi(halo_lum['halo_lum_fid'], halo_lum['halo_lum_lo'], halo_lum['halo_lum_hi'])}"
+              f"  ({halo_lum.get('n_outer_bins', '?')} bins, r>boundary -- clustering/filament term,"
+              f" NOT this galaxy's own CGM)")
+    else:
+        print("  2-halo  = (not computed)")
+
+    print("\n-- luminosity ratios --")
+    if ratios is not None:
+        print(f"  halo/core     = {_fmt_val_lohi(ratios['onehalo_over_core_fid'], ratios['onehalo_over_core_lo'], ratios['onehalo_over_core_hi'], '8.3f')}")
+        print(f"  2-halo/halo   = {_fmt_val_lohi(ratios['twohalo_over_onehalo_fid'], ratios['twohalo_over_onehalo_lo'], ratios['twohalo_over_onehalo_hi'], '8.3f')}")
+        print(f"  2-halo/total  = {_fmt_val_lohi(ratios['twohalo_over_total_fid'], ratios['twohalo_over_total_lo'], ratios['twohalo_over_total_hi'], '8.3f')}")
+        tot = ratios.get("total_lum_fid")
+        print(f"  total (core+halo+2-halo) = {tot:.4g}  erg/s" if tot is not None and np.isfinite(tot) else "  total = n/a")
+    else:
+        print("  (not computed -- needs measure_three_zone_ratios(core_lum, onehalo_lum, halo_lum))")

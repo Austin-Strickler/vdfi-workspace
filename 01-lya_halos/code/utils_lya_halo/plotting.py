@@ -762,8 +762,11 @@ def plot_centroid_vs_radius(
     16/84 interval. The bottom x-axis is the NATIVE bin unit (config.bin_mode);
     the top axis is the comparison unit (kpc<->R/Rvir), omitted for arcsec.
 
-    boot          : dict with 'centroid_v_med', 'centroid_v_lo', 'centroid_v_hi'
-                    (e.g. run_measure / bootstrap_measurements output).
+    boot          : dict with 'centroid_v_fid', 'centroid_v_lo', 'centroid_v_hi'
+                    (e.g. run_measure / bootstrap_measurements output). The
+                    plotted point is the FIDUCIAL (full, unresampled sample)
+                    centroid, matching print_centroid_table / plot_centroid_methods;
+                    only the 16/84 error bars come from the bootstrap.
     radial_bins   : bin edges in the NATIVE unit (stacks['r_edges']), length nrad+1.
     bin_mode      : 'virial' | 'kpc' | 'arcsec'. If None, read from stacks_result.
     VR_biweight_v : kpc per (R/Rvir). Needed ONLY for the comparison top axis
@@ -784,19 +787,19 @@ def plot_centroid_vs_radius(
     VR_biweight_v = _get_vr_biweight_v(VR_biweight_v, stacks_result)
     VR_biweight_error = _get_vr_biweight_e(VR_biweight_error, stacks_result)
 
-    v_med = np.asarray(boot["centroid_v_med"])
+    v_fid = np.asarray(boot["centroid_v_fid"])
     v_lo = np.asarray(boot["centroid_v_lo"])
     v_hi = np.asarray(boot["centroid_v_hi"])
-    yerr, unstable = _safe_yerr(v_med, v_lo, v_hi)
+    yerr, unstable = _safe_yerr(v_fid, v_lo, v_hi)
 
     fig, ax = plt.subplots(figsize=figsize)
     r_mid, xerr = _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v,
                                      VR_biweight, vr_ticks, xlims,
                                      show_vr=show_vr, VR_biweight_error=VR_biweight_error)
-    eb = ax.errorbar(r_mid, v_med, xerr=xerr, yerr=yerr, fmt="o",
+    eb = ax.errorbar(r_mid, v_fid, xerr=xerr, yerr=yerr, fmt="o",
                      capsize=3.5, ms=6, lw=1.5, label=label)
     if np.any(unstable):
-        ax.scatter(r_mid[unstable], v_med[unstable], s=70, facecolors="none",
+        ax.scatter(r_mid[unstable], v_fid[unstable], s=70, facecolors="none",
                    edgecolors=eb[0].get_color(), linewidths=1.3, zorder=5,
                    label="fiducial outside 16–84 band")
 
@@ -809,23 +812,38 @@ def plot_centroid_vs_radius(
             ax.axhline(add_axhline[0][i], c=add_axhline[2][i], label=add_axhline[1][i])
 
     if plot_literature:
-        guo_VR = 20
+        # Guo+2024's own numbers, in Guo's own units -- deliberately NEVER
+        # run through THIS sample's VR_biweight_v. Guo's virial radius (20
+        # kpc, guo_VR below) is a property of Guo's own galaxy sample, not
+        # ours; using our Rvir to place Guo's points would silently rescale
+        # them into our sample's frame instead of showing what Guo actually
+        # measured. So: bin_mode='kpc' -> Guo's raw kpc values, unconverted.
+        # bin_mode='virial' -> Guo's own R/Rvir (kpc / Guo's 20 kpc Rvir).
+        # Two independent unit choices, each self-contained to Guo's data.
+        guo_VR = 20  # Guo+2024's own assumed/measured virial radius (kpc)
         guo_r_edges_kpc = np.array([0, 7, 14, 29, 59])
         guo_r_mid_kpc = np.array([3.5, 10.5, 21.5, 44])
-        guo_vr_mid = guo_r_mid_kpc / guo_VR
-        guo_vr_edges = guo_r_edges_kpc / guo_VR
         guo_v = np.array([174, 173, 81, -72])
         guo_ev = np.array([11, 15, 51, 57])
-        gx = _vr_to_native(guo_vr_mid, bin_mode, VR_biweight_v)
+
+        if bin_mode == "kpc":
+            gx, g_edges = guo_r_mid_kpc, guo_r_edges_kpc
+        elif bin_mode == "virial":
+            gx, g_edges = guo_r_mid_kpc / guo_VR, guo_r_edges_kpc / guo_VR
+        else:
+            gx = g_edges = None
+
         if gx is not None:
-            lo = gx - _vr_to_native(guo_vr_edges[:-1], bin_mode, VR_biweight_v)
-            hi = _vr_to_native(guo_vr_edges[1:], bin_mode, VR_biweight_v) - gx
+            lo = gx - g_edges[:-1]
+            hi = g_edges[1:] - gx
             ax.errorbar(gx, guo_v, xerr=np.vstack([lo, hi]), yerr=guo_ev,
                         fmt="s--", capsize=3, ms=5, lw=1.2,
                         label="Guo+2024 LAEs, median stack")
         else:
-            print("plot_literature skipped: no R/Rvir conversion for "
-                  f"bin_mode={bin_mode!r} (need VR_biweight_v, or arcsec has none).")
+            print("plot_literature skipped: no clean Guo overlay for "
+                  f"bin_mode={bin_mode!r} -- 'kpc' uses Guo's own base kpc "
+                  "values, 'virial' uses Guo's own Rvir=20 kpc; arcsec has "
+                  "neither.")
 
     ax.axhline(0, color="tomato", alpha=0.4, lw=1)
     if z_err_kms and z_err_kms > 0:
@@ -962,7 +980,8 @@ def plot_centroid_comparison(
     other radial figure here, for visual consistency.
 
     boots        : dict {label: boot}, each boot a bootstrap_measurements /
-                   run_measure output (needs centroid_v_med/lo/hi).
+                   run_measure output (needs centroid_v_fid/lo/hi). Plots the
+                   FIDUCIAL centroid per sample, bootstrap 16/84 error bars.
     radial_bins  : bin edges (native unit). If None, taken from the first boot's
                    'r_edges' (run_measure carries it).
     bin_mode / VR_biweight_v : default from the first boot if it carries them.
@@ -984,7 +1003,7 @@ def plot_centroid_comparison(
     K = len(labels)
     for k, lab in enumerate(labels):
         b = boots[lab]
-        v = np.asarray(b["centroid_v_med"])
+        v = np.asarray(b["centroid_v_fid"])
         lo = np.asarray(b["centroid_v_lo"]); hi = np.asarray(b["centroid_v_hi"])
         jit = r_mid * (1 + jitter * (k - (K - 1) / 2.0)) if jitter else r_mid
         yerr, unstable = _safe_yerr(v, lo, hi)

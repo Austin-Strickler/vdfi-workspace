@@ -87,6 +87,69 @@ This needs a dedicated check — e.g. run the same template-fit-then-stack-by-fi
 
 ---
 
+## Local overdensity as an environment parameter (MOSDEF, COSMOS+EGS)
+
+Goal: attach a per-galaxy local overdensity to the MOSDEF sample (COSMOS + EGS, z~2-3) and test whether Lyα halo scale depends on environment, as **one binary low/high split** in the existing subsample-split machinery — a single paper paragraph, not a standalone LSS analysis.
+
+Relevant code: no new estimator needed — we adopt a published density catalog and cross-match it in via `multicat.add_matched_column` (see recipe below).
+
+### Plan (settled as of 2026-07-21)
+
+**Data — adopt Chartab et al. 2020, don't build our own.** Chartab et al. (2020, ApJ 890, 7) publicly release a per-galaxy density catalog covering **all five CANDELS fields, including both EGS and COSMOS**, for 86,716 galaxies at H(F160W)<26 AB, 0.4<z<5. It's built with a single uniform pipeline: weighted von Mises kernel-density estimation on the **full photo-z PDFs** (Kodra+2019 CANDELS photo-z, σ_NMAD≈0.02, folding in spec/3D-HST-grism z where available), boundary-corrected, LCV-optimized bandwidth. Density values extend to z=5, so our z~2-3 targets are covered. This is the standard, correct way to measure ~Mpc-scale projected environment — **photo-z-PDF-weighting is the right tool**, and is what lets the two small CANDELS fields work at all. (An earlier version of this note assumed photo-z was unusable and leaned COSMOS-only via spec-z compilations; that was wrong. Photo-z can't do sub-Mpc LOS-resolved density, but that isn't what we need. Spec-z at z~2-3 is far too sparse — ~13 Mpc mean tracer separation in EGS — to resolve small scales in either field, which is exactly why the whole cosmic-noon LSS literature uses photo-z-PDF density fields.)
+
+**Catalog contents (VizieR `J/ApJ/890/7`, table2):** `ID` (CANDELS photometric-catalog ID), `RAJ2000`, `DEJ2000`, `z` (z_best), comoving density, physical density, and **density contrast δ** — δ is the overdensity, already normalized within its z-slice, i.e. the field-relative quantity we want, no post-processing.
+
+**Cross-match by sky position, not ID.** The `ID` column is the CANDELS photometric ID (COSMOS→Nayyeri+2017, EGS→Stefanon+2017), *not* the 3D-HST/Skelton+2014 ID MOSDEF uses — a blind ID join is wrong. But every row has RA/Dec, so a positional match at ~0.3-0.5″ is trivial and robust (MOSDEF observed the CANDELS footprints, so overlap is high). Two checks before trusting a galaxy's δ: (a) it falls inside the WFC3 footprint and clear of the boundary/edge region; (b) it clears Chartab's mass-completeness floor M_min(z) (~10^9.7 at 1.2<z<2.2, higher at 2.2<z<3.5) — most MOSDEF galaxies do, but verify per-galaxy.
+
+**Structure — one binary axis, mass/z as controls.** With ~278 COSMOS + ~244 EGS, a single low/high median split leaves ~120-140 per bin per field (~250/bin pooled) — enough for a halo-scale stack. A mass×z×density grid would leave ~30-60 per cell and just measure noise, so **do not** cross-split; fold mass and redshift in as matched-subsample controls instead. Tag low/high vs. **each field's own median δ**, then the tags may be pooled across fields for the stack — but never compare raw δ values field-to-field (different effective depth/resolution). Note the catalog is a *single* smoothing scale (their LCV bandwidth); a second (sub-Mpc) scale would require re-running their estimator and isn't worth it for the paragraph.
+
+**Headline caveat — the mass–environment degeneracy.** Mass correlates with environment *and* with h1 (our own result), so a naive density split can silently re-derive the mass trend. **Mass-matching the low/high subsamples is what makes the result mean anything.** Second-order: UV/emission-line selection preferentially misses dusty/quiescent galaxies in the densest regions (Chartab 2025), which can dilute a real trend.
+
+### How to run it (uses existing `multicat` + `selection` + `stack`)
+
+Where to get the catalog: **VizieR `J/ApJ/890/7`** (also on the ApJ article page as the machine-readable table, and mirrored via arXiv). Download table2 for the EGS + COSMOS fields as FITS or CSV, or pull it with `astroquery`:
+
+```python
+# one-time: fetch Chartab+2020 density catalog, keep EGS + COSMOS rows
+from astroquery.vizier import Vizier
+Vizier.ROW_LIMIT = -1
+tab = Vizier.get_catalogs("J/ApJ/890/7")[0]      # table2: density measurements
+# inspect tab.colnames once; expect ~ ['Field','ID','RAJ2000','DEJ2000','z','ComD','PhysD','Dcont']
+ext = tab[[str(f) in ("EGS", "COSMOS") for f in tab["Field"]]]   # if a Field col exists
+ext.rename_columns(["RAJ2000", "DEJ2000", "Dcont"], ["RA", "DEC", "DELTA"])
+ext.write("chartab2020_egs_cosmos.fits", overwrite=True)
+
+# in the notebook: carry DELTA onto the galaxy product by position, then split
+from utils_lya_halo import multicat, selection, stack
+from astropy.table import Table
+ext = Table.read("chartab2020_egs_cosmos.fits")
+
+mega2 = multicat.add_matched_column(mega, ext, "DELTA", radius_arcsec=0.5)   # RA/DEC on both sides
+groups = multicat.split_product_by(mega2, "DELTA", percentiles=50,
+                                    labels=["low_density", "high_density"])   # median split; NaN/unmatched auto-dropped
+g_lo, g_hi = groups["low_density"], groups["high_density"]
+stacks_lo = stack.build_stacks(cfg_prod, g_lo, keep_cube=True)
+stacks_hi = stack.build_stacks(cfg_prod, g_hi, keep_cube=True)
+```
+
+`add_matched_column` already does the positional cross-match (defaults to RA/DEC on both sides, unmatched → NaN); `split_product_by(..., percentiles=50)` is a median split that drops non-finite/unmatched rows automatically. For a mass-matched version, pre-filter `mega` to a mass/z-matched subset (or use `selection.split_by_mask` on the mass column) before the density split.
+
+**Open follow-ups:**
+1. Pull table2 and confirm the exact EGS/COSMOS column names (Field/RA/Dec/δ) load as expected.
+2. Run the positional cross-match; report match rate and how many matched galaxies clear M_min(z) and the boundary.
+3. Read Chartab et al. 2025 for the selection-function/mass-matching details before finalizing.
+
+### Draft paragraph (for the paper — pending the actual cross-match + stack)
+> To test whether Lyα halo scale depends on large-scale environment, we assign each galaxy in our MOSDEF COSMOS and EGS subsamples a local overdensity from the publicly released CANDELS density-field catalog of Chartab et al. (2020), which reconstructs the galaxy number-density field in both fields with a single, uniform weighted von Mises kernel-density estimator applied to full photometric-redshift probability distributions (σ_NMAD ≈ 0.02), with boundary correction and a mass-completeness limit following Pozzetti et al. (2010). We cross-match our targets to that catalog by sky position and adopt its per-galaxy density contrast, restricting to galaxies above the redshift-dependent stellar-mass completeness limit. Within each field we split the sample at the median overdensity into low- and high-density subsamples — matched in stellar mass and redshift to break the mass–environment degeneracy — and re-measure the stacked Lyα halo scale length in each. Because the density field is normalized within each field, the two fields are combined only at the level of the low/high tag, not by comparing absolute densities.
+
+### See also (this section)
+- **VizieR `J/ApJ/890/7` (table2)** — the Chartab+2020 density catalog itself, the primary data product here: https://vizier.cds.unistra.fr/viz-bin/VizieR?-source=J/ApJ/890/7
+- Chartab 2020 - LSS Catalog in CANDELS Fields.pdf (`docs/literature/`) — the paper; method + mass-completeness (Pozzetti 2010) + Table 2 column definitions
+- Hatamnia 2026 - COSMOS-Web Density Maps.pdf (`docs/literature/`) — alternative photo-z density field, COSMOS only (cross-check/fallback)
+- Chartab et al. 2025, arXiv:2510.07445 (LATIS environment methods) — selection-function pitfalls; not yet in `docs/literature/`
+
+---
+
 ## See also
 
 - `GOALS.md` — project scope, headline measurements, and the settled/in-progress validation list

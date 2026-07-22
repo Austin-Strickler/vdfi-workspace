@@ -9,7 +9,20 @@ table, not just a figure per split. Design finalized 2026-07-17 after working
 through the PSF/boundary tradeoffs in detail (see decision log at the bottom);
 ready to implement.
 
-**Status: not started (spec only), design settled.**
+**Status: Parts 1–3 (core/halo, two-way split) implemented in `measure.py`
+(`measure_core_halo_velocity`, `measure_halo_luminosity`,
+`measure_psf_corrected_core_luminosity`, `measure_outer_properties`) and
+`fitting.py` (`find_core_halo_boundary`) as of 2026-07-17. Part 3b (three-way
+core/halo/2-halo split) implemented 2026-07-18 as
+`measure_onehalo_luminosity` + `measure_three_zone_ratios` -- ADDITIVE only;
+see Part 3b's "as implemented" note for the one naming deviation from the
+design below. Part 4 (fitting overlay in the two-sample comparison plot) is
+also implemented -- `analysis.plot_flux_profile_two` carries `fit`/
+`fit_model`/`fit_method`/`fit_skip_inner`/`gamma_fixed` kwargs, defaulting to
+`fit_model="expcore"` now that `halo-flux-fitting.md` Part 2 has shipped (see
+Part 4 below and Open Question 3, now resolved). Part 5 (the
+`describe_subsample_properties` printer) implemented 2026-07-18 -- see
+Part 5 below.**
 
 ## Goal
 
@@ -204,6 +217,134 @@ before the combine), not `analysis.py` — mirrors how `halo-flux-fitting.md`
 Part 3 flagged its own extraction code as closer to `extract.py`'s job than
 `fitting.py`'s.
 
+## Part 3b — three-way split: core / halo / 2-halo (design settled 2026-07-18, implemented 2026-07-18)
+
+**As implemented — one deviation from the design below.** Austin's
+implementation instruction was explicit: don't touch the two already-shipped
+measurements, just fit the new one in alongside them. So
+`measure_halo_luminosity` was NOT renamed — it keeps its original name and
+behavior completely unchanged. The new middle zone is
+`measure_onehalo_luminosity` (not `measure_halo_luminosity`/"halo" as
+originally proposed below) — "halo" was already taken, and "one-halo term" /
+"two-halo term" is itself standard halo-model terminology for this exact
+same-halo-vs-different-halo split, so it reads as precisely as the original
+naming would have. A new `measure_three_zone_ratios(core_lum, onehalo_lum,
+halo_lum)` combiner was added for the ratio numbers (`onehalo/core`,
+`twohalo/onehalo`, `twohalo/total`) described below — pure arithmetic on
+already-computed results, no new stacking/bootstrap. Everything else below
+(the zone definitions, the empirical-zone-sum method, the expcore-boundary
+recommendation, error alignment, edge cases) was implemented as designed.
+
+**The problem this fixes.** Part 3's "halo luminosity" (everything beyond the
+Part 1 crossover) is dominated by the fit's OUTER term — which
+`halo-flux-fitting.md` Part 2 and `fitting.py`'s own docstrings describe as "a
+stand-in for a clustering/two-halo-term outer profile," not the galaxy's own
+CGM emission. Meanwhile `h1`'s term (the inner exponential) is what Austin
+actually calls "the halo scale length" — the field's normal usage of "halo."
+So as shipped, Part 3 quietly measures a **core + two-halo** split and calls
+the second piece "halo," while the radial zone that's actually one-halo-term-
+dominated (between the PSF-corrected core bin and the crossover) is never its
+own reported number — it only ever feeds the fit.
+
+**Rename (originally proposed here, SUPERSEDED — see "As implemented" note
+above):** the original plan was `measure_halo_luminosity` →
+`measure_two_halo_luminosity`, freeing up "halo" for the new middle zone.
+Austin's implementation instruction overrode this: don't touch the existing
+function at all. `measure_halo_luminosity` keeps its name; the new zone is
+`measure_onehalo_luminosity` instead. The physical point stands regardless
+of which name won — `measure_halo_luminosity`'s zone is two-halo/clustering-
+dominated, not this galaxy's own CGM — just remember it going forward as "the
+function called `measure_halo_luminosity` measures the two-halo term," not
+literally as its own name suggests.
+
+**Three zones, all keyed off quantities that already exist:**
+
+- **Core** = bin `core_bin_index` (default 0), PSF-aperture-corrected.
+  Unchanged from Part 3 — `measure_psf_corrected_core_luminosity`.
+- **Halo** = bins with `core_bin_index < bin` and `r_mid ≤ boundary_radius`
+  (from `find_core_halo_boundary`) — the newly-measured middle zone,
+  one-halo/CGM-term-dominated.
+- **2-halo** = bins with `r_mid > boundary_radius` — Part 3's existing
+  "halo luminosity," renamed. Clustering-term-dominated.
+
+**Measurement method for the halo (middle) zone — empirical zone-sum,
+decided over the model-decomposed alternative.** Two ways to compute it were
+weighed:
+
+1. *Empirical zone-sum* (chosen): sum `total_flux_fid × own annulus area`
+   over the zone's bins, exactly `measure_halo_luminosity`'s existing recipe
+   applied to a different radius range. No new model dependence, no new
+   stacking pass — bootstrap error falls straight out of `total_flux_all` the
+   same way. **As implemented:** rather than refactoring
+   `measure_halo_luminosity` into a shared primitive (which would touch the
+   existing function, contrary to Austin's non-intrusive instruction), the
+   recipe is duplicated once, standalone, in the new
+   `measure_onehalo_luminosity` — a few lines of repetition traded for zero
+   risk to the already-shipped function.
+2. *Model-decomposed* (rejected as primary, kept as an optional diagnostic):
+   integrate the fit's `A1*exp(-r/h1)` term alone over the zone, netting out
+   the outer term's leakage. Physically cleaner attribution (near the
+   boundary the two terms are by construction comparable, so option 1 mixes
+   a bit of each into the "wrong" zone), but pins the number to the fit being
+   right — and `h1`/`r_c`/`gamma` are already documented
+   ([[lya-halos-bootstrap-fit-expcore]]) as seed- and `gamma_fixed`-sensitive
+   on sparse bins. Adding a second layer of fit uncertainty on top of a
+   boundary that's already a fitted (not measured) quantity was judged not
+   worth it for a number whose whole point, per this spec's Framing section,
+   is a clean cross-subsample comparison, not maximal physical purity.
+   Worth computing later as a secondary "estimated 2-halo leakage fraction
+   into the halo zone" diagnostic column, not as a correction to the primary
+   number.
+
+**Which model's boundary to use — expcore, not two-exponential, once
+`halo-flux-fitting.md` Part 2 ships.** `find_core_halo_boundary` already
+dispatches on either fit's `model` key, so both work mechanically. But only
+the expcore model's outer term (`A2*(1+(r/r_c)^2)^(-gamma/2)`) has an actual
+clustering/2-halo physical motivation in the docs — the two-exponential
+model's outer term is just a second exponential that happens to land its
+crossover near R_vir. A table column literally named "2-halo luminosity"
+should be built on the fit that motivates calling it that.
+
+**Errors and ratios — already aligned, no new bookkeeping.** `core_lum_all`
+is already built replaying `boot`'s exact bootstrap draw sequence
+(guarantee documented in `measure_psf_corrected_core_luminosity`).
+`measure_onehalo_luminosity`, built from the same `total_flux_all`, inherits
+that same per-draw alignment automatically. So `onehalo/core`,
+`twohalo/onehalo`, and `twohalo/total` ratios (implemented in
+`measure_three_zone_ratios`) all get correct per-draw error propagation
+(`ratio_b = zone_a_all[b] / zone_b_all[b]`, then 16/84-percentile the ratio
+distribution) essentially for free, the same
+pattern `measure_core_halo_velocity`'s `diff_all` already uses.
+
+**Verification.** `core_lum + onehalo_lum + halo_lum` (`total_lum_fid`,
+returned directly by `measure_three_zone_ratios`) should reconcile against
+the existing `flux_curve_of_growth` total, MINUS one expected, explicable
+offset: because `core_lum` uses the PSF-rescaled re-coadd (always ≥ the raw
+core bin), the reconciled three-zone total will be systematically *higher*
+than the raw curve-of-growth total by exactly the aperture-correction's added
+flux. Worth asserting this as an automated check
+(`total_lum_fid - curve_of_growth_total ≈ core_lum_fid - core_lum_raw`)
+rather than treating a mismatch as a bug the first time someone runs it. Not
+yet implemented as an automated check (still open, see item 4 below).
+
+**Edge cases to guard (same defensive pattern as Part 3's `n_outer < 1`
+check):** `boundary_radius` falling inside the core bin itself (empty
+one-halo zone — the fit says the core dominates all the way to the
+crossover, which would itself be worth flagging rather than silently
+returning zero, hence `measure_onehalo_luminosity` raises `ValueError`
+instead) or beyond the outermost bin edge (empty two-halo zone — no measured
+signal is two-halo-dominated for this subsample; `measure_halo_luminosity`
+already raised for this case).
+
+**Table columns this adds** to Part 5's `describe_subsample_properties`
+(now implemented — see Part 5): `onehalo_lum` (+16/84, from
+`measure_onehalo_luminosity`), `halo_lum` (+16/84, existing/unchanged,
+physically the two-halo term), `onehalo/core`, `twohalo/onehalo`,
+`twohalo/total` (all three from `measure_three_zone_ratios`) — the last one
+is the likely headline number for a Discussion paragraph ("X% of stacked
+Lyα luminosity at low-z vs. high-z arises from the 2-halo/clustering term
+beyond the fitted boundary, vs. Y% at low-z").
+
 ## Part 4 — optional fitting overlay in the two-sample comparison plots
 
 Independent of Parts 1–3 (this is about the FIGURES, not the table): extend
@@ -219,6 +360,16 @@ fit call, not two. Same model-dependency note as Part 1: ships against
 today's two-exponential model, generalizes to Part 2's exp+power-law model
 with no interface change once that lands.
 
+**Implemented.** `plot_flux_profile_two` carries `fit: bool = False`,
+`fit_model: str = "expcore"`, `fit_method: str = "psf"`,
+`fit_skip_inner: int = 1`, `gamma_fixed: float | None = 0.8` (matching
+`halo-flux-fitting.md` Part 2's shipped default) plus a `psf_r`-style PSF
+passthrough — the model-dependency note above resolved itself in
+`analysis.py`'s favor once Part 2 landed, so this ships against expcore by
+default rather than the originally-assumed two-exponential fallback.
+`plot_centroid_profile_two` was NOT given a `fit` argument — there is no
+centroid-vs-radius model to overlay, only the flux profile is fit.
+
 ## Part 5 — per-run deliverable: printed summary + Part 4 figures (NOT an auto-built cross-split table)
 
 **Clarification:** a single notebook run computes ONE subsample split (or the
@@ -227,12 +378,27 @@ full stack) at a time, exactly like today's `plot_centroid_profile_two`/
 actual deliverable is (a) the Part 4 comparison figures with the fit overlaid,
 and (b) a printed summary of that run's derived numbers, clean enough to read
 off and drop straight into the paper — mirroring the existing house
-convention `fitting.describe_fit` already uses for a single fit. New function,
-e.g. `describe_subsample_properties(props)`, printing: split label, N
-galaxies (+ which base sample — AGN-excluded ~450 vs. AGN-included ~500, not
-always the same one), h1/h2 (or r_c/gamma) + chi2/dof, the fitted boundary
-radius (+ `boundary_from_own_fit` flag), core/halo luminosity + ratio,
-core/halo velocity + difference, each with its 16/84 error.
+convention `fitting.describe_fit` already uses for a single fit.
+
+**Implemented 2026-07-18** as `analysis.describe_subsample_properties(*,
+label, n_gal=None, base_sample=None, fit_result=None, boundary_info=None,
+vel=None, core_lum=None, onehalo_lum=None, halo_lum=None, ratios=None,
+truth=None)`. Every result argument is an already-computed dict (this
+function does no computation, purely prints) and independently optional —
+whatever's `None` prints a "(not computed)" placeholder instead of raising,
+since an exploratory run rarely has all of `core_lum` (the expensive
+PSF-rescale-recoadd piece), `onehalo_lum`/`halo_lum`/`ratios` (Part 3b), and
+`vel` computed at once. Prints: header (label, N, base sample), the fit —
+delegated to `fitting.describe_fit_expcore`/`describe_fit` (dispatched on
+`fit_result['model']`) rather than reimplemented, so it never drifts from
+those — the boundary radius + `model`/`source`/`boundary_from_own_fit`,
+core/halo velocity + difference, core/halo(one-halo)/2-halo luminosity, and
+the three Part 3b ratios + reconciled total, each with its 16/84 band via a
+shared `_fmt_val_lohi` helper (`value  [lo, hi]`, not `+/-`, since every
+number here is a bootstrap percentile). The `halo_lum` section is explicitly
+labeled "2-halo" and annotated "NOT this galaxy's own CGM" in the printed
+output itself, not just in the docstring — the whole point of Part 3b was
+that this distinction stops being implicit.
 
 **The full cross-split table (one row per `subsample_splits.md` #1–11 entry,
 plus low-z/high-z, plus the full stack) is the eventual goal, not something
@@ -252,9 +418,16 @@ reformats numbers that already came out of individual runs.
    DataFrame.
 2. Function homes — `describe_subsample_properties` / the eventual
    `build_property_table` in `analysis.py` vs. a new small module.
-3. Part 1/4's model dependency on `halo-flux-fitting.md` Part 2 — ship now
+3. ~~Part 1/4's model dependency on `halo-flux-fitting.md` Part 2 — ship now
    against the two-exponential model (recommended, per the earlier
-   discussion) or wait.
+   discussion) or wait.~~ **Resolved 2026-07-18:** Part 2 shipped and was
+   promoted to the default model in `analysis.py`; Part 4 and
+   `describe_subsample_properties` (Part 5) both dispatch on
+   `fit_result['model']` and work against either model, defaulting to
+   expcore in practice.
+4. Part 3b's model-decomposed halo-zone diagnostic (estimated 2-halo leakage
+   fraction) — worth building alongside the primary empirical zone-sum, or
+   deferred until there's a specific referee/Discussion need for it.
 
 ## See also
 

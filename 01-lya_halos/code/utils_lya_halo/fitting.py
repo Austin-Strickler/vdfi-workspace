@@ -565,7 +565,7 @@ def _pack_result(success, popt=None, pcov=None, reason=None, mask=None,
     perr = (np.sqrt(np.diag(pcov)) if pcov is not None and np.all(np.isfinite(pcov))
             else np.full(4, np.nan))
     A1, h1, A2, h2 = popt
-    out = {"success": True,
+    out = {"success": True, "model": "twoexp",
            "A1": A1, "h1": h1, "A2": A2, "h2": h2,
            "A1_err": perr[0], "h1_err": perr[1],
            "A2_err": perr[2], "h2_err": perr[3],
@@ -1204,6 +1204,13 @@ def binned_model_from_result_expcore(result, r_fine, r_edges, R=None):
 
 
 # ---------------------------------------------------------------------
+# bootstrap_fit_expcore moved to analysis.bootstrap_fit_profile 2026-07-18
+# (generalized to support model="twoexp" too) -- fitting.py is model/fit
+# math only now; bootstrap-loop orchestration belongs in analysis.py.
+# ---------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------
 # Connecting the outer term to a clustering / two-halo-term signal.
 #
 # halo-flux-fitting.md Part 2's central physical point: a 3D two-point
@@ -1315,10 +1322,11 @@ def compare_models_aic_bic(result_a, result_b, *, label_a="two-exp", label_b="ex
 
 # ---------------------------------------------------------------------
 # Literature comparison points, computed from fit results rather than
-# hand-read off a plot -- so they can be overlaid on plot_expcore_fit (or
-# any future comparison plot) directly, instead of re-derived by eye each
-# time. See halo_gas_correlation_literature_review.md Section 7 for the
-# real-data numbers these were checked against.
+# hand-read off a plot -- so they can be overlaid on
+# analysis.plot_flux_profile_fit (or any future comparison plot) directly,
+# instead of re-derived by eye each time. See
+# halo_gas_correlation_literature_review.md Section 7 for the real-data
+# numbers these were checked against.
 # ---------------------------------------------------------------------
 def crossover_radius_twoexp(A1, h1, A2, h2):
     """Radius where the two-exponential model's two terms are equal:
@@ -1466,6 +1474,239 @@ def find_core_halo_boundary(fit_result, *, fallback_fit_result=None,
            "source": "none", "model": own_model}
 
 
+def diagnose_crossover_failures(boot, r_edges, r_fine, *, method="psf", R=None,
+                                gamma_fixed=0.8, fit_skip_inner=1, p0=None,
+                                nboot=None, seed=None, r_max_factor=20.0,
+                                verbose=True):
+    """
+    Classifies every bootstrap draw's expcore crossover OUTCOME, to answer
+    the question raised by analysis.bootstrap_fit_profile's n_no_crossover
+    count: when find_core_halo_boundary can't find a crossing for a draw,
+    is that because (a) the crossing genuinely exists but sits beyond
+    crossover_radius_expcore's default search bracket (r_max = max(50*h1,
+    5*r_c)) -- meaning the crossover_radius distribution bootstrap_fit_
+    profile reports is CENSORED, biased toward smaller values by silently
+    dropping the largest-crossover draws -- or (b) the fit put more
+    amplitude in the halo/power-law term than the core term even near
+    r~0, i.e. diff(r) = A1*exp(-r/h1) - A2*(1+(r/r_c)^2)^(-gamma/2) is
+    already negative at the bracket's own low edge -- a qualitatively
+    different degenerate solution that no amount of widening r_max will
+    fix, and that excluding IS the right call for.
+
+    These two failure modes are not the same thing and imply different
+    fixes: (a) says "widen r_max and rerun bootstrap_fit_profile" (the
+    reported crossover_radius_med is currently a lower bound, not the
+    true typical value); (b) says "these draws are fine to exclude from
+    the crossover_radius array, but check whether their fitted A1/h1/A2/
+    r_c cluster separately from the successful draws' -- that would mean
+    curve_fit is landing in a different local minimum on those draws, not
+    just sampling noise around the same answer."
+
+    Re-fits every draw itself -- same cost/loop as bootstrap_fit_profile.
+    This is a one-off diagnostic pass to run when investigating a
+    suspiciously high n_no_crossover rate, not something to run routinely
+    alongside it.
+
+    Classification per converged draw, evaluating diff(r) at the SAME
+    (lo=1e-3, hi=max(50*h1,5*r_c)) bracket crossover_radius_expcore uses:
+      'crossed'             : diff changes sign in (lo, hi) -- this draw
+                              already contributes to bootstrap_fit_
+                              profile's crossover_radius array; listed
+                              here too so the four counts sum to
+                              n_used - n_failed.
+      'censored_recovered'  : diff(lo)>0 and diff(hi)>0 (core still ahead
+                              at r_max), but widening the bracket to
+                              hi*r_max_factor DOES find a sign change --
+                              hypothesis (a) confirmed for this draw. Its
+                              recovered crossover radius is kept in
+                              censored_recovered_crossover.
+      'censored_unrecovered' : same diff(lo)>0, diff(hi)>0, but still no
+                              sign change even at the widened bracket --
+                              core dominates so completely (or A2 is so
+                              small) that no crossing exists in any
+                              physically reasonable range.
+      'inverted'             : diff(lo)<0 and diff(hi)<0 -- halo term
+                              already ahead of core at r~0. Widening
+                              r_max cannot change this (the sign at lo
+                              doesn't depend on r_max) -- hypothesis (b).
+
+    Parameters mirror analysis.bootstrap_fit_profile's (model is fixed to
+    "expcore" here since this failure mode doesn't apply to the closed-
+    form twoexp crossover). r_max_factor : how much wider than the
+    default bracket to search before calling a censored draw
+    'unrecovered' (default 20x -- generous; if 'censored_recovered'
+    crossings cluster near this new edge rather than comfortably inside
+    it, widen further and rerun).
+
+    Returns
+    -------
+    dict: n_used, n_failed, counts (per class), params (per class dict of
+    A1/h1/A2/r_c/gamma arrays -- compare distributions across classes,
+    e.g. via np.median/percentile, to see if 'inverted' draws are a
+    separate population or just the tail of the same one),
+    censored_recovered_crossover (recovered radii under the widened
+    bracket -- compare their median/spread against bootstrap_fit_
+    profile's reported crossover_radius_med to gauge how much censoring
+    is biasing that number), meta.
+    """
+    if method not in ("psf", "naive"):
+        raise ValueError(f"method must be 'psf' or 'naive' (got {method!r})")
+    if method == "psf" and R is None:
+        raise ValueError("method='psf' requires R (same ring_convolution_matrix "
+                         "used for the real bootstrap_fit_profile call).")
+    if "total_flux_all" not in boot or "total_flux_fid" not in boot:
+        raise KeyError("boot needs total_flux_all (nboot, nrad) and total_flux_fid.")
+
+    r_edges = np.asarray(r_edges, dtype=float)
+    r_fine = np.asarray(r_fine, dtype=float)
+    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
+
+    y_fid = np.asarray(boot["total_flux_fid"], dtype=float)
+    y_lo = np.asarray(boot["total_flux_lo"], dtype=float)
+    y_hi = np.asarray(boot["total_flux_hi"], dtype=float)
+    sigma = ((y_hi - y_fid) + (y_fid - y_lo)) / 2.0
+
+    flux_all = np.asarray(boot["total_flux_all"], dtype=float)
+    boot_meta = boot.get("meta", {}) or {}
+    n_available = flux_all.shape[0]
+    n_use = int(nboot) if nboot is not None else int(boot_meta.get("nboot", n_available))
+    n_use = min(n_use, n_available)
+
+    def _one_fit(y_row):
+        if method == "psf":
+            return fit_psf_aware_expcore(r_mid, y_row, sigma, R, r_fine, r_edges,
+                                         gamma_fixed=gamma_fixed, p0=p0, verbose=False)
+        return fit_naive_expcore(r_mid, r_edges, r_fine, y_row, sigma,
+                                 fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed,
+                                 p0=p0, verbose=False)
+
+    classes = ("crossed", "censored_recovered", "censored_unrecovered", "inverted")
+    params = {c: {p: [] for p in ("A1", "h1", "A2", "r_c", "gamma")} for c in classes}
+    censored_recovered_crossover = []
+    n_failed = 0
+
+    try:
+        from tqdm import tqdm
+        iterator = tqdm(range(n_use), disable=not verbose, desc="diagnose_crossover_failures")
+    except ImportError:
+        iterator = range(n_use)
+        if verbose:
+            print(f"diagnose_crossover_failures: refitting {n_use} draws "
+                  f"(tqdm not installed, no progress bar)")
+
+    for b in iterator:
+        result = _one_fit(flux_all[b])
+        if not result.get("success"):
+            n_failed += 1
+            continue
+        A1, h1, A2, r_c, gamma = (result["A1"], result["h1"], result["A2"],
+                                  result["r_c"], result["gamma"])
+
+        def diff(r, A1=A1, h1=h1, A2=A2, r_c=r_c, gamma=gamma):
+            return A1 * np.exp(-r / h1) - A2 * (1.0 + (r / r_c) ** 2) ** (-gamma / 2.0)
+
+        lo = 1e-3
+        hi = max(50.0 * h1, 5.0 * r_c)
+        f_lo, f_hi = diff(lo), diff(hi)
+
+        if f_lo * f_hi <= 0:
+            cls = "crossed"
+        elif f_lo > 0:  # both positive -- core still ahead throughout the default bracket
+            wide_hi = hi * r_max_factor
+            f_wide = diff(wide_hi)
+            if f_lo * f_wide <= 0:
+                cls = "censored_recovered"
+                censored_recovered_crossover.append(float(optimize.brentq(diff, lo, wide_hi)))
+            else:
+                cls = "censored_unrecovered"
+        else:  # both negative -- halo term already ahead of core at r~0
+            cls = "inverted"
+
+        for p, v in zip(("A1", "h1", "A2", "r_c", "gamma"), (A1, h1, A2, r_c, gamma)):
+            params[cls][p].append(v)
+
+    out = {"n_used": n_use, "n_failed": n_failed,
+          "counts": {c: len(params[c]["h1"]) for c in classes},
+          "params": {c: {p: np.asarray(v) for p, v in d.items()} for c, d in params.items()},
+          "censored_recovered_crossover": np.asarray(censored_recovered_crossover),
+          "meta": {"method": method, "gamma_fixed": gamma_fixed,
+                   "r_max_factor": r_max_factor, "nboot_used": n_use}}
+
+    if verbose:
+        print(f"diagnose_crossover_failures: {n_use - n_failed}/{n_use} converged "
+              f"({n_failed} failed fits)")
+        for c in classes:
+            print(f"  {c:>21} : {out['counts'][c]}")
+        if out["censored_recovered_crossover"].size:
+            arr = out["censored_recovered_crossover"]
+            print(f"  censored_recovered crossover radii (widened bracket): "
+                  f"median={np.median(arr):.3g}  "
+                  f"[{np.percentile(arr, 16):.3g}, {np.percentile(arr, 84):.3g}]")
+    return out
+
+
+def summarize_diagnosed_params(diag, params=("A1", "h1", "A2", "r_c", "gamma"), verbose=True):
+    """
+    Med/16/84 summary of a diagnose_crossover_failures() output's 'crossed'
+    class ONLY -- i.e. the same per-draw refit values analysis.
+    bootstrap_fit_profile already computed, but with 'inverted' (and any
+    'censored_unrecovered') draws excluded from EVERY parameter, not just
+    crossover_radius.
+
+    Why this is needed: bootstrap_fit_profile only filters crossover_radius
+    by whether a draw's own fit found a crossing -- h1/r_c/A2/gamma keep
+    every converged draw regardless, including 'inverted' ones (amplitude
+    ordering flipped: the fitted halo/power-law term A2 already exceeds
+    the core term A1 near r~0 -- see diagnose_crossover_failures). On a
+    split where 'inverted' is a large fraction (610/3000 = 20.3% on a
+    high-density subsample, vs 85/3000 = 2.8% on the paired low-density
+    one, in the run this was written for), the REPORTED h1/r_c bootstrap
+    med/16/84 is partly built from draws representing a different,
+    likely non-physical decomposition of the same data -- not just wider
+    noise around the same answer. This re-summarizes using only the
+    draws where the fit found a physically ordered (core-dominates-near-
+    center) solution, so the reported spread reflects noise on ONE
+    consistent decomposition instead of a blend of two.
+
+    Does no new fitting -- pure re-aggregation of
+    diag['params']['crossed'], which diagnose_crossover_failures already
+    collected during its own refit pass.
+
+    Parameters
+    ----------
+    diag : diagnose_crossover_failures's return dict.
+    params : which parameters to summarize (default all five expcore
+        params; crossover_radius isn't included here since
+        bootstrap_fit_profile's own crossover_radius array is already
+        'crossed'-only by construction).
+
+    Returns
+    -------
+    dict: n_crossed, n_total (n_used - n_failed, i.e. denominator
+    'crossed' is a fraction of), and {param}_med/_lo/_hi for each
+    requested param.
+    """
+    crossed = diag["params"]["crossed"]
+    out = {"n_crossed": int(crossed["h1"].size) if "h1" in crossed else 0,
+          "n_total": diag["n_used"] - diag["n_failed"]}
+    for p in params:
+        arr = crossed.get(p)
+        if arr is None or arr.size == 0:
+            out[f"{p}_med"] = out[f"{p}_lo"] = out[f"{p}_hi"] = float("nan")
+            continue
+        out[f"{p}_med"] = float(np.median(arr))
+        out[f"{p}_lo"] = float(np.percentile(arr, 16))
+        out[f"{p}_hi"] = float(np.percentile(arr, 84))
+    if verbose:
+        frac = out["n_crossed"] / out["n_total"] if out["n_total"] else float("nan")
+        print(f"summarize_diagnosed_params: {out['n_crossed']}/{out['n_total']} "
+              f"({frac:.1%}) draws physically ordered ('crossed') and used below")
+        for p in params:
+            print(f"  {p:>17} : med={out[f'{p}_med']:.3g}  "
+                  f"[{out[f'{p}_lo']:.3g}, {out[f'{p}_hi']:.3g}] (16/84)")
+    return out
+
+
 def sphere_of_influence_kpc(rvir_kpc, factor=7.0):
     """Sorini, Onorbe, Hennawi & Lukic 2018 (ApJ 859, 125)'s
     observationally-calibrated 'sphere of influence' scale: the mean Lya
@@ -1589,322 +1830,16 @@ def local_loglog_slope(r, y):
 
 
 # ---------------------------------------------------------------------
-# Notebook-testing convenience: same headline plot as
-# analysis.plot_flux_profile_fit, for the expcore model. Self-contained
-# (local matplotlib import, no dependency on analysis.py's private helpers)
-# so it doesn't create a circular import (analysis.py already imports this
-# module) and doesn't force a hard matplotlib dependency on the rest of
-# fitting.py, which is otherwise numpy/scipy only.
+# plot_expcore_fit removed 2026-07-18 -- superseded by
+# analysis.plot_flux_profile_fit(model="expcore"), which now does
+# everything this did (and, for the two-sample case,
+# analysis.plot_flux_profile_two(fit_model="expcore")) plus supports
+# model="twoexp" in the same call. This was a notebook-testing staging
+# area for the expcore model while it was still proposed/unvalidated;
+# now that it's earned its way in (compare_models_aic_bic, real-data
+# testing) and is the preferred model, it belongs in the same pipeline
+# entry point as the two-exponential fit, not a separate one.
 # ---------------------------------------------------------------------
-def plot_expcore_fit(
-    boot: dict,
-    r_edges=None,
-    method: str = "psf",
-    fit_skip_inner: int = 1,
-    gamma_fixed=0.8,
-    psf_r=None,
-    psf_vals=None,
-    psf_fwhm: float = 3.0,
-    psf_beta: float = 3.0,
-    p0=None,
-    r_fine=None,
-    logy: bool = True,
-    logx: bool = False,
-    xlims=None,
-    rvir_kpc=None,
-    show_crossover: bool = True,
-    show_sphere_of_influence: bool = True,
-    show_components: bool = True,
-    slope_frac: float = 0.9,
-    show_slope_diagnostic: bool = False,
-    compare_result=None,
-    figsize=(10, 5),
-    title=None,
-    verbose=True,
-):
-    """
-    NOTEBOOK-TESTING convenience for halo-flux-fitting.md Part 2 (Option
-    C). Deliberately mirrors analysis.plot_flux_profile_fit's call shape
-    (boot['total_flux_fid'] + bootstrap 16-84 error bars, method="psf"|
-    "naive", psf_r/psf_vals/psf_fwhm/psf_beta, p0, r_fine, logy, xlims,
-    figsize) so it's a drop-in swap while testing -- but fits/plots
-    intrinsic_profile_expcore instead of the shipped two-exponential, and
-    lives HERE rather than in analysis.py on purpose (Part 2 is proposed,
-    not validated -- analysis.py's plot_flux_profile_fit is untouched).
-
-    logx : False (default) -- linear radius axis, matching
-        analysis.plot_flux_profile_fit (which has no logx option at all).
-        Pass True for a log-x axis -- useful here specifically because this
-        model's whole point is the core-to-power-law TRANSITION around
-        r_c, which is usually squeezed into a couple of pixels on a linear
-        axis when bins span ~10 to ~1000+ kpc; log-x spreads the inner
-        bins out so the transition shape (and how it compares to the
-        two-exponential's h1/h2 break, if compare_result is given) is
-        actually visible. Safe here because r_mid is always > 0 (bin
-        midpoints of edges starting at r=0), so nothing has to be clipped
-        the way r_fine's r=0 point already is.
-
-    gamma_fixed : 0.8 (default) -- projected_slope_from_3d(1.8), the
-        Limber-projected z~2-3 clustering slope; see
-        fit_psf_aware_expcore's docstring for why floating gamma is not
-        the default (r_c/gamma degeneracy, AIC/BIC preferring two-exp
-        anyway). Pass None to let gamma float, or another literature value
-        -- e.g. LITERATURE_GAMMA_3D["z~2-3 galaxy clustering (typical)"]
-        (1.8, raw/unprojected) -- and compare fit_result['chi2'] to see
-        which the data actually prefers (open question 3 in the spec).
-    rvir_kpc : optional vertical reference line -- lets you see by eye
-        whether the fitted r_c sits near R_vir (open question 2: should
-        r_c be a free parameter, as it is here, or pinned to R_vir?).
-    show_crossover : True (default) -- if the fit(s) succeeded, mark the
-        radius where each model's two terms are equal
-        (crossover_radius_expcore for this fit, crossover_radius_twoexp
-        for compare_result if given). This is the actual "one-halo stops,
-        two-halo starts" radius -- a different, usually MUCH smaller
-        number than r_c itself; see crossover_radius_expcore's docstring.
-    show_sphere_of_influence : True (default) -- if rvir_kpc is given,
-        also mark Sorini et al. 2018's ~7x-R_vir "sphere of influence"
-        scale (sphere_of_influence_kpc) -- the literature comparison
-        point for r_c itself (not for the crossover radius above).
-    compare_result : optional fit_result dict from Part 1's fit_psf_aware /
-        fit_naive (the shipped two-exponential model, on the same bins) --
-        if given, its curve is overlaid and compare_models_aic_bic is
-        printed, so you can see whether Option C actually earns its extra
-        parameter(s) on your real data rather than just eyeballing two
-        separate plots.
-    show_components : True (default) -- overplot the core term
-        (A1*exp(-r/h1)) and the halo term (A2*(1+(r/r_c)^2)^(-gamma/2))
-        EACH ALONE, as dashed/dash-dot curves, in addition to the solid
-        combined curve already drawn. This is purely a visualization
-        addition -- it draws two more lines from the SAME fitted popt,
-        nothing about the fit itself changes. The point: added together,
-        it's easy to mistake the transition region for "the core
-        smoothly hands off to a genuine power law right around r_c" --
-        seeing the two terms separately makes it visually obvious that
-        one term is simply dying out while the other (which was already
-        present, just subdominant, at small r) takes over, and that r_c
-        is NOT the radius where the halo term itself starts looking like
-        a clean power law (see effective_slope_expcore's docstring). If
-        compare_result is also given, its two exponential terms are
-        overlaid the same way.
-    slope_frac : 0.9 (default) -- when show_components is True, also
-        marks the radius (radius_of_slope_fraction) where the halo
-        term's OWN local log-log slope first reaches slope_frac*gamma --
-        i.e. where the halo term actually starts looking like a genuine
-        power law of the fitted/fixed gamma, as opposed to r_c (which is
-        only the 50%-of-the-way point, always -gamma/2 in local slope,
-        by construction -- see radius_of_slope_fraction). Concretely
-        answers "is r_c the same as where this becomes a REAL (r/r0)^
-        -gamma power law?" -- no, this marker is, and it is typically
-        several times r_c out.
-    show_slope_diagnostic : False (default) -- add a second panel below
-        the main plot showing the TOTAL model's local log-log slope
-        (local_loglog_slope, numerical, on the combined core+halo curve)
-        vs radius, with horizontal reference lines at -0.8 (Limber-
-        projected z~2-3 clustering, projected_slope_from_3d(1.8)) and
-        -1.8 (raw 3D clustering slope, LITERATURE_GAMMA_3D). This is the
-        direct way to see whether/where the ACTUAL fitted profile's local
-        slope crosses either literature value, rather than assuming the
-        fitted gamma itself is the number to compare -- the core term's
-        contribution can shift the total curve's local slope away from
-        the halo term's own analytic slope, especially near the
-        core/halo crossover radius.
-
-    Returns (fig, ax, fit_result) -- fit_result is the dict from
-    fit_psf_aware_expcore / fit_naive_expcore. When show_slope_diagnostic
-    is True, ax is the tuple (ax_main, ax_slope) instead of a single Axes.
-    """
-    import matplotlib.pyplot as plt
-
-    if method not in ("psf", "naive"):
-        raise ValueError(f"method must be 'psf' or 'naive' (got {method!r})")
-    if "total_flux_fid" not in boot:
-        raise KeyError("boot does not contain total_flux_fid; re-run with "
-                       "compute_side_ratio=True (the default).")
-
-    radial_bins = np.asarray(r_edges if r_edges is not None else boot["r_edges"])
-    y = np.asarray(boot["total_flux_fid"], dtype=float)
-    y_lo = np.asarray(boot["total_flux_lo"], dtype=float)
-    y_hi = np.asarray(boot["total_flux_hi"], dtype=float)
-    sigma = ((y_hi - y) + (y - y_lo)) / 2.0
-
-    r_fine_arr = (np.asarray(r_fine, dtype=float) if r_fine is not None
-                 else default_fine_grid(radial_bins))
-    r_mid = 0.5 * (radial_bins[:-1] + radial_bins[1:])
-
-    if method == "psf":
-        if psf_r is not None and psf_vals is not None:
-            psf_r_use = np.asarray(psf_r, dtype=float)
-            psf_vals_use = np.asarray(psf_vals, dtype=float)
-        else:
-            psf_r_use = np.linspace(0.0, 20.0 * psf_fwhm, 400)
-            psf_vals_use = moffat_1d(psf_r_use, fwhm=psf_fwhm, beta=psf_beta)
-        R = ring_convolution_matrix(r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
-        fit_result = fit_psf_aware_expcore(r_mid, y, sigma, R, r_fine_arr, radial_bins,
-                                           gamma_fixed=gamma_fixed, p0=p0, verbose=verbose)
-        fit_result["R"] = R
-    else:
-        fit_result = fit_naive_expcore(r_mid, radial_bins, r_fine_arr, y, sigma,
-                                       fit_skip_inner=fit_skip_inner,
-                                       gamma_fixed=gamma_fixed, p0=p0, verbose=verbose)
-
-    fit_result.update({"method": method, "r_edges": radial_bins, "r_mid": r_mid,
-                       "r_fine": r_fine_arr, "y": y, "y_lo": y_lo, "y_hi": y_hi, "sigma": sigma})
-
-    if show_slope_diagnostic:
-        fig, (ax, ax_slope) = plt.subplots(
-            2, 1, figsize=(figsize[0], figsize[1] * 1.7), sharex=True,
-            gridspec_kw={"height_ratios": [2.2, 1], "hspace": 0.06})
-    else:
-        fig, ax = plt.subplots(figsize=figsize)
-        ax_slope = None
-
-    yerr = np.vstack([np.clip(y - y_lo, 0, None), np.clip(y_hi - y, 0, None)])
-    ax.errorbar(r_mid, y, yerr=yerr, fmt="o", capsize=3.5, ms=6, lw=1.5,
-                color="tab:blue", label="observed (bootstrap 16-84)", zorder=5)
-
-    if fit_result.get("success"):
-        popt = fit_result["popt"]
-        A1_f, h1_f, A2_f, r_c_f = popt[0], popt[1], popt[2], popt[3]
-        gamma_f = fit_result["gamma"]
-        params_for_curve = popt if gamma_fixed is None else np.append(popt, gamma_fixed)
-        chi2_txt = (f", $\\chi^2$/dof={fit_result['chi2']/max(fit_result['dof'],1):.2f}"
-                    if "chi2" in fit_result else "")
-        gtag = f"gamma={fit_result['gamma']:.2f}" + (" (fixed)" if fit_result["gamma_fixed"] else "")
-        total_curve = intrinsic_profile_expcore(r_fine_arr, *params_for_curve)
-        ax.plot(r_fine_arr, total_curve,
-                "-", color="tab:purple", lw=1.8, zorder=3,
-                label=(f"expcore fit (sum)  (h1={fit_result['h1']:.2g}, "
-                       f"r_c={fit_result['r_c']:.2g}, {gtag}{chi2_txt})"))
-        model_binned = binned_model_from_result_expcore(fit_result, r_fine_arr, radial_bins,
-                                                         fit_result.get("R"))
-        if model_binned is not None:
-            ax.plot(r_mid, model_binned, "D", color="tab:purple", ms=6, zorder=4,
-                    label="expcore predicted bin mean")
-
-        if show_components:
-            # Each term alone, from the SAME fitted popt -- no new fitting,
-            # purely a visualization of what's already been fit. Dashed for
-            # the core, dash-dot for the halo, both lighter/thinner than the
-            # solid combined curve so the sum still reads as "the fit."
-            core_curve = A1_f * np.exp(-r_fine_arr / h1_f)
-            halo_curve = A2_f * (1.0 + (r_fine_arr / r_c_f) ** 2) ** (-gamma_f / 2.0)
-            ax.plot(r_fine_arr, core_curve, "--", color="tab:purple", lw=1.3,
-                    alpha=0.65, zorder=2, label=f"  core alone (h1={h1_f:.2g})")
-            ax.plot(r_fine_arr, halo_curve, "-.", color="tab:purple", lw=1.3,
-                    alpha=0.65, zorder=2,
-                    label=f"  halo alone (r_c={r_c_f:.2g}, gamma={gamma_f:.2g})")
-            # r_c itself is ALWAYS the 50%-of-asymptotic-slope point, by
-            # construction (effective_slope_expcore(r_c)=-gamma/2) -- it is
-            # not "where this becomes a real power law." Mark the radius
-            # where the halo term's OWN local slope actually gets close
-            # (slope_frac, default 90%) to the asymptotic -gamma instead.
-            r_frac = radius_of_slope_fraction(r_c_f, gamma_f, frac=slope_frac)
-            ax.axvline(r_frac, color="tab:purple", ls=(0, (4, 1, 1, 1)), lw=1.2,
-                       alpha=0.8,
-                       label=(f"halo reaches {slope_frac*100:.0f}% of asymptotic "
-                              f"slope (-{gamma_f:.2g}) at r={r_frac:.0f}  "
-                              f"[r_c={r_c_f:.0f} itself is only the 50% point]"))
-    elif verbose:
-        print(f"plot_expcore_fit: fit FAILED -- {fit_result.get('reason')}")
-
-    if compare_result is not None and compare_result.get("success"):
-        cA1, ch1 = compare_result["A1"], compare_result["h1"]
-        cA2, ch2 = compare_result["A2"], compare_result["h2"]
-        ax.plot(r_fine_arr, intrinsic_profile(r_fine_arr, cA1, ch1, cA2, ch2),
-                "--", color="tab:green", lw=1.5, zorder=2,
-                label=(f"two-exp fit (sum) (h1={ch1:.2g}, h2={ch2:.2g})"))
-        if show_components:
-            ax.plot(r_fine_arr, cA1 * np.exp(-r_fine_arr / ch1), ":",
-                    color="tab:green", lw=1.2, alpha=0.6, zorder=1,
-                    label=f"  two-exp core alone (h1={ch1:.2g})")
-            ax.plot(r_fine_arr, cA2 * np.exp(-r_fine_arr / ch2), "-.",
-                    color="tab:green", lw=1.2, alpha=0.6, zorder=1,
-                    label=f"  two-exp halo alone (h2={ch2:.2g})")
-        if fit_result.get("success"):
-            compare_models_aic_bic(compare_result, fit_result, label_a="two-exp",
-                                   label_b="expcore", verbose=verbose)
-
-    if ax_slope is not None and fit_result.get("success"):
-        # Numerical local log-log slope of the TOTAL (core+halo) curve --
-        # not just the halo term's analytic slope -- since the core term's
-        # contribution can shift where the SUM actually reads as slope
-        # -0.8/-1.8, especially near the core/halo crossover radius.
-        pos = r_fine_arr > 0
-        slope_total = local_loglog_slope(r_fine_arr[pos], total_curve[pos])
-        ax_slope.plot(r_fine_arr[pos], slope_total, color="tab:purple", lw=1.6,
-                      label="total fitted profile, local slope")
-        ax_slope.plot(r_fine_arr[pos], effective_slope_expcore(r_fine_arr[pos], r_c_f, gamma_f),
-                      color="tab:purple", lw=1.1, ls=":", alpha=0.6,
-                      label="halo term alone, analytic slope")
-        ax_slope.axhline(-0.8, color="0.35", ls="--", lw=1.1,
-                         label="Limber-projected z~2-3 clustering (-0.8)")
-        ax_slope.axhline(-1.8, color="0.35", ls=":", lw=1.1,
-                         label="raw 3D clustering slope (-1.8)")
-        ax_slope.axhline(-gamma_f, color="tab:purple", ls="-.", lw=1.0, alpha=0.5,
-                         label=f"this fit's asymptotic slope (-{gamma_f:.2g})")
-        ax_slope.set_ylabel("local slope\n" + r"$d\ln I / d\ln r$")
-        ax_slope.legend(frameon=False, fontsize=7.5, loc="lower right")
-        ax_slope.grid(alpha=0.15)
-
-    if rvir_kpc is not None:
-        ax.axvline(rvir_kpc, color="0.4", ls=":", lw=1.2, label=f"R_vir = {rvir_kpc:.0f}")
-        if show_sphere_of_influence:
-            soi = sphere_of_influence_kpc(rvir_kpc)
-            ax.axvline(soi, color="0.4", ls="-.", lw=1.2,
-                       label=f"~7x R_vir sphere of influence (Sorini+18) = {soi:.0f}")
-
-    if show_crossover and fit_result.get("success"):
-        params_x = fit_result["popt"] if gamma_fixed is None else np.append(fit_result["popt"], gamma_fixed)
-        r_x = crossover_radius_expcore(*params_x)
-        if r_x is not None:
-            ax.axvline(r_x, color="tab:purple", ls=":", lw=1.3, alpha=0.8,
-                       label=f"expcore term1=term2 crossover = {r_x:.0f}")
-    if show_crossover and compare_result is not None and compare_result.get("success"):
-        r_x2 = crossover_radius_twoexp(compare_result["A1"], compare_result["h1"],
-                                       compare_result["A2"], compare_result["h2"])
-        if r_x2 is not None:
-            ax.axvline(r_x2, color="tab:green", ls=":", lw=1.3, alpha=0.8,
-                       label=f"two-exp term1=term2 crossover = {r_x2:.0f}")
-
-    ax.axhline(0, color="0.7", lw=0.7)
-    if logy:
-        pos = y[y > 0]
-        if len(pos):
-            ax.set_yscale("log")
-            ax.set_ylim(pos.min() * 0.3, y.max() * 3)
-    if logx:
-        ax.set_xscale("log")
-        if xlims is None:
-            # default log-x lower bound: half the innermost bin's midpoint,
-            # not 0 (log scale can't show r=0 anyway) -- avoids matplotlib's
-            # own auto-margin pushing the left edge to something silly.
-            ax.set_xlim(0.5 * r_mid[0], radial_bins[-1] * 1.2)
-    if xlims is not None:
-        ax.set_xlim(xlims)
-    r_unit = (boot.get("unit_info") or {}).get("r_unit", "")
-    unit = (boot.get("unit_info") or {}).get("y_unit", "")
-    xlabel_txt = f"radius [{r_unit}]" if r_unit else "radius"
-    if ax_slope is not None:
-        # shared x-axis: label goes on the bottom (slope) panel only, and
-        # the main panel's x tick labels are hidden so they don't repeat.
-        plt.setp(ax.get_xticklabels(), visible=False)
-        ax_slope.set_xlabel(xlabel_txt)
-        if logx:
-            ax_slope.set_xscale("log")
-    else:
-        ax.set_xlabel(xlabel_txt)
-    ax.set_ylabel(f"Integrated Lya flux [{unit}]" if unit else "Integrated Lya flux")
-    ax.set_title(title or (f"{'PSF-aware' if method == 'psf' else 'Naive'} exp-core + "
-                           f"cored-power-law fit (halo-flux-fitting.md Part 2 / Option C)"))
-    ax.legend(frameon=False, fontsize=8.5)
-    ax.grid(alpha=0.15)
-    plt.tight_layout()
-    plt.show()
-
-    if verbose:
-        describe_fit_expcore(fit_result, label=f"{method} expcore fit vs real data")
-
-    return fig, (ax, ax_slope) if ax_slope is not None else ax, fit_result
 
 
 # =======================================================================
@@ -2523,8 +2458,8 @@ def binned_model_from_result_uv_sersic(result, r_fine, r_edges, R=None):
 
 
 # ---------------------------------------------------------------------
-# Notebook-testing convenience: same headline plot as plot_expcore_fit
-# (Section 7), for Part 3's UV-continuum model(s). Takes plain
+# Notebook-testing convenience: same style of headline plot as
+# analysis.plot_flux_profile_fit, for Part 3's UV-continuum model(s). Takes plain
 # (r_edges, y, yerr) arrays rather than a Lya-pipeline `boot` dict, since
 # Part 3's extraction half (cutouts/centroiding/annuli/coaddition) isn't
 # built yet -- this lets the fit be tested against a synthetic profile or
@@ -2575,8 +2510,8 @@ def plot_uv_fit(
         star-based measurement only if no documented value is
         trustworthy). Replace it once a real number is in hand.
 
-    Returns (fig, ax, fit_result), mirroring plot_expcore_fit's return
-    shape.
+    Returns (fig, ax, fit_result), same shape as
+    analysis.plot_flux_profile_fit's return.
     """
     import matplotlib.pyplot as plt
 

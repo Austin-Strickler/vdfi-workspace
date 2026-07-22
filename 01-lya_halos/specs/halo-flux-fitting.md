@@ -12,9 +12,12 @@ validated the approach before it touched real data).
 (`utils_lya_halo/fitting.py`), now run against real data — the PSF-aware
 two-exponential fit gives **χ²/dof = 1.17, inner scale h1 ≈ 16–17 kpc**,
 outer h2 ≈ 1552 kpc; the inner scale is finalized and in the pipeline. Part 2
-(Option C — exponential core + cored power-law halo) remains an optional,
-not-started variant. Part 3 (UV-continuum radial decline from CFHT-LS r-band
-imaging) is now **implemented and validated** — the measured **UV scale length
+(Option C — exponential core + cored power-law halo, "expcore") is now
+**implemented, fit against real data, and promoted to the default model** —
+see the "As implemented" note at the top of Part 2 below for the real-data
+result and how each open question was actually resolved. Part 3
+(UV-continuum radial decline from CFHT-LS r-band imaging) is now
+**implemented and validated** — the measured **UV scale length
 ≈ 1.55 kpc** gives a **halo/UV scale ratio ≈ 10:1** — with its own settled
 workflow documented in the companion `uv-flux-fitting.md`.
 
@@ -114,7 +117,53 @@ Ultra Deep Field 5 Mpc filament result). See
 `halo_gas_correlation_literature_review.md` for the full literature
 comparison this result was checked against.
 
-## Part 2 — proposed extension: exponential core + cored power-law halo
+## Part 2 — exponential core + cored power-law halo ("expcore")
+
+**As implemented (2026-07-18), superseding "proposed extension" below.**
+The beta-model form sketched in this section (`I(r) = A1*exp(-r/h1) +
+A2*(1+(r/r_c)^2)^(-gamma/2)`) shipped as `fitting.py`'s
+`intrinsic_profile_expcore` / `fit_naive_expcore` / `fit_psf_aware_expcore`
+family, and was then promoted into `analysis.py` as the primary interface:
+`plot_flux_profile_fit`/`_two` take `model="expcore"` (now the **default**)
+or `model="twoexp"`, and the old `fitting.plot_expcore_fit`/
+`bootstrap_fit_expcore` were removed and generalized into
+`analysis.bootstrap_fit_profile` (works for either model, and is also the
+tool for refit-per-draw parameter uncertainty on `r_c`/`gamma`, which have
+no closed-form error otherwise). A real PSF-width bug (fits running ~3–4x
+too narrow) was caught and fixed during the promotion.
+
+How the open questions below actually resolved:
+- **Q1 (beta-model vs. multiplicative window):** beta-model, as drafted —
+  no need for the multiplicative alternative.
+- **Q2 (is `r_c` pinned to R_vir?):** no — `r_c` floats freely as a fit
+  parameter; `find_core_halo_boundary` (`fitting.py`) reads the *fitted*
+  crossover back out afterward and compares it to R_vir post hoc, rather
+  than the fit assuming they're equal.
+- **Q3 (does `gamma` float, or get fixed at a literature value?):** fixed,
+  not floating, and the default landed on the **projected** slope, not the
+  raw one — `gamma_fixed=0.8` (`projected_slope_from_3d(1.8)`, the
+  Limber-projected z~2–3 clustering slope), not the raw 3D `gamma=1.8`.
+  On real data, `r_c` and `gamma` are strongly degenerate when both float —
+  even on the highest-S/N full stack the free-`gamma` fit is essentially
+  unconstrained — so `gamma` is fixed by default (pass `gamma_fixed=None`
+  to float it anyway, or another literature value to test directly).
+- **Model comparison, done:** `compare_models_aic_bic` was run —
+  **AIC/BIC prefer the plain two-exponential model over expcore**, either
+  gamma choice. expcore is kept as the default in `analysis.py` for its
+  physical motivation (the outer term reads as an actual clustering/2-halo
+  profile, not just a second exponential that happens to cross over near
+  R_vir) rather than because it's the statistically preferred fit — worth
+  stating explicitly if this goes in the paper, since "default plotting
+  model" and "best-fitting model" are not the same claim here.
+- **Q5 (`_canonical_order`-equivalent needed?):** not revisited during the
+  promotion; the two expcore terms aren't swap-symmetric by construction
+  (per the original reasoning below), so this is presumed still moot, not
+  re-confirmed in code.
+- **Q4 (line-window depth vs. fiducial r0):** still open — not addressed by
+  the implementation.
+
+Original proposal text (Q1–Q5 numbering above refers to this) kept below
+for the reasoning trail:
 
 Motivated by a direct test: fitting a bare power law (slope pinned to
 −1.8, a literature 3D-correlation-style value) to the outer component fit

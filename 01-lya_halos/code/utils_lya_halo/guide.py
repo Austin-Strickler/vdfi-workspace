@@ -54,7 +54,8 @@ SECTIONS = {
     "measure":    ("Stage 3: centroids, integrated flux, asymmetry, and the "
                    "galaxy-bootstrap errors on them.",
                    ["Drivers", "Centroid estimators", "Flux & asymmetry",
-                    "Continuum", "Bootstrap", "Method comparison"]),
+                    "Continuum", "Bootstrap", "Method comparison",
+                    "Derived properties"]),
     "plotting":   ("Figures for stacks, radial profiles, and per-run "
                    "diagnostics.",
                    ["Stack spectra", "Radial profiles", "Two-sample overlays",
@@ -261,6 +262,14 @@ _ENTRIES = [
        "of percentiles. Bad (NaN/negative) bins warn and propagate rather "
        "than being hidden.",
        "cog = flux_curve_of_growth(boot, stacks)"),
+    _e("flux_curve_of_growth_annulus", "measure", "measure", "Flux & asymmetry",
+       "The area-correct sibling of flux_curve_of_growth: weights each bin's "
+       "surface-brightness value (total_flux_fid) by its OWN geometric "
+       "annulus area (pi*(r_out**2-r_in**2)) rather than one fixed "
+       "fiber-footprint area applied at every radius, so outer bins aren't "
+       "systematically under-weighted. Needs a stack built with "
+       "flux_unit='L_kpc2' (the default).",
+       "cog = flux_curve_of_growth_annulus(boot, stacks)"),
     _e("get_continuum_model", "measure", "measure", "Continuum",
        "The continuum model over the full grid from the sideband windows "
        "(median level or low-order poly). The one place the continuum is "
@@ -283,6 +292,46 @@ _ENTRIES = [
        "the S/N spectrum and any plot that needs an empirical per-pixel error "
        "band.",
        "err = bootstrap_stack_error(cube_flux, cube_err, nboot=1000)"),
+    _e("bootstrap_fit_profile", "analysis", "measure", "Bootstrap",
+       "Refit-per-draw parameter uncertainty for the two-component flux-"
+       "profile fit (h1/h2, or r_c/gamma for model='expcore'), as an "
+       "alternative to reading errors off one fiducial fit's covariance "
+       "matrix -- works for either model and generalizes the old "
+       "fitting.bootstrap_fit_expcore. Expensive (nboot separate nonlinear "
+       "fits); sanity-check with a small nboot first.",
+       "bf = bootstrap_fit_profile(boot, r_edges, r_fine, model='expcore', R=R)"),
+    _e("measure_core_halo_velocity", "measure", "measure", "Derived properties",
+       "Core velocity (innermost bin's centroid, unmodified) vs. halo "
+       "velocity (inv-var- or biweight-combined centroid beyond a "
+       "core/halo boundary_radius), plus their difference -- all with "
+       "bootstrap errors reusing boot's existing per-draw centroid arrays, "
+       "no new resampling. subsample-derived-properties.md Part 2.",
+       "vel = measure_core_halo_velocity(boot, boundary_radius)"),
+    _e("measure_halo_luminosity", "measure", "measure", "Derived properties",
+       "Integrated luminosity beyond a core/halo boundary_radius: each "
+       "outer bin's surface brightness times its OWN annulus area, summed "
+       "-- a genuine luminosity (erg/s), not a raw sum of surface-"
+       "brightness values. NOTE: despite the name, this zone is two-halo/"
+       "clustering-term dominated, not the galaxy's own CGM -- see "
+       "measure_onehalo_luminosity for the true one-halo zone. subsample-"
+       "derived-properties.md Part 3.",
+       "halo = measure_halo_luminosity(boot, boundary_radius)"),
+    _e("measure_outer_properties", "measure", "measure", "Derived properties",
+       "One-call bundle of everything needing NO new stacking/bootstrap "
+       "pass: measure_core_halo_velocity + measure_halo_luminosity, merged "
+       "into one dict. Deliberately excludes core luminosity "
+       "(measure_psf_corrected_core_luminosity), the one piece that DOES "
+       "need a fresh restacking pass.",
+       "props = measure_outer_properties(boot, boundary_radius)"),
+    _e("measure_psf_corrected_core_luminosity", "measure", "measure", "Derived properties",
+       "The core-side counterpart to measure_halo_luminosity: PSF-"
+       "aperture-corrects the innermost bin PER GALAXY (a fixed literature "
+       "Moffat converted to each galaxy's own kpc width via its z), "
+       "re-stacks, and returns a true luminosity (erg/s) for that bin -- "
+       "replaying boot's exact bootstrap seed/draw sequence so it's "
+       "ratio-safe against the halo side. subsample-derived-properties.md "
+       "Part 3, core side.",
+       "core = measure_psf_corrected_core_luminosity(cfg, product, stacks, boot)"),
     _e("compare_centroid_methods", "analysis", "measure", "Method comparison",
        "Point estimates (no bootstrap) from all standard estimators on the "
        "fiducial stack, as a printed table. The fastest way to see how much the "
