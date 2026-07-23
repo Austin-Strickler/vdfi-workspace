@@ -382,6 +382,11 @@ def validate_ring_convolution(psf_r=None, psf_vals=None, verbose=True):
 
 def _fine_ring_flux(r_fine, A1, h1, A2, h2):
     """
+    DEPRECATED 2026-07-22 -- no longer used by any shipped model. This is
+    the OLD 1-D convention (profile*dr, no 2*pi*r); see the block comment
+    above bin_average_no_psf for why it was wrong and what replaced it
+    (_fine_ring_flux_2d). Retained only to reproduce pre-fix numbers.
+
     The actual flux carried by the true radial shell at each r_fine
     sample: intrinsic_profile(r) treated as dF/dr (flux per unit radius --
     the natural reading given the real data product here is already a 1D
@@ -429,37 +434,178 @@ def _bin_integrate(r_fine, r_edges, A1, h1, A2, h2):
 
 
 def _bin_widths(r_edges):
-    """Width of each observed bin, r_edges[i+1]-r_edges[i]."""
+    """Width of each observed bin, r_edges[i+1]-r_edges[i]. LEGACY -- kept
+    only for the deprecated width-convention helpers; the shipped models
+    normalize by _annulus_areas instead (see the block comment below)."""
     e = np.asarray(r_edges, dtype=float)
     return e[1:] - e[:-1]
+
+
+def _annulus_areas(r_edges):
+    """Geometric area pi*(r_out^2 - r_in^2) of each annulus. The PSF forward
+    model redistributes real 2-D FLUX between annuli, so its per-bin flux is
+    converted to a per-bin mean SURFACE BRIGHTNESS by dividing by annulus
+    AREA -- NOT by radial bin width (that leaves a stray ~2*pi*r factor)."""
+    e = np.asarray(r_edges, dtype=float)
+    return np.pi * (e[1:] ** 2 - e[:-1] ** 2)
+
+
+def _segment_bounds(r_edges, r_max):
+    """The observed bins, plus the tail segment beyond the outermost edge
+    that default_fine_grid adds (flux out there still gets smeared back
+    into the observed range by the PSF, so it must carry weight too)."""
+    e = np.asarray(r_edges, dtype=float)
+    bounds = list(zip(e[:-1], e[1:]))
+    if r_max > e[-1]:
+        bounds.append((e[-1], r_max))
+    return bounds
+
+
+def _segment_weights(r_fine, r_edges):
+    """
+    Per-point radial quadrature weights dr, built as a COMPOSITE TRAPEZOID
+    RULE WITHIN EACH BIN SEPARATELY rather than a single np.gradient across
+    the whole grid.
+
+    Why this matters (fixed 2026-07-22): default_fine_grid deliberately
+    gives each observed bin its own linspace, so the grid SPACING JUMPS at
+    every bin edge (checked on the real 12-bin scheme: up to 2.5x between
+    adjacent bins). np.gradient is a central difference, so a point sitting
+    on a bin edge got a weight averaging the spacing on BOTH sides -- too
+    large for the narrow bin, too small for the wide one. Worse, the shared
+    edge point is a single grid point, so _bin_integrate_2d's np.add.at
+    assigned its entire weight to one bin, and the lower bin silently lost
+    its outer endpoint -- exactly where its 2*pi*r weighting is largest.
+
+    Building the weights per segment fixes both: each bin gets a proper
+    trapezoid rule over its own sub-grid including both endpoints, and a
+    shared edge point naturally collects a half-interval from each side.
+    Measured on the real bin scheme: innermost-bin error against exact
+    quadrature drops from 2.77% to 0.06% at the SAME n_per_bin=30 -- i.e.
+    better than n_per_bin=100 (0.81%) at no extra cost at all.
+    """
+    r_fine = np.asarray(r_fine, dtype=float)
+    w = np.zeros_like(r_fine)
+    for lo, hi in _segment_bounds(r_edges, float(r_fine[-1])):
+        m = np.where((r_fine >= lo) & (r_fine <= hi))[0]
+        if m.size == 0:
+            continue
+        rr = r_fine[m]
+        if m.size == 1:
+            w[m[0]] += hi - lo
+            continue
+        d = np.empty(rr.size)
+        d[1:-1] = (rr[2:] - rr[:-2]) / 2.0
+        d[0] = (rr[1] - rr[0]) / 2.0 + (rr[0] - lo)
+        d[-1] = (rr[-1] - rr[-2]) / 2.0 + (hi - rr[-1])
+        w[m] += d
+    return w
+
+
+def _fine_ring_flux_2d(profile_fn, r_fine, params, r_edges=None):
+    """
+    2-D ring flux of an intrinsic profile: profile(r) * 2*pi*r * dr -- the
+    actual FLUX carried by a thin annulus of surface brightness profile(r)
+    and width dr at radius r. THIS is what ring_convolution_matrix's R (a
+    flux-redistribution operator whose output is already weighted by the
+    destination annulus' 2*pi*rho) must be applied to. The circumference
+    factor is required, not optional -- see the block comment below.
+
+    r_edges : when given (all shipped callers do), the dr weights come from
+        _segment_weights -- a per-bin composite trapezoid rule, correct
+        across default_fine_grid's spacing jumps. Falls back to np.gradient
+        when omitted, which is the older, measurably worse rule; see
+        _segment_weights' docstring.
+    """
+    r_fine = np.asarray(r_fine, dtype=float)
+    dr = (np.gradient(r_fine) if r_edges is None
+          else _segment_weights(r_fine, r_edges))
+    return profile_fn(r_fine, *params) * (2.0 * np.pi * r_fine) * dr
+
+
+def _bin_integrate_2d(profile_fn, r_fine, r_edges, params):
+    """
+    No-PSF analogue of R @ _fine_ring_flux_2d: the 2-D flux of the intrinsic
+    profile within each coarse bin (no redistribution -- that's what R is
+    for). Integrates each bin over its OWN sub-grid with np.trapezoid,
+    including both bin endpoints explicitly, instead of summing per-point
+    weights into bins (which dropped each bin's outer endpoint; see
+    _segment_weights).
+    """
+    r_fine = np.asarray(r_fine, dtype=float)
+    e = np.asarray(r_edges, dtype=float)
+    n_bins = len(e) - 1
+    result = np.zeros(n_bins)
+    for b in range(n_bins):
+        lo, hi = e[b], e[b + 1]
+        rr = r_fine[(r_fine >= lo) & (r_fine <= hi)]
+        if rr.size == 0 or rr[0] > lo:
+            rr = np.concatenate(([lo], rr))
+        if rr[-1] < hi:
+            rr = np.concatenate((rr, [hi]))
+        if rr.size < 2:
+            continue
+        result[b] = _trapz(profile_fn(rr, *params) * 2.0 * np.pi * rr, rr)
+    return result
 
 
 # ---------------------------------------------------------------------
 # AVERAGE (not summed) per-bin model.
 #
 # The real data value in each bin is the biweight AVERAGE of the stacked
-# fiber fluxes in that annulus -- a representative flux(r), NOT the total
-# flux summed over the annulus. So the model prediction for a bin must be
-# the bin *mean* of the profile, = (1/width) * integral over the bin, not
-# the raw integral. Dividing the integrated quantities above by the bin
-# width converts them:
-#   * bin_average_no_psf : mean of the intrinsic profile over each bin.
-#   * bin_average_psf    : mean of the PSF-SMEARED profile over each bin
+# fiber fluxes in that annulus -- a representative surface brightness, NOT
+# the total flux summed over the annulus. So the model prediction for a bin
+# must be the AREA-WEIGHTED bin mean of the 2-D profile:
+#
+#     model_i = (R @ [I(r) * 2*pi*r * dr]) / (pi*(r_out^2 - r_in^2))
+#
+#   * bin_average_no_psf : area-weighted mean of the intrinsic profile.
+#   * bin_average_psf    : area-weighted mean of the PSF-SMEARED profile
 #                          (R still carries the ring-convolution geometry;
-#                          we only re-normalize its per-bin integral to a
-#                          per-bin mean).
-# Doing it this way keeps the validated ring-convolution / flux-conservation
-# machinery untouched -- R is still "integrated fraction of a unit-flux
-# ring"; the averaging is a single, explicit /width at the model level.
+#                          only the input flux weighting and the output
+#                          normalization live here, at the model level).
+#
+# CORRECTED 2026-07-22. The previous version computed
+#
+#     model_i = (R @ [I(r) * dr]) / (r_out - r_in)
+#
+# which is neither a 2-D flux (the input ring flux was missing its 2*pi*r
+# circumference) NOR a surface brightness (dividing flux by radial width
+# instead of annulus area leaves a stray ~2*pi*r factor that GROWS with
+# radius). The net effect is a radial ramp that suppresses the center and
+# pushes the model's peak outward -- harmless-looking for a narrow PSF
+# (R barely mixes radii, so the two errors largely cancel within a bin) but
+# catastrophic once a realistically WIDE PSF makes R mix flux across radii.
+#
+# This is the SAME defect that was found and fixed in the UV path (see
+# bin_average_psf_uv_exp); the fix was simply never back-ported here.
+# Verified against a brute-force 2-D image convolution + azimuthal average
+# (psf_forensics.py, Test 1): the corrected form agrees to <1% at both 1.3"
+# and 2.4" PSF FWHM, while the old form was off by 51% and 96% respectively,
+# with the error growing monotonically with PSF width. Under the old form a
+# single-exponential fit at 2.4" collapsed to h -> 0; under the corrected
+# form h is stable (15.1 kpc at 1.3", 12.0 kpc at 2.4", chi2/dof ~ 1.1-1.4)
+# across an assumed-FWHM sweep from 1.0" to 3.0".
+#
+# NOTE: the fitted amplitudes A1/A2 are now central SURFACE BRIGHTNESSES
+# (per unit area) rather than the old per-unit-radius quantity, so absolute
+# amplitudes from pre-fix fits are NOT comparable to post-fix ones. Scale
+# lengths, crossover radii and amplitude RATIOS are the comparable outputs.
+# R itself (ring_convolution_matrix) is unchanged and still validated by
+# validate_ring_convolution.
 # ---------------------------------------------------------------------
 def bin_average_no_psf(r_fine, r_edges, A1, h1, A2, h2):
-    """Mean intrinsic flux in each bin (NO PSF): _bin_integrate / bin width."""
-    return _bin_integrate(r_fine, r_edges, A1, h1, A2, h2) / _bin_widths(r_edges)
+    """Area-weighted mean intrinsic surface brightness in each bin, NO PSF."""
+    return (_bin_integrate_2d(intrinsic_profile, r_fine, r_edges, (A1, h1, A2, h2))
+            / _annulus_areas(r_edges))
 
 
 def bin_average_psf(R, r_fine, r_edges, A1, h1, A2, h2):
-    """Mean PSF-smeared flux in each bin: (R @ fine_flux) / bin width."""
-    return (R @ _fine_ring_flux(r_fine, A1, h1, A2, h2)) / _bin_widths(r_edges)
+    """Area-weighted mean PSF-smeared surface brightness in each bin:
+    (R @ 2-D ring flux) / annulus area."""
+    return (R @ _fine_ring_flux_2d(intrinsic_profile, r_fine, (A1, h1, A2, h2),
+                            r_edges=r_edges)
+            ) / _annulus_areas(r_edges)
 
 
 # =======================================================================
@@ -836,7 +982,10 @@ def intrinsic_profile_expcore(r, A1, h1, A2, r_c, gamma):
 
 
 def _fine_ring_flux_expcore(r_fine, A1, h1, A2, r_c, gamma):
-    """Same role as _fine_ring_flux (Part 1): flux per r_fine sample =
+    """DEPRECATED 2026-07-22 (old 1-D convention, replaced by
+    _fine_ring_flux_2d -- see bin_average_no_psf's block comment).
+
+    Same role as _fine_ring_flux (Part 1): flux per r_fine sample =
     intrinsic_profile_expcore treated as dF/dr, times local grid spacing
     dr. This, not the raw profile values, is what ring_convolution_matrix's
     R redistributes -- see _fine_ring_flux's docstring for why."""
@@ -860,93 +1009,137 @@ def _bin_integrate_expcore(r_fine, r_edges, A1, h1, A2, r_c, gamma):
 
 
 def bin_average_no_psf_expcore(r_fine, r_edges, A1, h1, A2, r_c, gamma):
-    """Mean intrinsic (expcore) flux in each bin, NO PSF -- same
-    divide-by-bin-width convention as Part 1's bin_average_no_psf, per
-    halo-flux-fitting.md Part 2's note that the average-vs-summed question
-    is already answered by Part 1 and needs no new work here."""
-    return _bin_integrate_expcore(r_fine, r_edges, A1, h1, A2, r_c, gamma) / _bin_widths(r_edges)
+    """Area-weighted mean intrinsic (expcore) surface brightness in each
+    bin, NO PSF -- same corrected 2-D-flux / annulus-area convention as
+    Part 1's bin_average_no_psf (see the block comment there for why the
+    old divide-by-bin-width form was wrong)."""
+    return (_bin_integrate_2d(intrinsic_profile_expcore, r_fine, r_edges,
+                              (A1, h1, A2, r_c, gamma))
+            / _annulus_areas(r_edges))
 
 
 def bin_average_psf_expcore(R, r_fine, r_edges, A1, h1, A2, r_c, gamma):
-    """Mean PSF-smeared (expcore) flux in each bin: (R @ fine_flux) / bin
-    width. R is the SAME ring_convolution_matrix used for Part 1's model --
-    it depends only on (r_fine, r_edges, psf_r, psf_vals), never on the
-    intrinsic profile's functional form, so it's reused completely
-    unchanged here (see halo-flux-fitting.md Part 2, 'Reuses the existing
-    machinery almost unchanged')."""
-    return (R @ _fine_ring_flux_expcore(r_fine, A1, h1, A2, r_c, gamma)) / _bin_widths(r_edges)
+    """Area-weighted mean PSF-smeared (expcore) surface brightness in each
+    bin: (R @ 2-D ring flux) / annulus area.
+
+    CORRECTED 2026-07-22 -- see the block comment above bin_average_no_psf
+    for the full account (missing 2*pi*r on input, bin width instead of
+    annulus area on output, error growing with PSF width, verified against
+    a brute-force 2-D convolution). This is the function whose old form
+    produced the h1 -> 0 collapse and chi2/dof ~ 2 plateau at a 2.4" PSF.
+
+    R is the SAME ring_convolution_matrix used for Part 1's model -- it
+    depends only on (r_fine, r_edges, psf_r, psf_vals), never on the
+    intrinsic profile's functional form, and is unchanged by this fix."""
+    return (R @ _fine_ring_flux_2d(intrinsic_profile_expcore, r_fine,
+                                   (A1, h1, A2, r_c, gamma), r_edges=r_edges)
+            ) / _annulus_areas(r_edges)
 
 
-def _default_seeds_expcore(r, y, *, gamma_fixed=None, r_c_guess=None):
-    """Candidate (A1,h1,A2,r_c[,gamma]) seeds for the expcore model. Reuses
-    _seed_from_split for the core term (A1,h1) exactly as Part 1 does; the
-    outer term's amplitude is seeded from the same split, and r_c from the
-    split radius itself (a genuine free parameter here, not a hand-picked
-    cutoff -- see spec).
+def _legacy_p0_to_seed(p0, scale, *, r_c_fixed=400.0, gamma_fixed=0.8, f_max=0.999):
+    """Convert a legacy (A1, h1, A2, r_c[, gamma]) p0 -- the format this
+    module's `p0` argument has always documented, and every existing
+    caller (plot_flux_profile_fit/_two's `p0`/`fit_p0`, notebooks) still
+    supplies in physical units -- into the internal (a1, h1, f, [r_c],
+    [gamma]) seed vector fit_naive_expcore/fit_psf_aware_expcore now
+    optimize over as of the 2026-07-21 A2=f*A1 reparametrization. Keeping
+    p0's INPUT format unchanged (rather than pushing the internal
+    reparametrization onto every caller) is deliberate -- callers
+    shouldn't need to know or replicate this module's internal `scale`
+    normalization just to supply a starting guess.
+
+    p0[3] (r_c) is read only if r_c_fixed is None (dropped otherwise,
+    since r_c isn't part of the free vector when it's fixed); p0[-1]
+    (gamma) likewise only if gamma_fixed is None."""
+    A1, h1, A2 = p0[0], p0[1], p0[2]
+    f = float(np.clip(A2 / A1 if A1 > 0 else 0.05, 1e-4, f_max * 0.9))
+    row = [A1 / scale, h1, f]
+    if r_c_fixed is None:
+        row.append(p0[3])
+    if gamma_fixed is None:
+        row.append(p0[-1])
+    return row
+
+
+def _default_seeds_expcore(r, y, scale, *, gamma_fixed=None, r_c_fixed=400.0,
+                            r_c_guess=None, f_max=0.999):
+    """Candidate (a1, h1, f, [r_c], [gamma]) seeds for the expcore model,
+    already in the units _model_masked optimizes over (a1 pre-divided by
+    `scale`; f is the A2=f*A1 fraction -- see fit_psf_aware_expcore's
+    docstring for why A2 is reparametrized this way as of 2026-07-21).
+    Reuses _seed_from_split for the core term (A1,h1) exactly as Part 1
+    does; f is seeded from that same split's A2 guess, converted to a
+    fraction of A1 and clipped into (0, f_max).
+
+    r_c_fixed=None (r_c floats): seeds a couple of r_c variants around the
+    split-radius guess, same spirit as the old r_c-varies-per-seed list.
+    r_c_fixed=<float> (the new default, 400.0): r_c isn't part of the seed
+    vector at all.
 
     gamma_fixed=None (gamma floats): seeds a spread of literature-motivated
     starting slopes -- 1.8 (typical z~2-3 3D galaxy-clustering slope), 0.8
-    (that same slope fully projected via Limber, see
-    projected_slope_from_3d), and 1.3 splitting the difference -- plus one
-    seed with a wider r_c, rather than a single arbitrary guess. Two
-    exp-core fits on sparse bins can be just as seed-sensitive as Part 1's
-    two-exponential fits (per spec's discussion of r_c/gamma trading off
-    non-Gaussian-ly), so this follows the same multi-seed philosophy.
+    (that same slope fully projected via Limber), 1.3 splitting the
+    difference. gamma_fixed=<float> (the default, 0.8): gamma isn't part of
+    the seed vector.
 
-    gamma_fixed=<float> (gamma held fixed, e.g. to directly test 1.8 vs 0.8
-    -- open question 3 in the spec): only A1,h1,A2,r_c are free, so seeds
-    just vary r_c around the split-radius guess.
-    """
+    f_max caps every f seed at f_max*0.9 (kept strictly inside the [0,f_max]
+    bound so no seed starts pinned at the boundary)."""
     r = np.asarray(r, dtype=float)
     y = np.clip(np.asarray(y, dtype=float), 1e-6, None)
     n = len(r)
     i_mid = max(1, n // 2)
     A1_0, h1_0, A2_0, _ = _seed_from_split(r, y, i_mid)
     A2_0 = max(A2_0, 1e-3)
+    f_cap = f_max * 0.9
+    f_0 = float(np.clip(A2_0 / A1_0 if A1_0 > 0 else 0.05, 1e-4, f_cap))
     if r_c_guess is None:
         r_c_guess = max(float(r[i_mid]), 1.0)
+    a1_0 = A1_0 / scale
 
-    if gamma_fixed is not None:
-        return [
-            [A1_0, h1_0, A2_0, r_c_guess],
-            [A1_0, h1_0, A2_0, r_c_guess * 0.5],
-            [A1_0, h1_0, A2_0, r_c_guess * 2.0],
-        ]
-    return [
-        [A1_0, h1_0, A2_0, r_c_guess, 0.8],
-        [A1_0, h1_0, A2_0, r_c_guess, 1.8],
-        [A1_0, h1_0, A2_0, r_c_guess, 1.3],
-        [A1_0, h1_0, A2_0, r_c_guess * 2.0, 1.3],
-        # extra r_c variants anchored at gamma=0.8 specifically: real-data
-        # testing (see conversation/usage notes) found the free-gamma fit
-        # can land in a WORSE local minimum than the gamma=0.8-fixed fit
-        # even though the fixed case is a feasible point of the free
-        # search -- a genuine r_c/gamma degeneracy on sparse bins, not a
-        # hypothetical one (matches the spec's own warning that these two
-        # parameters are more prone to trading off non-Gaussian-ly than
-        # h1/h2 are). These two extra starting points make it more likely
-        # a seed already sits close to that basin.
-        [A1_0, h1_0, A2_0, r_c_guess * 0.5, 0.8],
-        [A1_0, h1_0, A2_0, r_c_guess * 2.0, 0.8],
-    ]
+    def _s(f_v, r_c_v=None, gamma_v=None):
+        row = [a1_0, h1_0, f_v]
+        if r_c_fixed is None:
+            row.append(r_c_guess if r_c_v is None else r_c_v)
+        if gamma_fixed is None:
+            row.append(0.8 if gamma_v is None else gamma_v)
+        return row
+
+    seeds = [_s(f_0)]
+    if r_c_fixed is None:
+        seeds.append(_s(f_0, r_c_v=r_c_guess * 0.5))
+        seeds.append(_s(f_0, r_c_v=r_c_guess * 2.0))
+    for f_v in (min(0.01, f_cap), min(0.05, f_cap), min(0.2, f_cap)):
+        seeds.append(_s(f_v))
+    if gamma_fixed is None:
+        seeds.append(_s(f_0, gamma_v=1.8))
+        seeds.append(_s(f_0, gamma_v=1.3))
+    return seeds
 
 
-def _data_driven_bounds_expcore(r_fit, y_fit, *, gamma_fixed=None, gamma_bounds=(0.3, 3.5)):
-    """Same data-scaled philosophy as Part 1's _data_driven_bounds (see its
-    docstring for why blanket (0, inf) bounds let sparse/noisy fits wander
-    into numerically-degenerate solutions), extended with r_c > 0 (bounded
-    away from zero -- a genuine transition-scale parameter, not a
-    hand-picked cutoff per the spec's core objection to a bare power law)
-    and gamma constrained to a physically sane range. Default gamma_bounds
-    (0.3, 3.5) brackets both literature comparison points discussed in the
-    spec -- ~0.8 (fully projected) and ~1.8 (raw 3D) -- with headroom
-    either side rather than pinning the box to exactly those two numbers.
-    """
+def _data_driven_bounds_expcore(r_fit, y_fit, scale, *, gamma_fixed=None, r_c_fixed=400.0,
+                                gamma_bounds=(0.3, 3.5), f_max=0.999):
+    """Bounds for the internal (a1, h1, f, [r_c], [gamma]) free-parameter
+    vector, already divided by `scale` where relevant so the result is
+    ready to hand straight to curve_fit as `bounds=`.
+
+    f in [0, f_max] (default f_max=0.999) is what structurally enforces
+    A1>A2 -- see fit_psf_aware_expcore's docstring for why this replaced
+    an unconstrained A2 as of 2026-07-21 (diagnose_crossover_failures found
+    A2 could exceed A1 near r~0 on a real, non-negligible fraction of
+    bootstrap draws, especially on noisier subsample splits).
+
+    r_c/gamma bounds are the same data-scaled philosophy as Part 1's
+    _data_driven_bounds (see its docstring) when floated; omitted from the
+    returned bounds entirely when fixed (r_c_fixed/gamma_fixed not None)."""
     amp_max = max(50.0 * np.max(np.abs(y_fit)), 1.0)
     h_max = max(10.0 * (np.max(r_fit) - np.min(r_fit)), 10.0)
     rc_min = max(1e-3, 0.01 * np.min(r_fit))
-    lower = [0.0, 1e-3, 0.0, rc_min]
-    upper = [amp_max, h_max, amp_max, h_max]
+
+    lower = [0.0, 1e-3, 0.0]
+    upper = [amp_max / scale, h_max, f_max]
+    if r_c_fixed is None:
+        lower.append(rc_min)
+        upper.append(h_max)
     if gamma_fixed is None:
         lower.append(gamma_bounds[0])
         upper.append(gamma_bounds[1])
@@ -954,32 +1147,77 @@ def _data_driven_bounds_expcore(r_fit, y_fit, *, gamma_fixed=None, gamma_bounds=
 
 
 def _pack_result_expcore(success, popt=None, pcov=None, reason=None, mask=None,
-                          gamma_fixed=None, extra=None):
+                          gamma_fixed=None, r_c_fixed=400.0, scale=1.0, extra=None):
     """Same role as Part 1's _pack_result, for the (A1,h1,A2,r_c,gamma)
-    parameter set. When gamma_fixed is not None, gamma isn't a free
-    parameter of the fit -- it's still reported (as the value it was fixed
-    to) with gamma_err=0.0 and gamma_fixed=True in the result, so
-    describe_fit_expcore / downstream code doesn't need a separate code
-    path to know whether gamma floated."""
+    parameter set.
+
+    As of 2026-07-21, the fit is internally reparametrized as
+    (a1, h1, f, [r_c], [gamma]) -- A1=a1*scale, A2=f*A1 with f bounded in
+    [0,f_max] to structurally forbid A2 exceeding A1 near r~0 ("inverted"
+    solutions -- see fit_psf_aware_expcore's docstring for the full
+    rationale and docs/research-notes.md "Expcore fit stability" for the
+    investigation that motivated it). r_c_fixed mirrors gamma_fixed's
+    existing None-means-free convention (both still reported, with
+    _err=0.0, when held fixed for this particular fit -- same pattern
+    gamma_fixed already used).
+
+    `popt`/`pcov` passed in here are the RAW internal (a1,h1,f,[r_c],
+    [gamma]) optimizer output, in `scale` units for a1. This function
+    reconstructs and returns popt in the ORIGINAL (A1,h1,A2,r_c[,gamma])
+    layout (gamma appended only when gamma_fixed is not None -- unchanged
+    from before the reparametrization) purely so existing callers that
+    unpack fit_result['popt'] positionally (analysis.py's
+    plot_flux_profile_fit/_two, compare_models_aic_bic) don't need to know
+    the fit is internally reparametrized. pcov in that legacy layout isn't
+    recoverable without a full Jacobian, so it's set to None here -- use
+    the per-parameter *_err fields below (A2_err is delta-method propagated
+    from Cov(a1,f)) or, for real uncertainty, bootstrap_fit_profile."""
     if not success:
         return {"success": False, "reason": reason}
+
+    idx = {"a1": 0, "h1": 1, "f": 2}
+    next_i = 3
+    if r_c_fixed is None:
+        idx["r_c"] = next_i
+        next_i += 1
     if gamma_fixed is None:
-        perr = (np.sqrt(np.diag(pcov)) if pcov is not None and np.all(np.isfinite(pcov))
-                else np.full(5, np.nan))
-        A1, h1, A2, r_c, gamma = popt
-        gamma_err = perr[4]
+        idx["gamma"] = next_i
+        next_i += 1
+
+    a1, h1, f = popt[idx["a1"]], popt[idx["h1"]], popt[idx["f"]]
+    r_c = popt[idx["r_c"]] if "r_c" in idx else r_c_fixed
+    gamma = popt[idx["gamma"]] if "gamma" in idx else gamma_fixed
+
+    A1 = a1 * scale
+    A2 = f * A1
+
+    have_cov = pcov is not None and np.all(np.isfinite(pcov))
+    if have_cov:
+        var_a1 = pcov[idx["a1"], idx["a1"]] * scale ** 2
+        var_f = pcov[idx["f"], idx["f"]]
+        cov_a1f = pcov[idx["a1"], idx["f"]] * scale
+        A1_err = float(np.sqrt(max(var_a1, 0.0)))
+        # delta method: A2 = f*A1 -> Var(A2) = f^2*Var(A1) + A1^2*Var(f) + 2*f*A1*Cov(A1,f)
+        var_A2 = f ** 2 * var_a1 + A1 ** 2 * var_f + 2.0 * f * A1 * cov_a1f
+        A2_err = float(np.sqrt(max(var_A2, 0.0)))
+        h1_err = float(np.sqrt(max(pcov[idx["h1"], idx["h1"]], 0.0)))
+        r_c_err = float(np.sqrt(max(pcov[idx["r_c"], idx["r_c"]], 0.0))) if "r_c" in idx else 0.0
+        gamma_err = float(np.sqrt(max(pcov[idx["gamma"], idx["gamma"]], 0.0))) if "gamma" in idx else 0.0
     else:
-        perr = (np.sqrt(np.diag(pcov)) if pcov is not None and np.all(np.isfinite(pcov))
-                else np.full(4, np.nan))
-        A1, h1, A2, r_c = popt
-        gamma = gamma_fixed
-        gamma_err = 0.0
+        A1_err = A2_err = h1_err = float("nan")
+        r_c_err = float("nan") if "r_c" in idx else 0.0
+        gamma_err = float("nan") if "gamma" in idx else 0.0
+
+    popt_legacy = (np.array([A1, h1, A2, r_c, gamma]) if gamma_fixed is None
+                  else np.array([A1, h1, A2, r_c]))
+
     out = {"success": True, "model": "expcore",
-           "A1": A1, "h1": h1, "A2": A2, "r_c": r_c, "gamma": gamma,
+           "A1": A1, "h1": h1, "A2": A2, "r_c": r_c, "gamma": gamma, "f": f,
            "gamma_fixed": gamma_fixed is not None,
-           "A1_err": perr[0], "h1_err": perr[1], "A2_err": perr[2],
-           "r_c_err": perr[3], "gamma_err": gamma_err,
-           "popt": popt, "pcov": pcov, "mask": mask}
+           "r_c_fixed": r_c_fixed is not None,
+           "A1_err": A1_err, "h1_err": h1_err, "A2_err": A2_err,
+           "r_c_err": r_c_err, "gamma_err": gamma_err,
+           "popt": popt_legacy, "pcov": None, "mask": mask}
     if extra:
         out.update(extra)
     return out
@@ -1009,7 +1247,11 @@ def describe_fit_expcore(result, *, label="fit", truth=None):
              f"= {result['chi2'] / max(result['dof'], 1):.2f}"
              if "chi2" in result else ""))
     for k in names:
-        tag = " (fixed)" if (k == "gamma" and result.get("gamma_fixed")) else ""
+        tag = ""
+        if k == "gamma" and result.get("gamma_fixed"):
+            tag = " (fixed)"
+        elif k == "r_c" and result.get("r_c_fixed"):
+            tag = " (fixed)"
         line = f"    {k:>5} = {result[k]:12.4g} +/- {result[f'{k}_err']:<10.3g}{tag}"
         if truth is not None and k in truth:
             t = truth[k]
@@ -1031,13 +1273,15 @@ def _best_of_seeds_expcore(*args, **kwargs):
 # for the expcore model.
 # ---------------------------------------------------------------------
 def fit_naive_expcore(r_mid, r_edges, r_fine, y, yerr, *, fit_skip_inner=1,
-                       gamma_fixed=0.8, p0=None, verbose=False):
+                       gamma_fixed=0.8, r_c_fixed=400.0, f_max=0.999,
+                       p0=None, verbose=False):
     """
     Expcore analogue of fit_naive: no PSF correction, drops fit_skip_inner
     innermost bin(s), fits bin_average_no_psf_expcore against the rest.
     See fit_naive's docstring for why the bin-AVERAGE (not point-eval)
-    model is used, and fit_psf_aware_expcore's docstring for gamma_fixed
-    (default 0.8, same rationale -- pass None to let gamma float).
+    model is used, and fit_psf_aware_expcore's docstring for the A2=f*A1
+    ordering fix and the r_c_fixed/gamma_fixed defaults -- identical
+    rationale applies here, same 2026-07-21 investigation.
     """
     r_mid = np.asarray(r_mid, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -1045,66 +1289,72 @@ def fit_naive_expcore(r_mid, r_edges, r_fine, y, yerr, *, fit_skip_inner=1,
 
     mask = np.arange(len(r_mid)) >= fit_skip_inner
     mask &= np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
-    n_free = 4 if gamma_fixed is not None else 5
+    n_free = 3 + (1 if r_c_fixed is None else 0) + (1 if gamma_fixed is None else 0)
     if mask.sum() < n_free:
-        return _pack_result_expcore(False, reason=f"fewer than {n_free} usable bins after fit_skip_inner")
+        return _pack_result_expcore(False, reason=f"fewer than {n_free} usable bins after fit_skip_inner",
+                                    gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed)
 
     y_fit, e_fit = y[mask], yerr[mask]
     scale = _amp_scale(y_fit)
 
-    if gamma_fixed is None:
-        def _model_masked(_, a1, h1, a2, r_c, gamma):
-            return bin_average_no_psf_expcore(r_fine, r_edges, a1 * scale, h1, a2 * scale, r_c, gamma)[mask] / scale
-    else:
-        def _model_masked(_, a1, h1, a2, r_c):
-            return bin_average_no_psf_expcore(r_fine, r_edges, a1 * scale, h1, a2 * scale, r_c, gamma_fixed)[mask] / scale
+    def _unpack(params):
+        i = 0
+        a1 = params[i]; i += 1
+        h1 = params[i]; i += 1
+        f = params[i]; i += 1
+        r_c = params[i] if r_c_fixed is None else r_c_fixed
+        if r_c_fixed is None:
+            i += 1
+        gamma = params[i] if gamma_fixed is None else gamma_fixed
+        return a1, h1, f, r_c, gamma
 
-    seeds = [p0] if p0 is not None else _default_seeds_expcore(r_mid, y, gamma_fixed=gamma_fixed)
-    if gamma_fixed is None:
-        seeds = [[s[0] / scale, s[1], s[2] / scale, s[3], s[4]] for s in seeds]
-    else:
-        seeds = [[s[0] / scale, s[1], s[2] / scale, s[3]] for s in seeds]
+    def _model_masked(_, *params):
+        a1, h1, f, r_c, gamma = _unpack(params)
+        A1 = a1 * scale
+        A2 = f * A1
+        return bin_average_no_psf_expcore(r_fine, r_edges, A1, h1, A2, r_c, gamma)[mask] / scale
 
-    lo, up = _data_driven_bounds_expcore(r_mid[mask], y_fit, gamma_fixed=gamma_fixed)
-    if gamma_fixed is None:
-        bounds = ([lo[0] / scale, lo[1], lo[2] / scale, lo[3], lo[4]],
-                  [up[0] / scale, up[1], up[2] / scale, up[3], up[4]])
-    else:
-        bounds = ([lo[0] / scale, lo[1], lo[2] / scale, lo[3]],
-                  [up[0] / scale, up[1], up[2] / scale, up[3]])
+    seeds = ([_legacy_p0_to_seed(p0, scale, r_c_fixed=r_c_fixed, gamma_fixed=gamma_fixed, f_max=f_max)]
+             if p0 is not None else
+             _default_seeds_expcore(r_mid[mask], y_fit, scale, gamma_fixed=gamma_fixed,
+                                    r_c_fixed=r_c_fixed, f_max=f_max))
+    lo, up = _data_driven_bounds_expcore(r_mid[mask], y_fit, scale,
+                                        gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed, f_max=f_max)
+    bounds = (lo, up)
 
     popt, pcov = _best_of_seeds_expcore(_model_masked, r_mid[mask], y_fit / scale,
                                         e_fit / scale, seeds, bounds)
     if popt is None:
-        return _pack_result_expcore(False, reason="all seeds failed to converge")
-
-    D = np.array([scale, 1.0, scale, 1.0, 1.0] if gamma_fixed is None else [scale, 1.0, scale, 1.0])
-    popt = popt * D
-    if pcov is not None:
-        pcov = pcov * np.outer(D, D)
+        return _pack_result_expcore(False, reason="all seeds failed to converge",
+                                    gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed)
     # no _canonical_order step -- see intrinsic_profile_expcore's docstring:
-    # this model isn't swap-symmetric, so there's no core/halo slot ambiguity.
+    # this model isn't swap-symmetric, so there's no core/halo slot ambiguity
+    # (the separate amplitude-ORDERING issue the f-reparametrization above
+    # fixes is a different failure mode -- see fit_psf_aware_expcore's
+    # docstring -- not the swap symmetry this comment originally referred to).
 
-    if gamma_fixed is None:
-        model_binned = bin_average_no_psf_expcore(r_fine, r_edges, *popt)
-    else:
-        model_binned = bin_average_no_psf_expcore(r_fine, r_edges, popt[0], popt[1], popt[2], popt[3], gamma_fixed)
+    result = _pack_result_expcore(True, popt, pcov, mask=mask, gamma_fixed=gamma_fixed,
+                                  r_c_fixed=r_c_fixed, scale=scale,
+                                  extra={"n_fit": int(mask.sum()), "k_params": n_free})
+    model_binned = bin_average_no_psf_expcore(r_fine, r_edges, result["A1"], result["h1"],
+                                              result["A2"], result["r_c"], result["gamma"])
     chi2 = float(np.nansum(((y_fit - model_binned[mask]) / e_fit) ** 2))
     dof = int(mask.sum()) - n_free
-    result = _pack_result_expcore(True, popt, pcov, mask=mask, gamma_fixed=gamma_fixed,
-                                  extra={"model_binned": model_binned, "chi2": chi2,
-                                         "dof": dof, "n_fit": int(mask.sum()), "k_params": n_free})
+    result["model_binned"] = model_binned
+    result["chi2"] = chi2
+    result["dof"] = dof
     if verbose:
         n_drop = int((~mask).sum())
         print(f"fit_naive_expcore: NO PSF, dropped {fit_skip_inner} inner bin(s) "
               f"({int(mask.sum())} bins fit, {n_drop} excluded), gamma "
-              f"{'fixed=' + str(gamma_fixed) if gamma_fixed is not None else 'free'}")
+              f"{'fixed=' + str(gamma_fixed) if gamma_fixed is not None else 'free'}, r_c "
+              f"{'fixed=' + str(r_c_fixed) if r_c_fixed is not None else 'free'}")
         describe_fit_expcore(result, label="naive-expcore")
     return result
 
 
 def fit_psf_aware_expcore(r_mid, y, yerr, R, r_fine, r_edges, *, gamma_fixed=0.8,
-                          p0=None, verbose=False):
+                          r_c_fixed=400.0, f_max=0.999, p0=None, verbose=False):
     """
     Expcore analogue of fit_psf_aware: full PSF forward model, all bins fit
     (inner bin kept), same multi-seed-then-lowest-chi2 strategy. r_edges
@@ -1112,6 +1362,43 @@ def fit_psf_aware_expcore(r_mid, y, yerr, R, r_fine, r_edges, *, gamma_fixed=0.8
     normalization). R is the SAME ring_convolution_matrix built for the
     Part 1 model -- it's independent of the intrinsic profile's functional
     form, so nothing about building R changes for this model.
+
+    As of 2026-07-21, A2 is reparametrized as f*A1 (f bounded in
+    [0, f_max], default f_max=0.999) rather than fit as an independent
+    amplitude. This structurally forbids A2 exceeding A1 near r~0
+    ("inverted" solutions) -- a real failure mode, not a hypothetical one:
+    diagnose_crossover_failures (fitting.py) found 0 of 3000 bootstrap-
+    refit failures on a real low/high-density subsample split were due to
+    the crossover search bracket being too small ("censored") -- ALL of
+    them (85/3000 = 2.8% low, 610/3000 = 20.3% high) were this amplitude
+    inversion instead, worse on the noisier subsample as expected. Widening
+    the search bracket therefore cannot fix it; the fix has to be
+    structural. See docs/research-notes.md, "Expcore fit stability:
+    amplitude ordering & r_c degeneracy" (2026-07-21) for the full
+    investigation and specs/halo-flux-fitting.md Part 2's addendum for the
+    spec-level rationale.
+
+    r_c_fixed : 400.0 (NEW DEFAULT, as of 2026-07-21) -- mirrors
+        gamma_fixed's None-means-free convention exactly. r_c trades off
+        against A2 badly enough on realistic subsample-split S/N that even
+        the amplitude-ordering fix above didn't stabilize it (a same-k
+        ordering-only refit still returned r_c anywhere from ~2 to ~2400
+        kpc on the noisier subsample). A dedicated sensitivity scan across
+        r_c_fixed in [200,700] kpc found: h1 and the crossover_radius
+        RATIO between a low/high-density subsample pair were stable to
+        within ~5-15% across that whole range; the ABSOLUTE crossover_
+        radius is NOT r_c-independent (scales up ~20-26% from one end of
+        that range to the other, as expected -- a larger r_c keeps the
+        halo term near its plateau longer, pushing the core/halo crossing
+        outward) and should be reported as conditional on r_c_fixed, not
+        as a free-standing measurement. AIC/BIC on real fiducial fits
+        favored (or were statistically indifferent to) the fixed-r_c model
+        over the free-r_c one -- notably IMPROVING both criteria on the
+        noisier subsample, where the free r_c parameter wasn't earning its
+        keep. 400 sits inside that scan's stable range and close to where
+        a fit to the combined/full stack lands. Pass r_c_fixed=None to let
+        it float instead (pre-2026-07-21 default behavior, still available
+        for an explicit A/B comparison via compare_models_aic_bic).
 
     gamma_fixed : 0.8 (default) -- projected_slope_from_3d(1.8), the
         Limber-projected z~2-3 clustering slope (LITERATURE_GAMMA_3D). r_c
@@ -1127,63 +1414,70 @@ def fit_psf_aware_expcore(r_mid, y, yerr, R, r_fine, r_edges, *, gamma_fixed=0.8
         directly via chi2/AIC (open question 3 in halo-flux-fitting.md
         Part 2) -- either way, fewer free parameters than the None case,
         which is the point.
+
+    f_max : upper bound on A2/A1 (default 0.999 -- enforces essentially
+        just A1>A2 with no further prior; tighten if you want a stronger
+        core-dominance assumption).
     """
     r_mid = np.asarray(r_mid, dtype=float)
     y = np.asarray(y, dtype=float)
     yerr = np.asarray(yerr, dtype=float)
 
     mask = np.isfinite(y) & np.isfinite(yerr) & (yerr > 0)
-    n_free = 4 if gamma_fixed is not None else 5
+    n_free = 3 + (1 if r_c_fixed is None else 0) + (1 if gamma_fixed is None else 0)
     if mask.sum() < n_free:
-        return _pack_result_expcore(False, reason=f"fewer than {n_free} finite bins")
+        return _pack_result_expcore(False, reason=f"fewer than {n_free} finite bins",
+                                    gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed)
 
     y_fit, e_fit = y[mask], yerr[mask]
     scale = _amp_scale(y_fit)
 
-    if gamma_fixed is None:
-        def _model_masked(_, a1, h1, a2, r_c, gamma):
-            return bin_average_psf_expcore(R, r_fine, r_edges, a1 * scale, h1, a2 * scale, r_c, gamma)[mask] / scale
-    else:
-        def _model_masked(_, a1, h1, a2, r_c):
-            return bin_average_psf_expcore(R, r_fine, r_edges, a1 * scale, h1, a2 * scale, r_c, gamma_fixed)[mask] / scale
+    def _unpack(params):
+        i = 0
+        a1 = params[i]; i += 1
+        h1 = params[i]; i += 1
+        f = params[i]; i += 1
+        r_c = params[i] if r_c_fixed is None else r_c_fixed
+        if r_c_fixed is None:
+            i += 1
+        gamma = params[i] if gamma_fixed is None else gamma_fixed
+        return a1, h1, f, r_c, gamma
 
-    seeds = [p0] if p0 is not None else _default_seeds_expcore(r_mid, y, gamma_fixed=gamma_fixed)
-    if gamma_fixed is None:
-        seeds = [[s[0] / scale, s[1], s[2] / scale, s[3], s[4]] for s in seeds]
-    else:
-        seeds = [[s[0] / scale, s[1], s[2] / scale, s[3]] for s in seeds]
+    def _model_masked(_, *params):
+        a1, h1, f, r_c, gamma = _unpack(params)
+        A1 = a1 * scale
+        A2 = f * A1
+        return bin_average_psf_expcore(R, r_fine, r_edges, A1, h1, A2, r_c, gamma)[mask] / scale
 
-    lo, up = _data_driven_bounds_expcore(r_mid[mask], y_fit, gamma_fixed=gamma_fixed)
-    if gamma_fixed is None:
-        bounds = ([lo[0] / scale, lo[1], lo[2] / scale, lo[3], lo[4]],
-                  [up[0] / scale, up[1], up[2] / scale, up[3], up[4]])
-    else:
-        bounds = ([lo[0] / scale, lo[1], lo[2] / scale, lo[3]],
-                  [up[0] / scale, up[1], up[2] / scale, up[3]])
+    seeds = ([_legacy_p0_to_seed(p0, scale, r_c_fixed=r_c_fixed, gamma_fixed=gamma_fixed, f_max=f_max)]
+             if p0 is not None else
+             _default_seeds_expcore(r_mid[mask], y_fit, scale, gamma_fixed=gamma_fixed,
+                                    r_c_fixed=r_c_fixed, f_max=f_max))
+    lo, up = _data_driven_bounds_expcore(r_mid[mask], y_fit, scale,
+                                        gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed, f_max=f_max)
+    bounds = (lo, up)
 
     popt, pcov = _best_of_seeds_expcore(_model_masked, r_mid[mask], y_fit / scale,
                                         e_fit / scale, seeds, bounds)
     if popt is None:
-        return _pack_result_expcore(False, reason="all seeds failed to converge")
+        return _pack_result_expcore(False, reason="all seeds failed to converge",
+                                    gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed)
 
-    D = np.array([scale, 1.0, scale, 1.0, 1.0] if gamma_fixed is None else [scale, 1.0, scale, 1.0])
-    popt = popt * D
-    if pcov is not None:
-        pcov = pcov * np.outer(D, D)
-
-    if gamma_fixed is None:
-        model_binned = bin_average_psf_expcore(R, r_fine, r_edges, *popt)
-    else:
-        model_binned = bin_average_psf_expcore(R, r_fine, r_edges, popt[0], popt[1], popt[2], popt[3], gamma_fixed)
+    result = _pack_result_expcore(True, popt, pcov, mask=mask, gamma_fixed=gamma_fixed,
+                                  r_c_fixed=r_c_fixed, scale=scale,
+                                  extra={"n_fit": int(mask.sum()), "k_params": n_free})
+    model_binned = bin_average_psf_expcore(R, r_fine, r_edges, result["A1"], result["h1"],
+                                           result["A2"], result["r_c"], result["gamma"])
     chi2 = float(np.nansum(((y_fit - model_binned[mask]) / e_fit) ** 2))
     dof = int(mask.sum()) - n_free
-    result = _pack_result_expcore(True, popt, pcov, mask=mask, gamma_fixed=gamma_fixed,
-                                  extra={"model_binned": model_binned, "chi2": chi2,
-                                         "dof": dof, "n_fit": int(mask.sum()), "k_params": n_free})
+    result["model_binned"] = model_binned
+    result["chi2"] = chi2
+    result["dof"] = dof
     if verbose:
         print(f"fit_psf_aware_expcore: WITH PSF forward model, all {int(mask.sum())} "
               f"bins fit (inner bin kept), gamma "
-              f"{'fixed=' + str(gamma_fixed) if gamma_fixed is not None else 'free'}")
+              f"{'fixed=' + str(gamma_fixed) if gamma_fixed is not None else 'free'}, r_c "
+              f"{'fixed=' + str(r_c_fixed) if r_c_fixed is not None else 'free'}")
         describe_fit_expcore(result, label="psf-expcore")
     return result
 
@@ -1474,237 +1768,16 @@ def find_core_halo_boundary(fit_result, *, fallback_fit_result=None,
            "source": "none", "model": own_model}
 
 
-def diagnose_crossover_failures(boot, r_edges, r_fine, *, method="psf", R=None,
-                                gamma_fixed=0.8, fit_skip_inner=1, p0=None,
-                                nboot=None, seed=None, r_max_factor=20.0,
-                                verbose=True):
-    """
-    Classifies every bootstrap draw's expcore crossover OUTCOME, to answer
-    the question raised by analysis.bootstrap_fit_profile's n_no_crossover
-    count: when find_core_halo_boundary can't find a crossing for a draw,
-    is that because (a) the crossing genuinely exists but sits beyond
-    crossover_radius_expcore's default search bracket (r_max = max(50*h1,
-    5*r_c)) -- meaning the crossover_radius distribution bootstrap_fit_
-    profile reports is CENSORED, biased toward smaller values by silently
-    dropping the largest-crossover draws -- or (b) the fit put more
-    amplitude in the halo/power-law term than the core term even near
-    r~0, i.e. diff(r) = A1*exp(-r/h1) - A2*(1+(r/r_c)^2)^(-gamma/2) is
-    already negative at the bracket's own low edge -- a qualitatively
-    different degenerate solution that no amount of widening r_max will
-    fix, and that excluding IS the right call for.
-
-    These two failure modes are not the same thing and imply different
-    fixes: (a) says "widen r_max and rerun bootstrap_fit_profile" (the
-    reported crossover_radius_med is currently a lower bound, not the
-    true typical value); (b) says "these draws are fine to exclude from
-    the crossover_radius array, but check whether their fitted A1/h1/A2/
-    r_c cluster separately from the successful draws' -- that would mean
-    curve_fit is landing in a different local minimum on those draws, not
-    just sampling noise around the same answer."
-
-    Re-fits every draw itself -- same cost/loop as bootstrap_fit_profile.
-    This is a one-off diagnostic pass to run when investigating a
-    suspiciously high n_no_crossover rate, not something to run routinely
-    alongside it.
-
-    Classification per converged draw, evaluating diff(r) at the SAME
-    (lo=1e-3, hi=max(50*h1,5*r_c)) bracket crossover_radius_expcore uses:
-      'crossed'             : diff changes sign in (lo, hi) -- this draw
-                              already contributes to bootstrap_fit_
-                              profile's crossover_radius array; listed
-                              here too so the four counts sum to
-                              n_used - n_failed.
-      'censored_recovered'  : diff(lo)>0 and diff(hi)>0 (core still ahead
-                              at r_max), but widening the bracket to
-                              hi*r_max_factor DOES find a sign change --
-                              hypothesis (a) confirmed for this draw. Its
-                              recovered crossover radius is kept in
-                              censored_recovered_crossover.
-      'censored_unrecovered' : same diff(lo)>0, diff(hi)>0, but still no
-                              sign change even at the widened bracket --
-                              core dominates so completely (or A2 is so
-                              small) that no crossing exists in any
-                              physically reasonable range.
-      'inverted'             : diff(lo)<0 and diff(hi)<0 -- halo term
-                              already ahead of core at r~0. Widening
-                              r_max cannot change this (the sign at lo
-                              doesn't depend on r_max) -- hypothesis (b).
-
-    Parameters mirror analysis.bootstrap_fit_profile's (model is fixed to
-    "expcore" here since this failure mode doesn't apply to the closed-
-    form twoexp crossover). r_max_factor : how much wider than the
-    default bracket to search before calling a censored draw
-    'unrecovered' (default 20x -- generous; if 'censored_recovered'
-    crossings cluster near this new edge rather than comfortably inside
-    it, widen further and rerun).
-
-    Returns
-    -------
-    dict: n_used, n_failed, counts (per class), params (per class dict of
-    A1/h1/A2/r_c/gamma arrays -- compare distributions across classes,
-    e.g. via np.median/percentile, to see if 'inverted' draws are a
-    separate population or just the tail of the same one),
-    censored_recovered_crossover (recovered radii under the widened
-    bracket -- compare their median/spread against bootstrap_fit_
-    profile's reported crossover_radius_med to gauge how much censoring
-    is biasing that number), meta.
-    """
-    if method not in ("psf", "naive"):
-        raise ValueError(f"method must be 'psf' or 'naive' (got {method!r})")
-    if method == "psf" and R is None:
-        raise ValueError("method='psf' requires R (same ring_convolution_matrix "
-                         "used for the real bootstrap_fit_profile call).")
-    if "total_flux_all" not in boot or "total_flux_fid" not in boot:
-        raise KeyError("boot needs total_flux_all (nboot, nrad) and total_flux_fid.")
-
-    r_edges = np.asarray(r_edges, dtype=float)
-    r_fine = np.asarray(r_fine, dtype=float)
-    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
-
-    y_fid = np.asarray(boot["total_flux_fid"], dtype=float)
-    y_lo = np.asarray(boot["total_flux_lo"], dtype=float)
-    y_hi = np.asarray(boot["total_flux_hi"], dtype=float)
-    sigma = ((y_hi - y_fid) + (y_fid - y_lo)) / 2.0
-
-    flux_all = np.asarray(boot["total_flux_all"], dtype=float)
-    boot_meta = boot.get("meta", {}) or {}
-    n_available = flux_all.shape[0]
-    n_use = int(nboot) if nboot is not None else int(boot_meta.get("nboot", n_available))
-    n_use = min(n_use, n_available)
-
-    def _one_fit(y_row):
-        if method == "psf":
-            return fit_psf_aware_expcore(r_mid, y_row, sigma, R, r_fine, r_edges,
-                                         gamma_fixed=gamma_fixed, p0=p0, verbose=False)
-        return fit_naive_expcore(r_mid, r_edges, r_fine, y_row, sigma,
-                                 fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed,
-                                 p0=p0, verbose=False)
-
-    classes = ("crossed", "censored_recovered", "censored_unrecovered", "inverted")
-    params = {c: {p: [] for p in ("A1", "h1", "A2", "r_c", "gamma")} for c in classes}
-    censored_recovered_crossover = []
-    n_failed = 0
-
-    try:
-        from tqdm import tqdm
-        iterator = tqdm(range(n_use), disable=not verbose, desc="diagnose_crossover_failures")
-    except ImportError:
-        iterator = range(n_use)
-        if verbose:
-            print(f"diagnose_crossover_failures: refitting {n_use} draws "
-                  f"(tqdm not installed, no progress bar)")
-
-    for b in iterator:
-        result = _one_fit(flux_all[b])
-        if not result.get("success"):
-            n_failed += 1
-            continue
-        A1, h1, A2, r_c, gamma = (result["A1"], result["h1"], result["A2"],
-                                  result["r_c"], result["gamma"])
-
-        def diff(r, A1=A1, h1=h1, A2=A2, r_c=r_c, gamma=gamma):
-            return A1 * np.exp(-r / h1) - A2 * (1.0 + (r / r_c) ** 2) ** (-gamma / 2.0)
-
-        lo = 1e-3
-        hi = max(50.0 * h1, 5.0 * r_c)
-        f_lo, f_hi = diff(lo), diff(hi)
-
-        if f_lo * f_hi <= 0:
-            cls = "crossed"
-        elif f_lo > 0:  # both positive -- core still ahead throughout the default bracket
-            wide_hi = hi * r_max_factor
-            f_wide = diff(wide_hi)
-            if f_lo * f_wide <= 0:
-                cls = "censored_recovered"
-                censored_recovered_crossover.append(float(optimize.brentq(diff, lo, wide_hi)))
-            else:
-                cls = "censored_unrecovered"
-        else:  # both negative -- halo term already ahead of core at r~0
-            cls = "inverted"
-
-        for p, v in zip(("A1", "h1", "A2", "r_c", "gamma"), (A1, h1, A2, r_c, gamma)):
-            params[cls][p].append(v)
-
-    out = {"n_used": n_use, "n_failed": n_failed,
-          "counts": {c: len(params[c]["h1"]) for c in classes},
-          "params": {c: {p: np.asarray(v) for p, v in d.items()} for c, d in params.items()},
-          "censored_recovered_crossover": np.asarray(censored_recovered_crossover),
-          "meta": {"method": method, "gamma_fixed": gamma_fixed,
-                   "r_max_factor": r_max_factor, "nboot_used": n_use}}
-
-    if verbose:
-        print(f"diagnose_crossover_failures: {n_use - n_failed}/{n_use} converged "
-              f"({n_failed} failed fits)")
-        for c in classes:
-            print(f"  {c:>21} : {out['counts'][c]}")
-        if out["censored_recovered_crossover"].size:
-            arr = out["censored_recovered_crossover"]
-            print(f"  censored_recovered crossover radii (widened bracket): "
-                  f"median={np.median(arr):.3g}  "
-                  f"[{np.percentile(arr, 16):.3g}, {np.percentile(arr, 84):.3g}]")
-    return out
-
-
-def summarize_diagnosed_params(diag, params=("A1", "h1", "A2", "r_c", "gamma"), verbose=True):
-    """
-    Med/16/84 summary of a diagnose_crossover_failures() output's 'crossed'
-    class ONLY -- i.e. the same per-draw refit values analysis.
-    bootstrap_fit_profile already computed, but with 'inverted' (and any
-    'censored_unrecovered') draws excluded from EVERY parameter, not just
-    crossover_radius.
-
-    Why this is needed: bootstrap_fit_profile only filters crossover_radius
-    by whether a draw's own fit found a crossing -- h1/r_c/A2/gamma keep
-    every converged draw regardless, including 'inverted' ones (amplitude
-    ordering flipped: the fitted halo/power-law term A2 already exceeds
-    the core term A1 near r~0 -- see diagnose_crossover_failures). On a
-    split where 'inverted' is a large fraction (610/3000 = 20.3% on a
-    high-density subsample, vs 85/3000 = 2.8% on the paired low-density
-    one, in the run this was written for), the REPORTED h1/r_c bootstrap
-    med/16/84 is partly built from draws representing a different,
-    likely non-physical decomposition of the same data -- not just wider
-    noise around the same answer. This re-summarizes using only the
-    draws where the fit found a physically ordered (core-dominates-near-
-    center) solution, so the reported spread reflects noise on ONE
-    consistent decomposition instead of a blend of two.
-
-    Does no new fitting -- pure re-aggregation of
-    diag['params']['crossed'], which diagnose_crossover_failures already
-    collected during its own refit pass.
-
-    Parameters
-    ----------
-    diag : diagnose_crossover_failures's return dict.
-    params : which parameters to summarize (default all five expcore
-        params; crossover_radius isn't included here since
-        bootstrap_fit_profile's own crossover_radius array is already
-        'crossed'-only by construction).
-
-    Returns
-    -------
-    dict: n_crossed, n_total (n_used - n_failed, i.e. denominator
-    'crossed' is a fraction of), and {param}_med/_lo/_hi for each
-    requested param.
-    """
-    crossed = diag["params"]["crossed"]
-    out = {"n_crossed": int(crossed["h1"].size) if "h1" in crossed else 0,
-          "n_total": diag["n_used"] - diag["n_failed"]}
-    for p in params:
-        arr = crossed.get(p)
-        if arr is None or arr.size == 0:
-            out[f"{p}_med"] = out[f"{p}_lo"] = out[f"{p}_hi"] = float("nan")
-            continue
-        out[f"{p}_med"] = float(np.median(arr))
-        out[f"{p}_lo"] = float(np.percentile(arr, 16))
-        out[f"{p}_hi"] = float(np.percentile(arr, 84))
-    if verbose:
-        frac = out["n_crossed"] / out["n_total"] if out["n_total"] else float("nan")
-        print(f"summarize_diagnosed_params: {out['n_crossed']}/{out['n_total']} "
-              f"({frac:.1%}) draws physically ordered ('crossed') and used below")
-        for p in params:
-            print(f"  {p:>17} : med={out[f'{p}_med']:.3g}  "
-                  f"[{out[f'{p}_lo']:.3g}, {out[f'{p}_hi']:.3g}] (16/84)")
-    return out
+# NOTE (2026-07-21): diagnose_crossover_failures / summarize_diagnosed_params
+# were removed here. They were one-off diagnostic tooling built to investigate
+# a specific bootstrap_fit_profile instability (the amplitude-ordering /
+# r_c-degeneracy issue -- see [[lya-halos-expcore-ordering-rc-fixed-default]]
+# and docs/research-notes.md "Expcore fit stability: amplitude ordering & r_c
+# degeneracy"). That investigation is done and its fix (A2=f*A1 ordering,
+# r_c_fixed=400.0 default) has shipped as the pipeline standard, so the
+# testing-only functions were deleted rather than kept around as dead code.
+# The investigation's findings/numbers remain in docs/research-notes.md and
+# specs/halo-flux-fitting.md as the historical record.
 
 
 def sphere_of_influence_kpc(rvir_kpc, factor=7.0):
@@ -1946,36 +2019,24 @@ def _bin_integrate_generic(profile_fn, r_fine, r_edges, params):
     return result
 
 
-def _annulus_areas(r_edges):
-    """Geometric area pi*(r_out^2 - r_in^2) of each annulus. The PSF forward
-    model (bin_average_psf_uv_*) redistributes real 2-D FLUX between annuli,
-    so its per-bin flux is converted to a per-bin mean SURFACE BRIGHTNESS by
-    dividing by annulus AREA -- NOT by radial bin width (that leaves a stray
-    ~2*pi*r factor; see bin_average_psf_uv_exp)."""
-    e = np.asarray(r_edges, dtype=float)
-    return np.pi * (e[1:] ** 2 - e[:-1] ** 2)
-
-
-def _fine_ring_flux_uv_2d(profile_fn, r_fine, params):
-    """2-D ring flux of the intrinsic profile: profile(r) * 2*pi*r * dr --
-    the actual FLUX carried by a thin annulus of surface brightness
-    profile(r), width dr, at radius r. This is what ring_convolution_matrix's
-    R (a flux-redistribution operator, weighted by the OUTPUT annulus'
-    2*pi*rho) must be applied to. Differs from _fine_ring_flux_generic
-    (profile(r)*dr, NO 2*pi*r) -- the circumference factor is required, not
-    optional; see bin_average_psf_uv_exp's docstring."""
-    r_fine = np.asarray(r_fine, dtype=float)
-    dr = np.gradient(r_fine)
-    return profile_fn(r_fine, *params) * (2.0 * np.pi * r_fine) * dr
+# _annulus_areas and the 2-D ring flux now live in Part 1 (next to
+# _bin_widths / bin_average_no_psf), since as of 2026-07-22 the Lya models
+# use them too. _fine_ring_flux_uv_2d is kept as an alias so existing UV
+# call sites and docs keep working.
+_fine_ring_flux_uv_2d = _fine_ring_flux_2d
 
 
 def bin_average_no_psf_uv_exp(r_fine, r_edges, A, h_uv):
-    """Mean intrinsic (single-exponential) UV flux in each bin, NO PSF --
-    same divide-by-bin-width convention as Part 1's bin_average_no_psf, per
-    the spec's explicit instruction to report the bin AVERAGE flux per
-    annulus, matching Part 1's convention exactly."""
-    return _bin_integrate_generic(intrinsic_profile_uv_exp, r_fine, r_edges,
-                                  (A, h_uv)) / _bin_widths(r_edges)
+    """Area-weighted mean intrinsic (single-exponential) UV surface
+    brightness in each bin, NO PSF.
+
+    CORRECTED 2026-07-22 along with the Lya models: this previously used
+    the divide-by-bin-width convention while its OWN PSF counterpart
+    (bin_average_psf_uv_exp) had already been fixed to 2-D flux /
+    annulus area, so method='naive' and method='psf' UV fits were not
+    measuring the same quantity. Both now use the corrected form."""
+    return (_bin_integrate_2d(intrinsic_profile_uv_exp, r_fine, r_edges, (A, h_uv))
+            / _annulus_areas(r_edges))
 
 
 def bin_average_psf_uv_exp(R, r_fine, r_edges, A, h_uv):
@@ -1997,21 +2058,24 @@ def bin_average_psf_uv_exp(R, r_fine, r_edges, A, h_uv):
 
     R is built from whatever PSF is passed to ring_convolution_matrix -- the
     CFHT-LS PSF here, VIRUS elsewhere."""
-    return (R @ _fine_ring_flux_uv_2d(intrinsic_profile_uv_exp, r_fine, (A, h_uv))
+    return (R @ _fine_ring_flux_uv_2d(intrinsic_profile_uv_exp, r_fine, (A, h_uv),
+                               r_edges=r_edges)
             ) / _annulus_areas(r_edges)
 
 
 def bin_average_no_psf_uv_sersic(r_fine, r_edges, A, r_e, n):
-    """Sersic analogue of bin_average_no_psf_uv_exp."""
-    return _bin_integrate_generic(intrinsic_profile_uv_sersic, r_fine, r_edges,
-                                  (A, r_e, n)) / _bin_widths(r_edges)
+    """Sersic analogue of bin_average_no_psf_uv_exp -- same corrected
+    2-D-flux / annulus-area convention (fixed 2026-07-22)."""
+    return (_bin_integrate_2d(intrinsic_profile_uv_sersic, r_fine, r_edges, (A, r_e, n))
+            / _annulus_areas(r_edges))
 
 
 def bin_average_psf_uv_sersic(R, r_fine, r_edges, A, r_e, n):
     """Sersic analogue of bin_average_psf_uv_exp -- same corrected 2-D-flux
     input (2*pi*r*dr) and annulus-area normalization (see that function's
     docstring for why bin width was wrong)."""
-    return (R @ _fine_ring_flux_uv_2d(intrinsic_profile_uv_sersic, r_fine, (A, r_e, n))
+    return (R @ _fine_ring_flux_uv_2d(intrinsic_profile_uv_sersic, r_fine, (A, r_e, n),
+                               r_edges=r_edges)
             ) / _annulus_areas(r_edges)
 
 

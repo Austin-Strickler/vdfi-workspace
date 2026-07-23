@@ -14,7 +14,6 @@ Working list across the workspace. Check items off as they land; log the actual 
 
 ## Science
 
-- [x] **Subsample splits — primary tests done.** The core splits are run and the paper-1 vs paper-2 assignment is essentially settled (`split_by_derived`/`split_controlled` in selection.py, `split_by_redshift`/`split_product_by` in multicat.py; see `docs/subsample_splits.md`). Final list stays lightly in flux by nature, but this is no longer blocking work. Still need to finalize the output in the paper.
 - [ ] Read more!
 - [ ] Check whether core measurement templates (single vs. double Gaussian) and their related separation/flux-ratio stacks (blue- vs. redshifted) are being fit to noise that resembles the template by construction — test whether fitting these templates to pure noise/null spectra converges toward a template-shaped stack at high N, and if so how much of any observed double-peaked structure is genuine vs. fitting-induced. See `01-lya_halos/docs/research-notes.md`.
 

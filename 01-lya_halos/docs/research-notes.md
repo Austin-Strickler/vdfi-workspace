@@ -150,6 +150,74 @@ stacks_hi = stack.build_stacks(cfg_prod, g_hi, keep_cube=True)
 
 ---
 
+## Expcore fit stability: amplitude ordering & r_c degeneracy
+
+Settled as of 2026-07-21 — now the pipeline default (`fitting.fit_psf_aware_expcore`/`fit_naive_expcore`, `analysis.bootstrap_fit_profile`, `plot_flux_profile_fit`/`_two`). Left here for the full reasoning trail per this doc's own instructions; see `CHANGELOG.md` (2026-07-21) for the shipped-code summary and `specs/halo-flux-fitting.md` Part 2's addendum for the spec-level version.
+
+Relevant code: `fitting.py` — `fit_psf_aware_expcore`/`fit_naive_expcore` (the fits themselves), `diagnose_crossover_failures` (new, classifies bootstrap-refit failures), `summarize_diagnosed_params` (new, re-aggregates a diagnosis's physically-ordered subset). `analysis.py` — `bootstrap_fit_profile` (refit-per-draw uncertainty).
+
+### 2026-07-21
+
+**The trigger.** A low- vs. high-density environment subsample split (see "Local overdensity" section below) produced two expcore fits whose h1 and everything else looked similar but whose r_c differed by ~100 kpc in a way that flipped the visual "one-halo/two-halo crossover" picture between the two samples. Question: is that difference physical, or fit noise?
+
+**Diagnosis, step 1 — is r_c actually constrained?** `bootstrap_fit_profile` (nboot=1000, gamma_fixed=0.8, r_c free) gave: low h1=11.15 [9.86,12.2], r_c=162 [84.2,324]; high h1=22.46 [17,24.3], r_c=802 [0.865,2130]. r_c's own uncertainty is larger than or comparable to its value in both samples — not a measurement, closer to unconstrained.
+
+**Diagnosis, step 2 — why does `bootstrap_fit_profile` report ~20-28% "no crossover found"?** Two competing hypotheses going in: (a) the crossover search bracket (`r_max = max(50*h1, 5*r_c)` in `crossover_radius_expcore`) is too small for some draws (censoring — the reported crossover_radius would be biased low), or (b) the fit puts more amplitude in the halo/power-law term (A2) than the core term (A1) near r~0 for some draws (an "inverted" solution — a different degeneracy censoring can't fix). Built `diagnose_crossover_failures` to distinguish them directly: evaluate `diff(r) = A1*exp(-r/h1) - A2*(1+(r/r_c)^2)^(-gamma/2)` at both ends of the search bracket per draw, then for draws where `diff` doesn't change sign, retest with the bracket widened 20x.
+
+Result (nboot=3000): **0 of either sample's failures were censoring.** Low: 2915 crossed, 0 censored (either flavor), 85 inverted (2.8%). High: 2390 crossed, 0 censored, 610 inverted (20.3%). All "no crossover" draws were amplitude inversion, worse on the noisier (high-density) subsample as expected — confirms hypothesis (b), rules out (a) cleanly.
+
+**Diagnosis, step 3 — does filtering the inverted draws out of h1/r_c (not just crossover_radius, which `bootstrap_fit_profile` already filtered) change anything?** `summarize_diagnosed_params` re-aggregated using only the "crossed" (physically-ordered) subset: low h1=11 [9.81,12.2], r_c=179 [93.2,329]; high h1=20.9 [16.6,24.3], r_c=866 [35.2,2370]. h1 barely moved — robust to the inverted-draw contamination. **r_c did not clean up** — even the physically-ordered 79.7% of high's draws span a factor of ~68x (35 to 2370 kpc), confirming the wide r_c isn't just an artifact of blending in inverted solutions; it's a real information-limit on a half-sample split.
+
+**Fix attempt 1 — enforce A1>A2 structurally.** Reparametrized A2 = f*A1, f bounded in [0, f_max≈0.999] (rather than fitting A2 as an independent, unconstrained amplitude) — forbids the inverted branch by construction. Tested standalone (r_c still free, same k=4 parameter budget as before): 500/500 draws converged for both samples (0 failures), but r_c for high still ranged from 2.13 to 2390 kpc and A2 up to 3.72e39 — forcing an ordered solution doesn't cure the underlying non-identifiability, it just relocates where the optimizer lands. **"100% converged" is not itself evidence of a good fit** — worth remembering generally.
+
+**Fix attempt 2 — also fix r_c (borrowed from the full/combined-sample fit).** Same ordering fix, plus r_c held fixed (tested at 400 kpc) instead of floated — down to a 3-parameter fit (A1, h1, f). Result (nboot=500): low h1=11.5 [10.4,12.8], A2=6.08e37 [4.53e37,7.39e37], crossover_radius=57 [51.6,63.3]; high h1=20.9 [18.2,23.5], A2=7.8e37 [6.46e37,9.12e37], crossover_radius=88.7 [78.7,98.8]. Central values barely moved from the free-r_c case; uncertainty on A2 and crossover_radius tightened substantially (crossover_radius's 16/84 width for high: 57.2 kpc free-but-filtered → 20.1 kpc fixed).
+
+**Sensitivity scan — is the fixed r_c value doing the work, or is 400 special?** Reran the fixed-r_c fit (ordering enforced) across r_c_fixed ∈ {200,300,400,500,700} kpc, nboot=1000 each:
+
+| r_c_fixed | low h1 | low crossover_radius | high h1 | high crossover_radius | high/low ratio |
+|---|---|---|---|---|---|
+| 200 | 11.1 [10,12.4] | 51.1 [46.1,57.2] | 19.4 [17.1,21.9] | 76.8 [68.3,86] | 1.503 |
+| 300 | 11.4 [10.2,12.7] | 54.7 [49.4,61.1] | 20.4 [17.9,23] | 84 [74.6,94.1] | 1.536 |
+| 400 | 11.6 [10.3,12.9] | 57.2 [51.5,63.7] | 21 [18.3,23.6] | 89 [79.1,99.7] | 1.556 |
+| 500 | 11.7 [10.4,13] | 59.1 [53.1,65.8] | 21.4 [18.6,24] | 92.4 [82.3,104] | 1.563 |
+| 700 | 11.8 [10.5,13.2] | 61.7 [55.4,68.8] | 21.9 [19,24.6] | 97 [86.4,109] | 1.572 |
+
+n_fail = 0/1000 in all 10 runs (5 r_c values × 2 samples) — the ordering fix holds up at this bootstrap size too.
+
+**Conclusions from the scan:** h1 drifts only mildly (~6-13%) across a 3.5x span in the assumed r_c — robust. The **absolute** crossover_radius is NOT r_c-independent (scales up ~20-26% across the same span, as expected physically: a larger r_c keeps the halo term near its plateau longer, pushing the core/halo crossing outward) — report it as conditional on r_c_fixed, with the scan range as an explicit systematic band, not as a free-standing measurement. The high/low **ratio**, however, sits in a tight 1.50-1.57 band across the whole scan (only ~5% relative movement despite the 3.5x span in the underlying assumption) — because both samples share the same fixed r_c in each pass, the systematic largely cancels in the ratio. **"The two-halo crossover sits ~50-57% further out in the high-density environment" is the robust, r_c-choice-independent claim; "the crossover is at 89 kpc" is not**, without stating which r_c_fixed it's conditional on.
+
+**AIC/BIC verdict (fiducial fit, r_c_fixed=400 vs. free, both with the ordering fix):** low — free (k=4): chi2=6.23, dof=8, chi2/dof=0.778, AIC=14.23, BIC=16.17; fixed (k=3): chi2=8.50, dof=9, chi2/dof=0.945, AIC=14.50, BIC=15.96 (a wash, |ΔAIC|/|ΔBIC| < 2). High — free (k=4): chi2=12.17, dof=8, chi2/dof=1.52, AIC=20.17, BIC=22.11; fixed (k=3): chi2=12.34, dof=9, chi2/dof=1.37, AIC=18.34, BIC=19.79 (fixing r_c *improves* both criteria; ΔBIC≈2.3 is real, if modest, positive evidence for the simpler model) — the free r_c parameter wasn't earning its keep in the noisier subsample, exactly where you'd want that to be true.
+
+**Decision:** adopt A2=f*A1 ordering (f_max=0.999) + r_c_fixed=400.0 as the new pipeline default (mirrors `gamma_fixed`'s existing None-means-free convention exactly; pass `r_c_fixed=None` for the old floating behavior, still available for explicit A/B comparison via `compare_models_aic_bic`). Report h1 and the crossover_radius *ratio* between subsamples as the robust numbers; report absolute crossover_radius as conditional on r_c_fixed with the scan range as its systematic uncertainty; continue not reporting r_c/A2/gamma as independently physical numbers (the zone-luminosity and velocity measurements in `specs/subsample-derived-properties.md` were already unaffected by any of this, since they depend only on the derived boundary_radius, not on r_c/A2 point estimates).
+
+**Open follow-up:** the AIC/BIC and sensitivity-scan numbers above are from one specific real low/high-density subsample pair — worth re-running the same scan on at least one other split (e.g. the total/full-sample fit, or a different subsample-split candidate from `subsample_splits.md`) before treating r_c_fixed=400 as universal rather than "validated for the density split, plausible elsewhere."
+
+---
+
+## Pipeline organization pass: environment.py merge + halo→two-halo rename
+
+### 2026-07-21
+
+Two housekeeping changes requested alongside the r_c_fixed work above, both code-complete.
+
+**`environment.py` folded into `multicat.py`.** The Chartab et al. (2020) CANDELS overdensity helpers (`load_overdensity`, `attach_overdensity`, `split_by_overdensity` — see "Local overdensity as an environment parameter" above) lived in their own 4-function module. Too small to earn a separate file, so it was merged into `multicat.py` (the module whose `add_matched_column`/`split_product_by` it's built on) and the standalone file deleted. No call-site changes needed — nothing else imported `utils_lya_halo.environment` as a module.
+
+**"halo" → "two-halo" renamed wherever it meant the large-scale/clustering zone.** The pipeline had accumulated a real naming ambiguity: `measure_halo_luminosity` and `measure_core_halo_velocity` both used bare "halo" for the zone beyond the fitted core/halo crossover — which is physically the **two-halo**/clustering-term contribution (random density correlations + cosmic-web filaments), not a galaxy's own CGM halo. Meanwhile `h1` (the fit's inner exponential scale) is what's conventionally called "the halo scale length" (see the h1-is-the-halo-scale convention note), and `measure_onehalo_luminosity` (added 2026-07-18, see `specs/subsample-derived-properties.md` Part 3b) was already correctly named for the true one-halo/CGM zone. Austin's instruction: rename the ambiguous ones, leave `measure_onehalo_luminosity` and `find_core_halo_boundary`/`boundary_radius` (the crossover concept itself, not either zone) alone.
+
+Renamed: `measure_halo_luminosity` → `measure_twohalo_luminosity`; `measure_core_halo_velocity` → `measure_core_twohalo_velocity` (its `halo_combine` param and `halo_v_*` return keys → `twohalo_combine`/`twohalo_v_*`); `measure_three_zone_ratios`'s `halo_lum` parameter → `twohalo_lum`; `describe_subsample_properties`'s `halo_lum` parameter → `twohalo_lum`. `measure_outer_properties` (the one-call bundle) updated to match. All of `measure.py`, `analysis.py` (including `plot_flux_profile_fit`/`_two`'s "halo term alone" plot-legend labels → "two-halo term alone"), and `guide.py`'s front-door registry updated to match; `specs/subsample-derived-properties.md` got a dated addendum rather than a rewrite of its 2026-07-17/18 design narrative (preserved as the historical record).
+
+**A genuine pre-existing bug surfaced during the rename, not just a cosmetic rename:** `describe_subsample_properties`'s velocity section printed under the header `"-- velocity: core vs. halo (one-halo/CGM zone) --"`, but the value it prints (`vel['halo_v_fid']`, now `vel['twohalo_v_fid']`) comes from the COMBINED OUTER bins beyond the boundary — the two-halo zone, not one-halo/CGM. This directly validates Austin's stated reasoning for the rename ("the two-halo is the one that has a negative average velocity in those bins" — an infall signature at large radius). Fixed to `"-- velocity: core vs. two-halo --"` alongside the rename.
+
+While in `guide.py`, ran `check_guide()` and found (independent of the rename) 6 public functions missing front-door entries: `measure_onehalo_luminosity`, `measure_three_zone_ratios`, `analysis.describe_subsample_properties` (all added 2026-07-18, never registered), plus the 3 newly-merged `multicat` overdensity functions. Added entries for all 6 so `check_guide()` now reports clean (`{'missing': [], 'new': []}`).
+
+Full function-level diff: `CHANGELOG.md` (2026-07-21).
+
+**Follow-up, same day: `fitting.py`/`uv_profile.py` registered in `guide.py`, two investigative functions retired.** The pipeline audit above (in the prior chat turn) flagged that `fitting.py` (the PSF/profile-fitting engine) and `uv_profile.py` (the UV-continuum pipeline) had zero entries in `guide.py`'s front-end registry — and since `check_guide()` only scans modules that already have at least one entry, neither file was ever covered by the drift check at all. Added a `fitting` section (47 entries: PSF & convolution, Two-exponential fit, Expcore fit, Model comparison & boundary, UV-continuum fit) and a `uv_continuum` section (27 entries: Field & catalog I/O, Per-galaxy extraction, Coadd & fit, Stellar PSF) to `guide.py`. `check_guide()` now reports clean across all 8 sections.
+
+At the same time, removed `diagnose_crossover_failures`/`summarize_diagnosed_params` from `fitting.py` — both were one-off diagnostic tooling built specifically for the r_c/amplitude-ordering investigation above, and Austin asked for them to be dropped now that the investigation is closed and its fix has shipped as the pipeline standard. Confirmed no other code called them; the removal is noted in-line in `fitting.py` and in `CHANGELOG.md`, with this section remaining the full historical write-up of what they found.
+
+---
+
 ## See also
 
 - `GOALS.md` — project scope, headline measurements, and the settled/in-progress validation list

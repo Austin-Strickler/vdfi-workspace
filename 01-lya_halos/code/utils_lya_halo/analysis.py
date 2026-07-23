@@ -1075,6 +1075,7 @@ def plot_flux_profile_fit(
     method: str = "psf",
     fit_skip_inner: int = 1,
     gamma_fixed: float | None = 0.8,
+    r_c_fixed: float | None = 400.0,
     psf_r=None,
     psf_vals=None,
     psf_fwhm_arcsec: float = 1.3,
@@ -1131,6 +1132,17 @@ def plot_flux_profile_fit(
              is not the default (r_c/gamma degeneracy, AIC/BIC preferring
              two-exp on a free-gamma fit anyway). Ignored when
              model="twoexp".
+    r_c_fixed : 400.0 (NEW DEFAULT, 2026-07-21) -- ONLY used when
+             model="expcore". Bundled with an A2=f*A1 reparametrization
+             that structurally enforces A1>A2 (see
+             fitting.fit_psf_aware_expcore's docstring for the full
+             investigation: r_c/A2 are badly degenerate on realistic
+             subsample-split S/N even after that ordering fix alone, a
+             sensitivity scan found h1 and the crossover_radius RATIO
+             between subsamples stable across r_c_fixed in [200,700] kpc,
+             and AIC/BIC favor or are indifferent to the fixed-r_c model
+             on real fits). Pass None to let r_c float instead (the
+             pre-2026-07-21 default). Ignored when model="twoexp".
 
     boot['total_flux_fid'] is treated as a per-bin AVERAGE flux (not a sum;
     see fitting.bin_average_no_psf / bin_average_psf), matching how the real
@@ -1286,7 +1298,8 @@ def plot_flux_profile_fit(
         R = fitting.ring_convolution_matrix(r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
         if model == "expcore":
             fit_result = fitting.fit_psf_aware_expcore(r_mid, y, sigma, R, r_fine_arr, radial_bins,
-                                                       gamma_fixed=gamma_fixed, p0=p0, verbose=verbose)
+                                                       gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed,
+                                                       p0=p0, verbose=verbose)
         else:
             fit_result = fitting.fit_psf_aware(r_mid, y, sigma, R, r_fine_arr, radial_bins,
                                                p0=p0, verbose=verbose)
@@ -1297,7 +1310,8 @@ def plot_flux_profile_fit(
         if model == "expcore":
             fit_result = fitting.fit_naive_expcore(r_mid, radial_bins, r_fine_arr, y, sigma,
                                                     fit_skip_inner=fit_skip_inner,
-                                                    gamma_fixed=gamma_fixed, p0=p0, verbose=verbose)
+                                                    gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed,
+                                                    p0=p0, verbose=verbose)
         else:
             fit_result = fitting.fit_naive(r_mid, radial_bins, r_fine_arr, y, sigma,
                                            fit_skip_inner=fit_skip_inner, p0=p0,
@@ -1377,14 +1391,14 @@ def plot_flux_profile_fit(
             # the work at a given radius.
             if model == "expcore":
                 core_curve = A1_f * np.exp(-r_fine_arr / h1_f)
-                halo_curve = A2_f * (1.0 + (r_fine_arr / r_c_f) ** 2) ** (-gamma_f / 2.0)
+                twohalo_curve = A2_f * (1.0 + (r_fine_arr / r_c_f) ** 2) ** (-gamma_f / 2.0)
                 ax.plot(r_fine_arr, core_curve, "--", color=color, lw=1.3, alpha=0.65,
                         zorder=2, label=f"  core term alone (h1={h1_f:.2g})")
-                ax.plot(r_fine_arr, halo_curve, "-.", color=color, lw=1.3, alpha=0.65,
-                        zorder=2, label=f"  halo term alone (r_c={r_c_f:.2g}, gamma={gamma_f:.2g})")
+                ax.plot(r_fine_arr, twohalo_curve, "-.", color=color, lw=1.3, alpha=0.65,
+                        zorder=2, label=f"  two-halo term alone (r_c={r_c_f:.2g}, gamma={gamma_f:.2g})")
                 r_frac = fitting.radius_of_slope_fraction(r_c_f, gamma_f, frac=slope_frac)
                 ax.axvline(r_frac, color=color, ls=(0, (4, 1, 1, 1)), lw=1.2, alpha=0.8,
-                           label=(f"halo reaches {slope_frac*100:.0f}% of asymptotic slope "
+                           label=(f"two-halo reaches {slope_frac*100:.0f}% of asymptotic slope "
                                   f"(-{gamma_f:.2g}) at r={r_frac:.0f}"))
             else:
                 ax.plot(r_fine_arr, A1_f * np.exp(-r_fine_arr / h1_f), "--",
@@ -1392,7 +1406,7 @@ def plot_flux_profile_fit(
                         label=f"  core term alone (h1={h1_f:.2g})")
                 ax.plot(r_fine_arr, A2_f * np.exp(-r_fine_arr / h2_f), "-.",
                         color=color, lw=1.3, alpha=0.65, zorder=2,
-                        label=f"  halo term alone (h2={h2_f:.2g})")
+                        label=f"  two-halo term alone (h2={h2_f:.2g})")
     elif verbose:
         print(f"plot_flux_profile_fit: fit FAILED -- {fit_result.get('reason')}")
 
@@ -1425,7 +1439,7 @@ def plot_flux_profile_fit(
                       label="total fitted profile, local slope")
         ax_slope.plot(r_fine_arr[pos], fitting.effective_slope_expcore(r_fine_arr[pos], r_c_f, gamma_f),
                       color=color, lw=1.1, ls=":", alpha=0.6,
-                      label="halo term alone, analytic slope")
+                      label="two-halo term alone, analytic slope")
         ax_slope.axhline(-0.8, color="0.35", ls="--", lw=1.1,
                          label="Limber-projected z~2-3 clustering (-0.8)")
         ax_slope.axhline(-1.8, color="0.35", ls=":", lw=1.1,
@@ -1948,6 +1962,7 @@ def plot_flux_profile_two(
     fit_method: str = "psf",
     fit_skip_inner: int = 1,
     gamma_fixed: float | None = 0.8,
+    r_c_fixed: float | None = 400.0,
     psf_r=None,
     psf_vals=None,
     psf_fwhm_arcsec: float = 1.3,
@@ -2177,7 +2192,7 @@ def plot_flux_profile_two(
                 if fit_model == "expcore":
                     fr = fitting.fit_psf_aware_expcore(
                         r_mid_linear, s["y"], sigma, R, r_fine_arr, radial_bins,
-                        gamma_fixed=gamma_fixed, p0=fit_p0, verbose=False)
+                        gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed, p0=fit_p0, verbose=False)
                 else:
                     fr = fitting.fit_psf_aware(
                         r_mid_linear, s["y"], sigma, R, r_fine_arr, radial_bins,
@@ -2188,7 +2203,7 @@ def plot_flux_profile_two(
                     fr = fitting.fit_naive_expcore(
                         r_mid_linear, radial_bins, r_fine_arr, s["y"], sigma,
                         fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed,
-                        p0=fit_p0, verbose=False)
+                        r_c_fixed=r_c_fixed, p0=fit_p0, verbose=False)
                 else:
                     fr = fitting.fit_naive(
                         r_mid_linear, radial_bins, r_fine_arr, s["y"], sigma,
@@ -2301,7 +2316,7 @@ def plot_flux_profile_two(
 # already stash on their returned fit_result).
 # ---------------------------------------------------------------------
 def bootstrap_fit_profile(boot, r_edges, r_fine, *, model="expcore", method="psf", R=None,
-                          gamma_fixed=0.8, fit_skip_inner=1, p0=None,
+                          gamma_fixed=0.8, r_c_fixed=400.0, fit_skip_inner=1, p0=None,
                           nboot=None, seed=None, verbose=True):
     """
     Refit-per-draw parameter uncertainty, as an alternative to reading
@@ -2313,7 +2328,8 @@ def bootstrap_fit_profile(boot, r_edges, r_fine, *, model="expcore", method="psf
     locally quadratic (Gaussian) around the best fit. For model="expcore",
     r_c is known to be poorly approximated that way even with gamma pinned
     (see fitting.fit_psf_aware_expcore's docstring -- this is exactly why
-    gamma_fixed defaults to 0.8 now instead of floating). Refitting
+    gamma_fixed defaults to 0.8, and r_c_fixed defaults to 400.0 as of
+    2026-07-21, instead of both floating). Refitting
     independently to each of boot['total_flux_all']'s nboot rows and taking
     the 16/84 percentile spread of each resulting parameter -- INCLUDING
     the derived, non-fit-parameter core/halo crossover radius
@@ -2355,9 +2371,12 @@ def bootstrap_fit_profile(boot, r_edges, r_fine, *, model="expcore", method="psf
     method : "psf" (default, requires R) or "naive".
     R : ring_convolution_matrix output (or plot_flux_profile_fit's
         fit_result["R"]); required if method="psf", ignored for "naive".
-    gamma_fixed : passed straight through when model="expcore" (ignored for
-        model="twoexp"); use the SAME value as whatever headline fit you're
-        attaching these errors to (default 0.8).
+    gamma_fixed, r_c_fixed : passed straight through when model="expcore"
+        (ignored for model="twoexp"); use the SAME values as whatever
+        headline fit you're attaching these errors to (defaults 0.8 and
+        400.0 -- see fitting.fit_psf_aware_expcore's docstring for the
+        2026-07-21 investigation behind both defaults, including the
+        amplitude-ordering fix (A2=f*A1) that comes bundled with them).
     fit_skip_inner : "naive" method only -- forwarded to the underlying
         fit_naive/fit_naive_expcore.
     p0 : optional shared starting guess for every draw's fit (None ->
@@ -2422,10 +2441,11 @@ def bootstrap_fit_profile(boot, r_edges, r_fine, *, model="expcore", method="psf
         if model == "expcore":
             if method == "psf":
                 return fitting.fit_psf_aware_expcore(r_mid, y_row, sigma, R, r_fine, r_edges,
-                                                      gamma_fixed=gamma_fixed, p0=p0, verbose=False)
+                                                      gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed,
+                                                      p0=p0, verbose=False)
             return fitting.fit_naive_expcore(r_mid, r_edges, r_fine, y_row, sigma,
                                              fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed,
-                                             p0=p0, verbose=False)
+                                             r_c_fixed=r_c_fixed, p0=p0, verbose=False)
         if method == "psf":
             return fitting.fit_psf_aware(r_mid, y_row, sigma, R, r_fine, r_edges,
                                          p0=p0, verbose=False)
@@ -2456,15 +2476,16 @@ def bootstrap_fit_profile(boot, r_edges, r_fine, *, model="expcore", method="psf
     draws = {p: [] for p in params}
     n_success, n_failed, n_no_crossover = 0, 0, 0
 
+    _tag = f"gamma_fixed={gamma_fixed}" + (f", r_c_fixed={r_c_fixed}" if model == "expcore" else "")
     try:
         from tqdm import tqdm
         iterator = tqdm(range(n_use), disable=not verbose,
-                        desc=f"bootstrap_fit_profile [{model}/{method}, gamma_fixed={gamma_fixed}]")
+                        desc=f"bootstrap_fit_profile [{model}/{method}, {_tag}]")
     except ImportError:
         iterator = range(n_use)
         if verbose:
             print(f"bootstrap_fit_profile: refitting {n_use} draws "
-                  f"[{model}/{method}, gamma_fixed={gamma_fixed}] (tqdm not installed, no progress bar)")
+                  f"[{model}/{method}, {_tag}] (tqdm not installed, no progress bar)")
 
     for b in iterator:
         result = _one_fit(flux_all[b])
@@ -2482,6 +2503,7 @@ def bootstrap_fit_profile(boot, r_edges, r_fine, *, model="expcore", method="psf
 
     out = {"meta": {"model": model, "method": method,
                     "gamma_fixed": gamma_fixed if model == "expcore" else None,
+                    "r_c_fixed": r_c_fixed if model == "expcore" else None,
                     "fit_skip_inner": fit_skip_inner if method == "naive" else None,
                     "nboot_used": n_use, "seed": seed_record},
            "n_success": n_success, "n_failed": n_failed,
@@ -3152,7 +3174,7 @@ def _fmt_val_lohi(fid, lo=None, hi=None, fmt="10.4g") -> str:
     percentile, not a covariance-matrix sigma. 'n/a' for a missing/non-finite
     fid (the whole section wasn't computed); '[no error band]' when fid is
     finite but lo/hi aren't (e.g. a boot dict with no total_flux_all -- see
-    measure_onehalo_luminosity/measure_halo_luminosity's own fallback)."""
+    measure_onehalo_luminosity/measure_twohalo_luminosity's own fallback)."""
     if fid is None or not np.isfinite(fid):
         return "n/a"
     if lo is not None and hi is not None and np.isfinite(lo) and np.isfinite(hi):
@@ -3170,7 +3192,7 @@ def describe_subsample_properties(
     vel: dict | None = None,
     core_lum: dict | None = None,
     onehalo_lum: dict | None = None,
-    halo_lum: dict | None = None,
+    twohalo_lum: dict | None = None,
     ratios: dict | None = None,
     boot_fit: dict | None = None,
     truth=None,
@@ -3178,7 +3200,7 @@ def describe_subsample_properties(
     """
     subsample-derived-properties.md Part 5 -- one printed summary of every
     derived number Parts 1-3b can produce for ONE subsample: the fit, the
-    core/halo boundary, core-vs-halo velocity, and the core/one-halo/
+    core/two-halo boundary, core-vs-two-halo velocity, and the core/one-halo/
     two-halo luminosity split with ratios. Mirrors the house convention
     fitting.describe_fit/describe_fit_expcore already use for a single fit
     result (label header, `key = value [lo, hi]` rows) -- the "clean enough
@@ -3199,15 +3221,15 @@ def describe_subsample_properties(
     Example
     -------
         boundary = fitting.find_core_halo_boundary(fit_result)
-        vel  = measure.measure_core_halo_velocity(boot, boundary)
-        oh   = measure.measure_onehalo_luminosity(boot, boundary)
-        halo = measure.measure_halo_luminosity(boot, boundary)   # 2-halo term
+        vel     = measure.measure_core_twohalo_velocity(boot, boundary)
+        oh      = measure.measure_onehalo_luminosity(boot, boundary)
+        twohalo = measure.measure_twohalo_luminosity(boot, boundary)   # 2-halo term
         core = measure.measure_psf_corrected_core_luminosity(cfg, product, stacks, boot)
-        rat  = measure.measure_three_zone_ratios(core, oh, halo)
+        rat  = measure.measure_three_zone_ratios(core, oh, twohalo)
         analysis.describe_subsample_properties(
             label="low-z", n_gal=len(product.catalog), base_sample="AGN-excluded",
             fit_result=fit_result, boundary_info=boundary, vel=vel,
-            core_lum=core, onehalo_lum=oh, halo_lum=halo, ratios=rat,
+            core_lum=core, onehalo_lum=oh, twohalo_lum=twohalo, ratios=rat,
             boot_fit=boot_fit)   # optional -- see boot_fit param below
 
     Parameters
@@ -3227,21 +3249,17 @@ def describe_subsample_properties(
     boundary_info : fitting.find_core_halo_boundary's return dict, or a bare
         float boundary radius -- prints boundary_radius plus, when a dict,
         the model/source/boundary_from_own_fit flags the spec calls for.
-    vel : measure_core_halo_velocity (or measure_outer_properties, which
-        includes it) result -- core_v/halo_v/diff with 16/84 errors.
+    vel : measure_core_twohalo_velocity (or measure_outer_properties, which
+        includes it) result -- core_v/twohalo_v/diff with 16/84 errors.
     core_lum : measure_psf_corrected_core_luminosity result.
     onehalo_lum : measure_onehalo_luminosity result (Part 3b) -- the
         genuine one-halo/CGM zone, core bin < r <= boundary.
-    halo_lum : measure_halo_luminosity result (r > boundary). NOTE, per
-        Part 3b: despite its key names (halo_lum_fid etc, left unchanged on
-        purpose -- see Part 3b's "as implemented" note), this zone is
-        physically the TWO-HALO/clustering-term contribution (random
-        density correlations + cosmic-web filaments along the line of
-        sight), not this galaxy's own halo gas -- printed here under a
-        "2-halo" label for clarity even though the dict itself still says
-        "halo".
-    ratios : measure_three_zone_ratios result (Part 3b) -- halo/core,
-        2-halo/halo, 2-halo/total, and the reconciled total luminosity.
+    twohalo_lum : measure_twohalo_luminosity result (r > boundary) -- the
+        large-scale, TWO-HALO/clustering-term contribution (random density
+        correlations + cosmic-web filaments along the line of sight), not
+        this galaxy's own halo gas -- printed here under a "2-halo" label.
+    ratios : measure_three_zone_ratios result (Part 3b) -- one-halo/core,
+        2-halo/1-halo, 2-halo/total, and the reconciled total luminosity.
     boot_fit : OPTIONAL analysis.bootstrap_fit_profile result for this SAME
         subsample/fit_result -- adds a supplementary "fit parameters
         (bootstrap-refit)" section reporting h1 (exponential/CGM scale
@@ -3252,7 +3270,7 @@ def describe_subsample_properties(
         errors, printed in the "-- fit --" section above from fit_result
         alone, are known unreliable for r_c/gamma given their non-Gaussian
         chi2 surface even with gamma pinned). Deliberately does NOT change
-        which bins count as core/halo/2-halo -- that split still uses the
+        which bins count as core/one-halo/two-halo -- that split still uses the
         fixed point-estimate boundary_info, per the "cheap and honest"
         convention (report the boundary's own uncertainty as context,
         don't re-partition every luminosity/velocity bootstrap draw by a
@@ -3305,7 +3323,7 @@ def describe_subsample_properties(
     else:
         print("  (not computed -- run analysis.bootstrap_fit_profile and pass boot_fit=)")
 
-    print("\n-- core/halo boundary --")
+    print("\n-- core/two-halo boundary --")
     if boundary_info is not None:
         if isinstance(boundary_info, dict):
             b = boundary_info.get("boundary_radius")
@@ -3331,39 +3349,39 @@ def describe_subsample_properties(
     else:
         print("  (not computed)")
 
-    print("\n-- velocity: core vs. halo (one-halo/CGM zone) --")
+    print("\n-- velocity: core vs. two-halo --")
     if vel is not None:
         print(f"  core_v          = {_fmt_val_lohi(vel['core_v_fid'], vel['core_v_lo'], vel['core_v_hi'], '8.2f')}  km/s")
-        print(f"  halo_v          = {_fmt_val_lohi(vel['halo_v_fid'], vel['halo_v_lo'], vel['halo_v_hi'], '8.2f')}  km/s"
-              f"  ({vel.get('n_outer_bins', '?')} bins, {vel.get('halo_combine', '?')} combine)")
-        print(f"  core - halo     = {_fmt_val_lohi(vel['diff_fid'], vel['diff_lo'], vel['diff_hi'], '8.2f')}  km/s")
+        print(f"  twohalo_v       = {_fmt_val_lohi(vel['twohalo_v_fid'], vel['twohalo_v_lo'], vel['twohalo_v_hi'], '8.2f')}  km/s"
+              f"  ({vel.get('n_outer_bins', '?')} bins, {vel.get('twohalo_combine', '?')} combine)")
+        print(f"  core - two-halo = {_fmt_val_lohi(vel['diff_fid'], vel['diff_lo'], vel['diff_hi'], '8.2f')}  km/s")
     else:
         print("  (not computed)")
 
-    print("\n-- luminosity: core / halo (one-halo) / 2-halo -- erg/s --")
+    print("\n-- luminosity: core / one-halo / two-halo -- erg/s --")
     if core_lum is not None:
         print(f"  core    = {_fmt_val_lohi(core_lum['core_lum_fid'], core_lum['core_lum_lo'], core_lum['core_lum_hi'])}"
               f"  (PSF-corrected, bin {core_lum.get('inner_bin_index', '?')})")
     else:
         print("  core    = (not computed)")
     if onehalo_lum is not None:
-        print(f"  halo    = {_fmt_val_lohi(onehalo_lum['onehalo_lum_fid'], onehalo_lum['onehalo_lum_lo'], onehalo_lum['onehalo_lum_hi'])}"
+        print(f"  1-halo  = {_fmt_val_lohi(onehalo_lum['onehalo_lum_fid'], onehalo_lum['onehalo_lum_lo'], onehalo_lum['onehalo_lum_hi'])}"
               f"  ({onehalo_lum.get('n_zone_bins', '?')} bins, core<r<=boundary -- one-halo/CGM term)")
     else:
-        print("  halo    = (not computed)")
-    if halo_lum is not None:
-        print(f"  2-halo  = {_fmt_val_lohi(halo_lum['halo_lum_fid'], halo_lum['halo_lum_lo'], halo_lum['halo_lum_hi'])}"
-              f"  ({halo_lum.get('n_outer_bins', '?')} bins, r>boundary -- clustering/filament term,"
+        print("  1-halo  = (not computed)")
+    if twohalo_lum is not None:
+        print(f"  2-halo  = {_fmt_val_lohi(twohalo_lum['twohalo_lum_fid'], twohalo_lum['twohalo_lum_lo'], twohalo_lum['twohalo_lum_hi'])}"
+              f"  ({twohalo_lum.get('n_outer_bins', '?')} bins, r>boundary -- clustering/filament term,"
               f" NOT this galaxy's own CGM)")
     else:
         print("  2-halo  = (not computed)")
 
     print("\n-- luminosity ratios --")
     if ratios is not None:
-        print(f"  halo/core     = {_fmt_val_lohi(ratios['onehalo_over_core_fid'], ratios['onehalo_over_core_lo'], ratios['onehalo_over_core_hi'], '8.3f')}")
-        print(f"  2-halo/halo   = {_fmt_val_lohi(ratios['twohalo_over_onehalo_fid'], ratios['twohalo_over_onehalo_lo'], ratios['twohalo_over_onehalo_hi'], '8.3f')}")
+        print(f"  1-halo/core   = {_fmt_val_lohi(ratios['onehalo_over_core_fid'], ratios['onehalo_over_core_lo'], ratios['onehalo_over_core_hi'], '8.3f')}")
+        print(f"  2-halo/1-halo = {_fmt_val_lohi(ratios['twohalo_over_onehalo_fid'], ratios['twohalo_over_onehalo_lo'], ratios['twohalo_over_onehalo_hi'], '8.3f')}")
         print(f"  2-halo/total  = {_fmt_val_lohi(ratios['twohalo_over_total_fid'], ratios['twohalo_over_total_lo'], ratios['twohalo_over_total_hi'], '8.3f')}")
         tot = ratios.get("total_lum_fid")
-        print(f"  total (core+halo+2-halo) = {tot:.4g}  erg/s" if tot is not None and np.isfinite(tot) else "  total = n/a")
+        print(f"  total (core+1-halo+2-halo) = {tot:.4g}  erg/s" if tot is not None and np.isfinite(tot) else "  total = n/a")
     else:
-        print("  (not computed -- needs measure_three_zone_ratios(core_lum, onehalo_lum, halo_lum))")
+        print("  (not computed -- needs measure_three_zone_ratios(core_lum, onehalo_lum, twohalo_lum))")

@@ -24,6 +24,27 @@ Part 4 below and Open Question 3, now resolved). Part 5 (the
 `describe_subsample_properties` printer) implemented 2026-07-18 -- see
 Part 5 below.**
 
+**RENAME UPDATE (2026-07-21):** the naming deviation described throughout this
+spec -- "`measure_halo_luminosity` keeps its name, unchanged, despite
+physically being the two-halo/clustering zone" -- has been REVERSED. Austin
+asked explicitly for the "halo" → "two-halo" rename to go through everywhere
+it referred to this large-scale/clustering zone (not wherever "halo" means
+h1's scale length, and not `measure_onehalo_luminosity`, which was already
+correctly named). As of 2026-07-21: `measure_halo_luminosity` →
+`measure_twohalo_luminosity`; `measure_core_halo_velocity` →
+`measure_core_twohalo_velocity` (its `halo_combine` param and `halo_v_*`/
+`halo_combine` return keys → `twohalo_combine`/`twohalo_v_*`);
+`measure_three_zone_ratios`' `halo_lum` parameter → `twohalo_lum`;
+`describe_subsample_properties`' `halo_lum` parameter → `twohalo_lum` (and its
+mislabeled "-- velocity: core vs. halo (one-halo/CGM zone) --" print header,
+which described the TWO-halo zone despite the label, is now "-- velocity:
+core vs. two-halo --"). `find_core_halo_boundary`/`boundary_radius` are
+UNCHANGED -- that name refers to the crossover concept generically, not
+specifically to either zone. The rest of this document's body prose below
+(written 2026-07-17/18) is left as the historical record of the original
+design reasoning and still uses the pre-rename names in places; treat this
+addendum as authoritative for current names.
+
 ## Goal
 
 Today, `1_Measure_Splits.ipynb` calls `analysis.plot_centroid_profile_two` /
@@ -219,7 +240,7 @@ Part 3 flagged its own extraction code as closer to `extract.py`'s job than
 
 ## Part 3b — three-way split: core / halo / 2-halo (design settled 2026-07-18, implemented 2026-07-18)
 
-**As implemented — one deviation from the design below.** Austin's
+**As implemented (2026-07-18) — one deviation from the design below.** Austin's
 implementation instruction was explicit: don't touch the two already-shipped
 measurements, just fit the new one in alongside them. So
 `measure_halo_luminosity` was NOT renamed — it keeps its original name and
@@ -234,6 +255,15 @@ halo_lum)` combiner was added for the ratio numbers (`onehalo/core`,
 already-computed results, no new stacking/bootstrap. Everything else below
 (the zone definitions, the empirical-zone-sum method, the expcore-boundary
 recommendation, error alignment, edge cases) was implemented as designed.
+
+**REVERSED 2026-07-21 — see the top-of-document "RENAME UPDATE" note.** Austin
+decided the "halo" ambiguity this note above describes was worth fixing after
+all: `measure_halo_luminosity` → `measure_twohalo_luminosity`,
+`measure_core_halo_velocity` → `measure_core_twohalo_velocity`,
+`measure_three_zone_ratios`' `halo_lum` param → `twohalo_lum`.
+`measure_onehalo_luminosity` is unaffected (already correctly named). The
+"pins Austin's non-intrusive instruction" reasoning below is now superseded —
+kept for the historical record of why the 2026-07-18 pass didn't rename it.
 
 **The problem this fixes.** Part 3's "halo luminosity" (everything beyond the
 Part 1 crossover) is dominated by the fit's OUTER term — which
@@ -400,6 +430,20 @@ labeled "2-halo" and annotated "NOT this galaxy's own CGM" in the printed
 output itself, not just in the docstring — the whole point of Part 3b was
 that this distinction stops being implicit.
 
+**RENAMED 2026-07-21** (see top-of-document "RENAME UPDATE" note): the
+signature above is as it was on 2026-07-18. As of 2026-07-21 it's
+`analysis.describe_subsample_properties(*, label, n_gal=None,
+base_sample=None, fit_result=None, boundary_info=None, vel=None,
+core_lum=None, onehalo_lum=None, twohalo_lum=None, ratios=None, truth=None)`
+— `halo_lum` → `twohalo_lum`. The velocity section's print header, which used
+to read "-- velocity: core vs. halo (one-halo/CGM zone) --" (a genuine
+labeling bug: that section prints the TWO-halo-zone value, not a one-halo/CGM
+one, despite the header), now reads "-- velocity: core vs. two-halo --", and
+its rows print `twohalo_v`/`twohalo_combine` instead of `halo_v`/
+`halo_combine`. The luminosity section's "halo" row (which was always the
+one-halo zone, from `onehalo_lum`) is now explicitly labeled "1-halo" instead
+of "halo" for the same clarity reason.
+
 **The full cross-split table (one row per `subsample_splits.md` #1–11 entry,
 plus low-z/high-z, plus the full stack) is the eventual goal, not something
 this spec assembles in one automated pass.** It's built by running each split
@@ -411,6 +455,62 @@ just reformats an already-assembled `{label: props}` dict into one exportable
 table (`.write(path, format="latex")` / `.to_pandas().to_markdown()`). That
 aggregator is real but secondary — it has nothing to compute; it only
 reformats numbers that already came out of individual runs.
+
+**Addendum 2026-07-22 — PSF-leak-corrected one-halo (double-count fix).**
+`measure_psf_corrected_core_luminosity` (core) and `measure_onehalo_
+luminosity` (one-halo) were each individually correct in what they claimed
+to measure, but not jointly consistent: the core correction's own model
+implies a fraction `(1-EE_i)` of each galaxy's reconstructed point-source
+flux is scattered by the PSF *outside* the core aperture, and that
+scattered light was landing, completely unflagged, in exactly the radial
+bins `measure_onehalo_luminosity` sums — double-counted once as boosted
+core luminosity, once as raw one-halo flux. New `measure.
+measure_psf_corrected_core_onehalo_luminosity(config, product, stacks,
+boot, boundary_radius, ...)` extends the core correction's per-galaxy
+Moffat model from a single `EE_i` (at the core aperture) to a full
+encircled-energy profile evaluated at every one-halo bin edge, and
+subtracts each bin's predicted leaked fraction (as a ratio against the
+core aperture's own fraction, applied to that galaxy's own raw core
+spectrum) from the corresponding zone bin before stacking — a spectral
+subtraction, valid because the PSF smears a photon's position, not its
+wavelength. Core and one-halo come out of one restack + one bootstrap
+pass. Returns `(core_lum, onehalo_lum)`, key-compatible with the two
+existing functions so it drops straight into `measure_three_zone_ratios`/
+`describe_subsample_properties`; `onehalo_lum` additionally carries
+`onehalo_lum_raw_*`/`leaked_lum_*` for a direct before/after check. The
+two-halo zone is untouched, consistent with the existing "PSF
+contamination negligible beyond `boundary_radius`" assumption — this
+addendum doesn't re-derive that claim, just stops undermining it on the
+one-halo side. `measure_psf_corrected_core_luminosity` and `measure_
+onehalo_luminosity` are unchanged and remain the right (cheaper) call when
+only one zone is needed. A cheaper zone-total-only alternative also exists
+if you're willing to assume no leaked flux crosses `boundary_radius` at
+all: pure flux conservation, `onehalo_true = onehalo_raw - (core_lum_fid -
+raw_core_lum_fid)`, reusing the two existing functions' outputs with no
+new stacking pass — noted in the new function's own docstring but not
+implemented as a separate function, since the fuller per-bin version was
+what was asked for.
+
+**Addendum 2026-07-22 (2) — performance follow-up.** Profiling
+(`cProfile`, realistic synthetic scale) found the earlier flux-integration
+vectorization wasn't the real bottleneck: ~88% of runtime is inside
+`astropy.stats.biweight_location` itself, which scales worse than
+linearly in `nwave`. Fixed by slicing the cube to `_measurement_window`
+before restacking (the same helper/margin `measure_all_bins`/
+`bootstrap_all` already use, for the identical reason) rather than
+stacking the full `rest_wave` grid every draw. The zone-total conservation
+alternative floated just above was also implemented as an actual opt-in
+parameter, `assume_no_leak_beyond_boundary` — when True, the per-bin PSF
+profile and zone restack are skipped entirely and the one-halo zone total
+is corrected by pure flux conservation (`onehalo_true = onehalo_raw -
+(core_lum - raw_core_lum)`), restacking only 2 columns per draw (matching
+`measure_psf_corrected_core_luminosity`'s own original per-draw cost)
+instead of `1+n_zone`. Separately surfaced: `fitting.
+moffat_encircled_energy_fraction` at the two PSF widths `halo-flux-
+fitting.md`'s own systematic check already uses (1.3″ vs 2.4″) shows the
+leaked-flux fraction this whole correction is built on swings ~2-5x
+across that range — a real, currently-unreported systematic on the
+correction's *size*, independent of which computation mode is used.
 
 ## Open questions (remaining, minor)
 

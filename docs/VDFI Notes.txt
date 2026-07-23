@@ -382,11 +382,4 @@ Large-Scale Kinematics and HI optical depth: https://ui.adsabs.harvard.edu/abs/2
 Limber Approximation to convert between 3D and 2D Clustering: https://arxiv.org/pdf/astro-ph/0609165
 
 
-
-Claude Prompt:
-
-Housekeeping!!!
-- I want to first move environment dot pi into dot pi or multicat dot pi. Now the reason is because I don't think it has enough code in it to exist as a separate file, um, since it is so simple and and kind of, uh, only a few functions in it. I believe that it would work fine if it were to be put into multicat. Um, I and just add it as those functions in there just to basically make things a little bit better organized.
-- The other thing I want to do is organize the naming scheme. So I believe something we have right now, um, we define things as a, uh, halo versus two halo, um, and core. However, in the actual measure functions, there's measure halo luminosity and measure one halo luminosity. The one non non nonocity is correctly named that the halo may change to two halo luminosity. This should also be changing that references the specific large scale two halo scheme. If it is simply looking at something like a crossover radius of the one halo versus two halo or looking at the... more so the exponential decline, that's one halo. The two halo is the far large scale measurements that we're making. And so I wanna rename all of those things with two halo. all that would also include, um, the velocity shift, the core versus halo shift is really a core versus two halo shift as the two halo is the one that has a negative average velocity in those bins.
-- I also wanna do some cleaning up of the entire pipeline. So the emphasis is on the things that I've recently been working on. So that is just the general measurement pipeline that we've established in analysis dot pi, measure dot pi, plotting dot pi, UV profile dot pi, um, any of those generally, and fitting dot pi. We want to specifically be able to separate which of these functions are really core measurements that are included in this pipeline that we're making or in things that are just used simply for the exploration and debugging and diagnosing of whatever problems or things that we have in order for us to get to this final, um, measurement and be satisfied with it. So I want you to look in these files and do give us short summary in what you think should be, um, either edited or dropped,or left alone.
-- 
+Zoom link: https://us06web.zoom.us/j/86860542996

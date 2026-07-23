@@ -162,6 +162,49 @@ How the open questions below actually resolved:
 - **Q4 (line-window depth vs. fiducial r0):** still open — not addressed by
   the implementation.
 
+**Addendum (2026-07-21) — amplitude ordering fix + r_c_fixed default,
+superseding Q2's "r_c floats freely" resolution above.** A real low- vs.
+high-density subsample split exposed two problems with the as-implemented
+fit above, diagnosed via a new `fitting.diagnose_crossover_failures`: (1)
+`A2` was fit as an independent, unconstrained amplitude, and on a
+meaningful fraction of noisy bootstrap draws (2.8% of a low-density
+subsample, 20.3% of the paired high-density one) the fit returned `A2`
+exceeding `A1` near `r~0` — a degenerate, non-physical decomposition, not
+a search-bracket artifact (confirmed: 0 of these were fixable by widening
+`crossover_radius_expcore`'s `r_max`); (2) even after fixing that,`r_c`
+itself remains badly unidentified on realistic subsample-split S/N (a
+physically-ordered refit still returned `r_c` anywhere from ~2 to ~2400
+kpc on the noisier subsample). Full investigation, numbers, and the
+sensitivity-scan/AIC-BIC evidence behind the fix are in
+`docs/research-notes.md`, "Expcore fit stability: amplitude ordering & r_c
+degeneracy" (2026-07-21).
+
+**Resolution, now the shipped default in `fitting.fit_psf_aware_expcore`/
+`fit_naive_expcore`:** `A2` is reparametrized as `f*A1` (`f` bounded in
+`[0, f_max≈0.999]`), structurally forbidding the inversion; `r_c` gains a
+`r_c_fixed` parameter mirroring `gamma_fixed`'s existing None-means-free
+convention, defaulting to **400.0 kpc** (validated via a sensitivity scan
+over `r_c_fixed ∈ [200,700]` kpc and an AIC/BIC comparison against the
+free-`r_c` fit — the latter *improved* on the noisier subsample when `r_c`
+was fixed). Q2's original resolution ("`r_c` floats freely... `find_core_
+halo_boundary` compares the fitted crossover to R_vir post hoc") still
+describes the *mechanism* (the crossover is still read back out of the
+fit, not assumed), but no longer describes the *default* — `r_c` no
+longer floats by default; pass `r_c_fixed=None` for that behavior.
+
+**Reporting implication for the paper:** the derived `crossover_radius`
+is not r_c-independent (it scales with whatever `r_c_fixed` is assumed,
+since a larger `r_c` keeps the halo term near plateau longer before the
+core/halo crossing) and should be quoted as conditional on `r_c_fixed`,
+with the sensitivity-scan range as its systematic uncertainty. The
+low/high-subsample crossover_radius *ratio*, however, was stable to
+~5% across the whole scanned `r_c_fixed` range — that relative statement
+is the robust claim, not the absolute kpc value alone. `h1` is unaffected
+either way (stable under both the ordering fix and the r_c scan). `r_c`,
+`A2`, and `gamma` remain internal fit parameters, not independently
+reported physical numbers — unchanged guidance from before this addendum,
+now on firmer footing.
+
 Original proposal text (Q1–Q5 numbering above refers to this) kept below
 for the reasoning trail:
 

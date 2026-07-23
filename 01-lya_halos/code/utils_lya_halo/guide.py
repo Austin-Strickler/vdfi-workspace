@@ -74,6 +74,18 @@ SECTIONS = {
                    ["Virial conversions", "LSF / intrinsic profile",
                     "Star-PSF & line profiles", "Core / escape-fraction",
                     "Single galaxy"]),
+    "fitting":    ("Radial flux-profile fitting: PSF forward-modeling, the "
+                   "two-exponential and expcore (core + two-halo) models, "
+                   "and the UV-continuum single-component fit.",
+                   ["PSF & convolution", "Two-exponential fit (Part 1)",
+                    "Expcore fit (Part 2)", "Model comparison & boundary",
+                    "UV-continuum fit (Part 3)"]),
+    "uv_continuum": ("Part 3's standalone UV-continuum pipeline (CFHT-LS "
+                     "r-band): per-galaxy cutout/photometry through coadd, "
+                     "bootstrap, and stellar-PSF measurement. Not yet merged "
+                     "into extract.py -- see uv_profile.py's own module note.",
+                     ["Field & catalog I/O", "Per-galaxy extraction",
+                      "Coadd & fit", "Stellar PSF"]),
 }
 
 # ---------------------------------------------------------------------
@@ -300,38 +312,85 @@ _ENTRIES = [
        "fitting.bootstrap_fit_expcore. Expensive (nboot separate nonlinear "
        "fits); sanity-check with a small nboot first.",
        "bf = bootstrap_fit_profile(boot, r_edges, r_fine, model='expcore', R=R)"),
-    _e("measure_core_halo_velocity", "measure", "measure", "Derived properties",
-       "Core velocity (innermost bin's centroid, unmodified) vs. halo "
+    _e("describe_subsample_properties", "analysis", "measure", "Derived properties",
+       "Prints the full paper-ready summary for ONE subsample: the fit "
+       "(delegating to describe_fit/describe_fit_expcore), core/two-halo "
+       "boundary, core-vs-two-halo velocity, and the core/one-halo/two-halo "
+       "luminosity split with ratios. Purely a reporting function -- every "
+       "argument is an already-computed result dict, all optional. Added "
+       "2026-07-18. subsample-derived-properties.md Part 5.",
+       "describe_subsample_properties(label='low-z', fit_result=fr, vel=vel, "
+       "core_lum=core, onehalo_lum=oh, twohalo_lum=twohalo, ratios=rat)"),
+    _e("measure_core_twohalo_velocity", "measure", "measure", "Derived properties",
+       "Core velocity (innermost bin's centroid, unmodified) vs. two-halo "
        "velocity (inv-var- or biweight-combined centroid beyond a "
-       "core/halo boundary_radius), plus their difference -- all with "
+       "core/two-halo boundary_radius), plus their difference -- all with "
        "bootstrap errors reusing boot's existing per-draw centroid arrays, "
-       "no new resampling. subsample-derived-properties.md Part 2.",
-       "vel = measure_core_halo_velocity(boot, boundary_radius)"),
-    _e("measure_halo_luminosity", "measure", "measure", "Derived properties",
-       "Integrated luminosity beyond a core/halo boundary_radius: each "
+       "no new resampling. Renamed from measure_core_halo_velocity "
+       "(2026-07-21). subsample-derived-properties.md Part 2.",
+       "vel = measure_core_twohalo_velocity(boot, boundary_radius)"),
+    _e("measure_twohalo_luminosity", "measure", "measure", "Derived properties",
+       "Integrated luminosity beyond a core/two-halo boundary_radius: each "
        "outer bin's surface brightness times its OWN annulus area, summed "
        "-- a genuine luminosity (erg/s), not a raw sum of surface-"
-       "brightness values. NOTE: despite the name, this zone is two-halo/"
-       "clustering-term dominated, not the galaxy's own CGM -- see "
-       "measure_onehalo_luminosity for the true one-halo zone. subsample-"
+       "brightness values. This zone is two-halo/clustering-term "
+       "dominated, not the galaxy's own CGM -- see "
+       "measure_onehalo_luminosity for the true one-halo zone. Renamed "
+       "from measure_halo_luminosity (2026-07-21). subsample-"
        "derived-properties.md Part 3.",
-       "halo = measure_halo_luminosity(boot, boundary_radius)"),
+       "twohalo = measure_twohalo_luminosity(boot, boundary_radius)"),
+    _e("measure_onehalo_luminosity", "measure", "measure", "Derived properties",
+       "Integrated luminosity of the TRUE one-halo (CGM) zone: strictly "
+       "between the core bin and the fitted core/two-halo boundary_radius. "
+       "Same empirical zone-sum recipe as measure_twohalo_luminosity, just "
+       "over the inner radius range -- draw-aligned with it and with "
+       "measure_psf_corrected_core_luminosity's core_lum_all so ratios "
+       "between all three are safe. Added 2026-07-18. subsample-derived-"
+       "properties.md Part 3b.",
+       "oh = measure_onehalo_luminosity(boot, boundary_radius)"),
+    _e("measure_three_zone_ratios", "measure", "measure", "Derived properties",
+       "Combines core_lum + onehalo_lum + twohalo_lum into per-draw-aligned "
+       "ratios (onehalo/core, twohalo/onehalo, twohalo/total) and the "
+       "reconciled total luminosity. Pure arithmetic on already-computed "
+       "results, no new bootstrap. Added 2026-07-18. subsample-derived-"
+       "properties.md Part 3b.",
+       "rat = measure_three_zone_ratios(core_lum, onehalo_lum, twohalo_lum)"),
     _e("measure_outer_properties", "measure", "measure", "Derived properties",
        "One-call bundle of everything needing NO new stacking/bootstrap "
-       "pass: measure_core_halo_velocity + measure_halo_luminosity, merged "
-       "into one dict. Deliberately excludes core luminosity "
+       "pass: measure_core_twohalo_velocity + measure_twohalo_luminosity, "
+       "merged into one dict. Deliberately excludes core luminosity "
        "(measure_psf_corrected_core_luminosity), the one piece that DOES "
        "need a fresh restacking pass.",
        "props = measure_outer_properties(boot, boundary_radius)"),
     _e("measure_psf_corrected_core_luminosity", "measure", "measure", "Derived properties",
-       "The core-side counterpart to measure_halo_luminosity: PSF-"
+       "The core-side counterpart to measure_twohalo_luminosity: PSF-"
        "aperture-corrects the innermost bin PER GALAXY (a fixed literature "
        "Moffat converted to each galaxy's own kpc width via its z), "
        "re-stacks, and returns a true luminosity (erg/s) for that bin -- "
        "replaying boot's exact bootstrap seed/draw sequence so it's "
-       "ratio-safe against the halo side. subsample-derived-properties.md "
+       "ratio-safe against the two-halo side. subsample-derived-properties.md "
        "Part 3, core side.",
        "core = measure_psf_corrected_core_luminosity(cfg, product, stacks, boot)"),
+    _e("measure_psf_corrected_core_onehalo_luminosity", "measure", "measure", "Derived properties",
+       "Core correction + one-halo PSF-leak subtraction together in ONE "
+       "restack + bootstrap pass. Extends the core's per-galaxy Moffat EE "
+       "model to a full profile evaluated at every one-halo bin edge, so "
+       "the fraction of core flux the PSF model predicts leaked into each "
+       "zone bin is subtracted from that galaxy's raw spectrum before "
+       "stacking -- closes a double-count between measure_psf_corrected_"
+       "core_luminosity (boosts the core) and measure_onehalo_luminosity "
+       "(left the leaked light uncorrected in the zone). Returns "
+       "(core_lum, onehalo_lum), key-compatible with both older functions' "
+       "outputs (drop straight into measure_three_zone_ratios/"
+       "describe_subsample_properties); onehalo_lum also carries "
+       "onehalo_lum_raw_*/leaked_lum_* diagnostics. Bootstraps only the "
+       "_measurement_window-sliced cube (biweight dominates runtime and "
+       "scales worse than linearly in nwave -- same fix bootstrap_all "
+       "already uses). assume_no_leak_beyond_boundary=True swaps in a much "
+       "cheaper conservation-only mode (2 restacked columns per draw "
+       "instead of 1+n_zone) if you're willing to assume no leaked flux "
+       "crosses boundary_radius at all. Added 2026-07-22.",
+       "core, oh = measure_psf_corrected_core_onehalo_luminosity(cfg, product, stacks, boot, boundary_radius)"),
     _e("compare_centroid_methods", "analysis", "measure", "Method comparison",
        "Point estimates (no bootstrap) from all standard estimators on the "
        "fiducial stack, as a printed table. The fastest way to see how much the "
@@ -694,6 +753,22 @@ _ENTRIES = [
        "Overlay centroid-vs-radius for several labelled samples with sensible "
        "multi-catalog defaults. The one-liner comparison figure for a split.",
        "compare_centroids(boot_by)"),
+    _e("load_overdensity", "multicat", "sample", "Multi-catalog",
+       "Load the Chartab et al. (2020) CANDELS environment-density catalog "
+       "(VizieR J/ApJ/890/7) for one field. Folded in from the standalone "
+       "environment.py (2026-07-21).",
+       "od = load_overdensity('COSMOS')"),
+    _e("attach_overdensity", "multicat", "sample", "Multi-catalog",
+       "Positionally cross-match a product onto the Chartab overdensity catalog "
+       "and attach the density column. add_matched_column, specialized for this "
+       "one catalog. Folded in from environment.py (2026-07-21).",
+       "product = attach_overdensity(product, field='COSMOS')"),
+    _e("split_by_overdensity", "multicat", "sample", "Split",
+       "Low/high environment-density split using the attached Chartab column, "
+       "across one or both fields, with an optional mass-matching pass. "
+       "split_product_by, specialized for this one catalog. Folded in from "
+       "environment.py (2026-07-21).",
+       "lo, hi = split_by_overdensity(product)"),
     _e("plot_sky", "selection", "sample", "Sky plots",
        "Scatter the sample on the sky, optionally highlighting a selection and "
        "drawing a cone. Sanity-check where a cut lands spatially.",
@@ -957,6 +1032,336 @@ _ENTRIES = [
        "noise_from_stacks; this is 'does minimizing continuum noise raise "
        "line S/N', plotted, not ranked.",
        "fig, tbl = plot_line_snr_summary(scores)"),
+
+    # =====================================================================
+    # fitting.py -- radial flux-profile fitting (registered 2026-07-21;
+    # previously not a contributing module, so check_guide() never scanned
+    # it. diagnose_crossover_failures/summarize_diagnosed_params were
+    # deleted the same day (one-off investigative tooling, task done) so
+    # they are NOT listed here.
+    # =====================================================================
+    _e("moffat_1d", "fitting", "fitting", "PSF & convolution",
+       "Unnormalized Moffat PSF profile (1+(r/alpha)^2)^-beta, alpha derived "
+       "from FWHM/beta. The literature-grounded PSF form used throughout "
+       "this pipeline's fits.",
+       "psf = moffat_1d(r_fine, fwhm=1.3, beta=3.0)"),
+    _e("normalize_psf_flux", "fitting", "fitting", "PSF & convolution",
+       "Rescale a 1D radial PSF array so integral(psf(r)*2*pi*r dr) == 1 -- "
+       "flux-conserving normalization for any PSF curve, empirical or analytic.",
+       "psf_norm = normalize_psf_flux(r_fine, psf)"),
+    _e("moffat_encircled_energy_fraction", "fitting", "fitting", "PSF & convolution",
+       "Fraction of a point source's total flux landing within a circular "
+       "aperture of a given radius, for a Moffat PSF. Feeds the innermost-bin "
+       "aperture correction.",
+       "ee = moffat_encircled_energy_fraction(r_ap, fwhm=1.3, beta=3.0)"),
+    _e("default_fine_grid", "fitting", "fitting", "PSF & convolution",
+       "Build a sensible r_fine grid: n_per_bin points spread across EACH "
+       "radial bin, for evaluating the intrinsic profile before PSF convolution.",
+       "r_fine = default_fine_grid(r_edges, n_per_bin=20)"),
+    _e("ring_convolution_matrix", "fitting", "fitting", "PSF & convolution",
+       "R[i,j] = fraction of a unit-flux thin ring at r_fine[j] observed in "
+       "radial bin i, after PSF blurring -- the closed-form 1D forward-model "
+       "matrix every PSF-aware fit multiplies against.",
+       "R = ring_convolution_matrix(r_edges, r_fine, fwhm=1.3, beta=3.0)"),
+    _e("validate_ring_convolution", "fitting", "fitting", "PSF & convolution",
+       "Regression check: compares the fast trapz-based ring convolution "
+       "against a slow direct-integration reference, confirming flux "
+       "conservation out to large radius. A test, not a measurement.",
+       "validate_ring_convolution(r_edges, r_fine, fwhm=1.3, beta=3.0)"),
+    _e("intrinsic_profile", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "I(r) = A1*exp(-r/h1) + A2*exp(-r/h2), h1<h2 by convention. The Part 1 "
+       "two-exponential intrinsic (pre-PSF) flux-profile model.",
+       "y = intrinsic_profile(r_fine, A1, h1, A2, h2)"),
+    _e("estimate_truth_from_profile", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "Quick, no-optimizer, two-exponential ballpark estimate (A1,h1,A2,h2) "
+       "from the binned data alone -- a seed generator, not a fit.",
+       "p0 = estimate_truth_from_profile(r_mid, y_fid)"),
+    _e("bin_average_no_psf", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "Mean intrinsic (no-PSF) flux in each bin: the fine-grid integral "
+       "divided by bin width. What fit_naive predicts against.",
+       "y_bin = bin_average_no_psf(r_edges, r_fine, A1, h1, A2, h2)"),
+    _e("bin_average_psf", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "Mean PSF-smeared flux in each bin: (R @ fine_flux)/bin width. What "
+       "fit_psf_aware predicts against.",
+       "y_bin = bin_average_psf(R, r_fine, A1, h1, A2, h2)"),
+    _e("fit_naive", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "Two-exponential fit with NO PSF correction: drops the inner bin(s) "
+       "(fit_skip_inner) instead, on the assumption the PSF only meaningfully "
+       "affects those. Multi-seed-then-lowest-chi2, amplitude-normalized.",
+       "result = fit_naive(r_mid, r_edges, r_fine, y_fid, sigma)"),
+    _e("fit_psf_aware", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "Two-exponential fit WITH the full PSF forward model (ring_convolution_"
+       "matrix) -- every bin fit, including the innermost. The PSF-aware "
+       "headline fit this pipeline defaults to.",
+       "result = fit_psf_aware(r_mid, y_fid, sigma, R, r_fine, r_edges)"),
+    _e("describe_fit", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "Pretty-print a fit_naive/fit_psf_aware result: recovered (A1,h1,A2,h2) "
+       "with 1-sigma covariance errors, chi2/dof, success flag.",
+       "describe_fit(result, label='full stack')"),
+    _e("binned_model_from_result", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "The fit's prediction in the SAME per-bin average-flux units as the "
+       "data, for overlaying a fitted curve's predicted bin means on a plot.",
+       "y_pred = binned_model_from_result(result, r_fine, r_edges, R)"),
+    _e("crossover_radius_twoexp", "fitting", "fitting", "Two-exponential fit (Part 1)",
+       "Radius where the two-exponential model's two terms are equal -- "
+       "closed-form/root-find on the fitted A1,h1,A2,h2.",
+       "r_x = crossover_radius_twoexp(result)"),
+    _e("intrinsic_profile_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "I(r) = A1*exp(-r/h1) + A2*(1+(r/r_c)^2)^(-gamma/2) -- Part 2's "
+       "exponential-core + cored-power-law model, the two-halo term's "
+       "physically-motivated stand-in for a clustering profile.",
+       "y = intrinsic_profile_expcore(r_fine, A1, h1, A2, r_c, gamma)"),
+    _e("bin_average_no_psf_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Mean intrinsic (no-PSF) expcore flux in each bin -- same role as "
+       "bin_average_no_psf for the expcore model.",
+       "y_bin = bin_average_no_psf_expcore(r_edges, r_fine, A1, h1, A2, r_c, gamma)"),
+    _e("bin_average_psf_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Mean PSF-smeared expcore flux in each bin -- same role as "
+       "bin_average_psf for the expcore model.",
+       "y_bin = bin_average_psf_expcore(R, r_fine, A1, h1, A2, r_c, gamma)"),
+    _e("fit_naive_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Expcore analogue of fit_naive: no PSF correction, drops fit_skip_inner "
+       "bins. As of 2026-07-21: A2=f*A1 reparametrized (forces A1>A2) and "
+       "r_c_fixed defaults to 400.0 (mirrors gamma_fixed's None-means-free "
+       "convention) -- see [[lya-halos-expcore-ordering-rc-fixed-default]].",
+       "result = fit_naive_expcore(r_mid, r_edges, r_fine, y_fid, sigma)"),
+    _e("fit_psf_aware_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Expcore analogue of fit_psf_aware: full PSF forward model, all bins "
+       "fit. The pipeline-standard expcore fit as of 2026-07-21 (A2=f*A1 "
+       "ordering + r_c_fixed=400.0 default).",
+       "result = fit_psf_aware_expcore(r_mid, y_fid, sigma, R, r_fine, r_edges)"),
+    _e("describe_fit_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Pretty-print an expcore fit result -- same role as describe_fit, "
+       "for the expcore model's parameters.",
+       "describe_fit_expcore(result, label='low-density')"),
+    _e("binned_model_from_result_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Expcore analogue of binned_model_from_result: the fit's prediction "
+       "in per-bin average-flux units.",
+       "y_pred = binned_model_from_result_expcore(result, r_fine, r_edges, R)"),
+    _e("crossover_radius_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Radius where the expcore model's core and two-halo terms are equal -- "
+       "root-find over a default (50*h1, 5*r_c)-scaled bracket. NOT r_c-"
+       "independent -- report conditional on r_c_fixed.",
+       "r_x = crossover_radius_expcore(result)"),
+    _e("projected_slope_from_3d", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Limber approximation: converts a 3D correlation slope gamma_3d to "
+       "the expected 2D-projected outer slope. Grounds expcore's gamma_fixed "
+       "default (0.8) in the Limber-projected z~2-3 clustering slope.",
+       "gamma_2d = projected_slope_from_3d(1.8)"),
+    _e("deprojected_slope_bounds", "fitting", "fitting", "Expcore fit (Part 2)",
+       "The two endpoints bracketing the expected 2D outer slope for a 3D "
+       "clustering slope range -- used to sanity-check gamma_fixed choices.",
+       "lo, hi = deprojected_slope_bounds()"),
+    _e("effective_slope_expcore", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Local (point-by-point) log-log slope of the two-halo term ALONE, "
+       "for overlaying against the total fitted profile's slope on a "
+       "slope-vs-radius panel.",
+       "slope = effective_slope_expcore(r_fine, r_c, gamma)"),
+    _e("radius_of_slope_fraction", "fitting", "fitting", "Expcore fit (Part 2)",
+       "Closed-form radius where the two-halo term's local log-log slope "
+       "reaches a given fraction of its asymptotic (-gamma) value.",
+       "r_frac = radius_of_slope_fraction(r_c, gamma, frac=0.9)"),
+    _e("compare_models_aic_bic", "fitting", "fitting", "Model comparison & boundary",
+       "Compare two fit results (e.g. twoexp vs expcore, or free-r_c vs "
+       "r_c_fixed) via chi2/AIC/BIC. Used to justify r_c_fixed=400.0 as the "
+       "2026-07-21 default -- see docs/research-notes.md.",
+       "compare_models_aic_bic(result_a, result_b, label_a='free', label_b='fixed')"),
+    _e("find_core_halo_boundary", "fitting", "fitting", "Model comparison & boundary",
+       "THE core/two-halo boundary for one subsample's fit_result: the "
+       "radius where the fitted core and two-halo terms cross, with a "
+       "fallback-radius/fallback-fit chain if the fit itself has no crossing. "
+       "Feeds measure.py's zone-based derived properties.",
+       "boundary = find_core_halo_boundary(fit_result)"),
+    _e("sphere_of_influence_kpc", "fitting", "fitting", "Model comparison & boundary",
+       "Sorini+2018's ~7x-R_vir 'sphere of influence' scale -- the radius "
+       "beyond which the two-halo/clustering term has fully taken over, for "
+       "comparing against a fitted r_c.",
+       "r_soi = sphere_of_influence_kpc(rvir_kpc=75.0)"),
+    _e("local_loglog_slope", "fitting", "fitting", "Model comparison & boundary",
+       "Generic numerical local log-log slope d(ln y)/d(ln r) via central "
+       "differences, for any curve (not just the expcore two-halo term).",
+       "slope = local_loglog_slope(r_fine, y_fine)"),
+    _e("sersic_bn", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Ciotti & Bertin (1999) approximation for b_n, the constant in the "
+       "Sersic profile's exponent -- feeds intrinsic_profile_uv_sersic.",
+       "bn = sersic_bn(n=1.0)"),
+    _e("intrinsic_profile_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "I(r) = A*exp(-r/h_uv) -- Part 3's default single-exponential "
+       "UV-continuum model.",
+       "y = intrinsic_profile_uv_exp(r_fine, A, h_uv)"),
+    _e("intrinsic_profile_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "I(r) = A*exp(-b_n*[(r/r_e)^(1/n) - 1]) -- Part 3's optional Sersic "
+       "alternative to the single exponential.",
+       "y = intrinsic_profile_uv_sersic(r_fine, A, r_e, n)"),
+    _e("bin_average_no_psf_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Mean intrinsic single-exponential UV flux in each bin, no PSF.",
+       "y_bin = bin_average_no_psf_uv_exp(r_edges, r_fine, A, h_uv)"),
+    _e("bin_average_psf_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Mean PSF-smeared single-exponential UV surface brightness in each bin.",
+       "y_bin = bin_average_psf_uv_exp(R, r_fine, A, h_uv)"),
+    _e("bin_average_no_psf_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Sersic analogue of bin_average_no_psf_uv_exp.",
+       "y_bin = bin_average_no_psf_uv_sersic(r_edges, r_fine, A, r_e, n)"),
+    _e("bin_average_psf_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Sersic analogue of bin_average_psf_uv_exp.",
+       "y_bin = bin_average_psf_uv_sersic(R, r_fine, A, r_e, n)"),
+    _e("describe_fit_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Pretty-print a single-exponential UV fit result -- same role as "
+       "describe_fit_expcore, for the UV-continuum model.",
+       "describe_fit_uv_exp(result)"),
+    _e("describe_fit_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Pretty-print a Sersic UV fit result.",
+       "describe_fit_uv_sersic(result)"),
+    _e("fit_naive_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Single-exponential UV-continuum fit with NO PSF -- drop-inner-bin(s) "
+       "convention, same as fit_naive.",
+       "result = fit_naive_uv_exp(r_mid, r_edges, r_fine, y_fid, sigma)"),
+    _e("fit_psf_aware_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Single-exponential UV-continuum fit WITH the PSF forward model -- "
+       "the real UV/Lya-scale-ratio result (h1~16-17kpc Lya, UV~1.55kpc, "
+       "ratio ~10:1) came from this fit.",
+       "result = fit_psf_aware_uv_exp(r_mid, y_fid, sigma, R, r_fine, r_edges)"),
+    _e("fit_naive_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Sersic UV-continuum fit with NO PSF -- same naive/drop-inner-bin(s) "
+       "convention as fit_naive_uv_exp.",
+       "result = fit_naive_uv_sersic(r_mid, r_edges, r_fine, y_fid, sigma)"),
+    _e("fit_psf_aware_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Sersic UV-continuum fit WITH the PSF forward model -- same structure "
+       "as fit_psf_aware_uv_exp.",
+       "result = fit_psf_aware_uv_sersic(r_mid, y_fid, sigma, R, r_fine, r_edges)"),
+    _e("binned_model_from_result_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "UV-exponential analogue of binned_model_from_result.",
+       "y_pred = binned_model_from_result_uv_exp(result, r_fine, r_edges, R)"),
+    _e("binned_model_from_result_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "UV-Sersic analogue of binned_model_from_result_expcore.",
+       "y_pred = binned_model_from_result_uv_sersic(result, r_fine, r_edges, R)"),
+    _e("plot_uv_fit", "fitting", "fitting", "UV-continuum fit (Part 3)",
+       "Notebook-testing convenience for halo-flux-fitting.md Part 3's UV "
+       "fit -- quick-look plot of a UV coadd + its fitted curve.",
+       "plot_uv_fit(r_mid, y_fid, result, r_fine)"),
+
+    # =====================================================================
+    # uv_profile.py -- Part 3's standalone UV-continuum pipeline (registered
+    # 2026-07-21; previously not a contributing module). Per CHANGELOG
+    # 2026-07-15, this file is a "standalone testbed, not yet merged into
+    # extract.py" -- real results have come out of it (the UV/Lya scale
+    # ratio, see [[uv-lya-scale-result]]), but it isn't wired into the main
+    # Stage 1-3 driver path the way measure.py/analysis.py are.
+    # =====================================================================
+    _e("resolve_uv_image_path", "uv_profile", "uv_continuum", "Field & catalog I/O",
+       "Per-field CFHT-LS r-band image path, from the normalized field name.",
+       "path = resolve_uv_image_path('COSMOS')"),
+    _e("resolve_uv_segmap_path", "uv_profile", "uv_continuum", "Field & catalog I/O",
+       "Per-field background segmap path, or None if not configured for "
+       "that field.",
+       "path = resolve_uv_segmap_path('COSMOS')"),
+    _e("read_seeing_fwhm_arcsec", "uv_profile", "uv_continuum", "Field & catalog I/O",
+       "Seeing FWHM (arcsec) for a field, tried from each of the configured "
+       "FITS header keys in turn.",
+       "fwhm = read_seeing_fwhm_arcsec('COSMOS')"),
+    _e("get_uv_sample_catalog", "uv_profile", "uv_continuum", "Field & catalog I/O",
+       "Pull the RA/Dec/z/mass sample straight from the already-built Lya "
+       "product -- the same galaxies the halo-profile pipeline uses.",
+       "catalog = get_uv_sample_catalog(product)"),
+    _e("compute_field_bbox", "uv_profile", "uv_continuum", "Field & catalog I/O",
+       "RA/Dec bounding box for one field's subsample of the catalog, "
+       "padded by a margin -- sizes build_field_cutout.",
+       "bbox = compute_field_bbox(catalog, 'COSMOS')"),
+    _e("validate_cutout_covers_sample", "uv_profile", "uv_continuum", "Field & catalog I/O",
+       "Check whether an existing cutout FITS's WCS footprint covers every "
+       "galaxy in the sample -- a sanity check before extraction, not a "
+       "measurement.",
+       "validate_cutout_covers_sample(cutout_path, catalog, 'COSMOS')"),
+    _e("build_field_cutout", "uv_profile", "uv_continuum", "Field & catalog I/O",
+       "Build a WCS-aware cutout FITS from the full ~1 deg^2 mosaic, sized "
+       "to cover the field's sample with margin.",
+       "cutout_path = build_field_cutout('COSMOS', catalog)"),
+    _e("psf_fwhm_kpc_for_z", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "Convert an angular seeing FWHM (arcsec) to a physical FWHM (kpc) at "
+       "one galaxy's redshift.",
+       "fwhm_kpc = psf_fwhm_kpc_for_z(fwhm_arcsec, z)"),
+    _e("make_galaxy_cutout", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "Small WCS-aware stamp around (ra, dec), sized by size_arcsec -- the "
+       "per-galaxy starting point for centroiding and photometry.",
+       "cutout = make_galaxy_cutout(field_cutout, ra, dec, size_arcsec=10)"),
+    _e("centroid_galaxy", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "2D-Gaussian centroid (photutils.centroid_2dg) on a galaxy cutout, "
+       "windowed to avoid neighbor contamination. Kept-but-flagged, never "
+       "silently dropped, if it fails.",
+       "xc, yc, ok = centroid_galaxy(cutout)"),
+    _e("align_segmap_to_grid", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "Reproject a segmentation-mask FITS onto a target (wcs, shape) grid -- "
+       "aligns the neighbor-masking segmap to a galaxy cutout's own pixels.",
+       "seg_aligned = align_segmap_to_grid(segmap, target_wcs, target_shape)"),
+    _e("compute_field_background", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "Global background level for one field's cutout: masked-median of "
+       "unmasked sky pixels.",
+       "bg = compute_field_background(field_cutout, segmap)"),
+    _e("radial_bin_edges_uv", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "Per-galaxy kpc bin edges converted to arcsec, using that galaxy's "
+       "own z -- reuses the halo-profile pipeline's bin_mode convention.",
+       "edges_arcsec = radial_bin_edges_uv(r_edges_kpc, z)"),
+    _e("measure_uv_annuli", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "Per-annulus flux, background-subtracted, reduced across pixels via "
+       "masked-median with segmap-based neighbor masking.",
+       "flux_per_bin = measure_uv_annuli(cutout, edges_arcsec, bg, segmap)"),
+    _e("extract_uv_profiles_for_field", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "Single-field-at-a-time loop over every galaxy in the catalog: "
+       "cutout -> centroid -> background -> annuli, one dict per galaxy.",
+       "profiles = extract_uv_profiles_for_field('COSMOS', catalog, cfg)"),
+    _e("summarize_uv_extraction", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "QC summary over a list of per-galaxy extraction dicts -- centroid "
+       "success rate, flagged galaxies, basic sanity stats. Diagnostic, not "
+       "part of the measurement itself.",
+       "summarize_uv_extraction(profiles)"),
+    _e("run_uv_extraction_testbed", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+       "One-call smoke test: get_uv_sample_catalog -> resolve image path -> "
+       "extract_uv_profiles_for_field, for a quick end-to-end check. Testing "
+       "convenience, not a production driver.",
+       "profiles = run_uv_extraction_testbed('COSMOS', cfg)"),
+    _e("coadd_uv_profiles", "uv_profile", "uv_continuum", "Coadd & fit",
+       "Coadd per-galaxy UV profiles (extract_uv_profiles_for_field's list) "
+       "into one stacked radial profile, via a chosen combine method.",
+       "stack = coadd_uv_profiles(profiles, method='biweight')"),
+    _e("bootstrap_uv_coadd", "uv_profile", "uv_continuum", "Coadd & fit",
+       "Bootstrap error band for one coadd_uv_profiles() method, resampling "
+       "the galaxy list.",
+       "boot = bootstrap_uv_coadd(profiles, method='biweight', nboot=1000)"),
+    _e("fit_and_plot_uv_coadd", "uv_profile", "uv_continuum", "Coadd & fit",
+       "Fit + plot one coadd_uv_profiles() method's stacked profile, via "
+       "fitting.fit_psf_aware_uv_exp/_uv_sersic.",
+       "result = fit_and_plot_uv_coadd(boot, r_edges_kpc)"),
+    _e("stack_and_bootstrap_uv", "uv_profile", "uv_continuum", "Coadd & fit",
+       "Coadd + bootstrap ONCE, decoupled from fitting -- run this a single "
+       "time, then fit_and_plot_uv_coadd/fitting.* as many times as needed "
+       "without re-stacking.",
+       "boot = stack_and_bootstrap_uv(profiles, r_edges_kpc)"),
+    _e("bootstrap_and_fit_uv", "uv_profile", "uv_continuum", "Coadd & fit",
+       "One-call coadd -> bootstrap -> fit -> plot for the UV-continuum "
+       "sample -- the end-to-end convenience wrapping the steps above.",
+       "result = bootstrap_and_fit_uv(profiles, r_edges_kpc)"),
+    _e("measure_stellar_psf", "uv_profile", "uv_continuum", "Stellar PSF",
+       "Measure the empirical stellar PSF for a field: each star's radial "
+       "profile, coadded -- the psf_empirical alternative to a fitted Moffat.",
+       "psf_r, psf_vals = measure_stellar_psf('COSMOS', star_catalog)"),
+    _e("fit_moffat_psf", "uv_profile", "uv_continuum", "Stellar PSF",
+       "Fit an analytic Moffat (both FWHM and beta free) to a measured "
+       "stellar PSF curve -- the alternative to keeping the empirical curve "
+       "as-is (see [[uv-psf-empirical-decision]]).",
+       "fwhm, beta = fit_moffat_psf(psf_r, psf_vals)"),
+    _e("psf_empirical_entry", "uv_profile", "uv_continuum", "Stellar PSF",
+       "Turn a measured stellar-PSF curve into a paste-ready config entry "
+       "for the psf_empirical slot.",
+       "entry = psf_empirical_entry(psf_r, psf_vals)"),
+    _e("build_effective_psf_uv", "uv_profile", "uv_continuum", "Stellar PSF",
+       "Build the sample's effective PSF curve (psf_r, psf_vals) in kpc, "
+       "per-galaxy kpc-converted and combined -- what the UV PSF-aware fit "
+       "actually convolves with.",
+       "psf_r, psf_vals = build_effective_psf_uv(profiles)"),
+    _e("apply_psf_to_results", "uv_profile", "uv_continuum", "Stellar PSF",
+       "(Re)assign each galaxy's PSF metadata -- psf_fwhm_arcsec, "
+       "psf_fwhm_kpc, etc. -- onto an existing extraction-results list.",
+       "profiles = apply_psf_to_results(profiles, psf_r, psf_vals)"),
 ]
 
 

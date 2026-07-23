@@ -1915,22 +1915,39 @@ def flux_curve_of_growth_annulus(
 
 
 # =====================================================================
-# 4b. SUBSAMPLE-DERIVED CORE/HALO PROPERTIES
+# 4b. SUBSAMPLE-DERIVED CORE/TWO-HALO PROPERTIES
 #     (subsample-derived-properties.md Parts 2-3)
 #
 # All of these operate on a measure_all_bins/bootstrap_all summary dict
-# (`boot`) for ONE subsample, given that subsample's own core/halo boundary
-# radius (Part 1 -- see fitting.find_core_halo_boundary, which turns a
-# fitting.fit_psf_aware_expcore/fit_naive_expcore -- or the older
+# (`boot`) for ONE subsample, given that subsample's own core/two-halo
+# boundary radius (Part 1 -- see fitting.find_core_halo_boundary, which turns
+# a fitting.fit_psf_aware_expcore/fit_naive_expcore -- or the older
 # fit_psf_aware/fit_naive two-exponential -- fit_result into exactly the
-# float this section's functions want).
+# float this section's functions want). NOTE: find_core_halo_boundary's own
+# name/API is UNCHANGED (2026-07-21 rename) -- it's a widely-referenced
+# fit-level function, not a zone-luminosity/velocity one, and wasn't part of
+# what Austin asked to rename; only the derived MEASUREMENTS below (which
+# zone gets called what) changed.
 #
-# measure_core_halo_velocity / measure_halo_luminosity / measure_outer_
+# measure_core_twohalo_velocity / measure_twohalo_luminosity / measure_outer_
 # properties reuse boot's EXISTING bootstrap draws only -- no new
 # stacking/bootstrap pass, per the spec's framing that this half is
 # "simple." measure_psf_corrected_core_luminosity is the one genuinely
 # heavy piece (a second per-galaxy-rescaled stacking + bootstrap pass), kept
 # separate for exactly that reason.
+#
+# Naming, as of 2026-07-21 (see docs/research-notes.md and the
+# measure_onehalo_luminosity section below for the full history): the zone
+# beyond `boundary_radius` is the outer/clustering term -- what a halo-model/
+# clustering paper calls the TWO-HALO term, not this galaxy's own halo (that's
+# the one-halo term, h1-dominated, between the core bin and the boundary --
+# see measure_onehalo_luminosity). measure_halo_luminosity and
+# measure_core_halo_velocity were originally left with their generic "halo"
+# names (additive-only decision, 2026-07-18) even though their zone/velocity
+# is specifically the two-halo one; Austin reversed that call on 2026-07-21
+# and asked for the explicit "two-halo" naming everywhere it was previously
+# just "halo" -- hence measure_twohalo_luminosity / measure_core_twohalo_
+# velocity below.
 # =====================================================================
 
 def _annulus_area_kpc2(r_lo, r_hi):
@@ -1943,7 +1960,7 @@ def _annulus_area_kpc2(r_lo, r_hi):
     reduces exactly to the FULL CIRCLE area pi*r_hi**2 -- i.e. the "core"
     is just the r_lo=0 special case of the same annulus formula every other
     bin uses, not a separate calculation. This is the ONE geometric-area
-    convention measure_halo_luminosity and measure_psf_corrected_core_
+    convention measure_twohalo_luminosity and measure_psf_corrected_core_
     luminosity both use to turn a per-bin surface-brightness value
     (total_flux_fid / core_lum's own per-bin quantity, both in L_kpc2 --
     luminosity per kpc^2) into an actual luminosity (erg/s): multiply THAT
@@ -1970,12 +1987,22 @@ def _resolve_boundary_radius(boundary_radius) -> float:
     return float(b)
 
 
-def measure_core_halo_velocity(
+def measure_core_twohalo_velocity(
     boot: dict, boundary_radius, *, r_edges=None,
-    halo_combine: str = "inv_var", core_bin_index: int = 0,
+    twohalo_combine: str = "inv_var", core_bin_index: int = 0,
 ) -> dict:
     """
     subsample-derived-properties.md Part 2.
+
+    Renamed from measure_core_halo_velocity (2026-07-21): every bin beyond
+    `boundary_radius` is the TWO-HALO (large-scale clustering) zone, not
+    this galaxy's own halo -- see measure_twohalo_luminosity/
+    measure_onehalo_luminosity for the same one-halo/two-halo distinction
+    applied to luminosity. This is also the measurement that motivated the
+    rename in the first place: the two-halo velocity is consistently
+    NEGATIVE (blueshifted) across several consecutive outer bins, read as a
+    large-scale infall signature -- "core vs. halo" undersold what's
+    actually being contrasted here.
 
     Core velocity = the innermost radial bin's centroid, UNMODIFIED -- not
     an average over several inner bins. The centroid genuinely evolves with
@@ -1986,14 +2013,14 @@ def measure_core_halo_velocity(
     treatment -- no PSF correction is needed here either: the PSF blurs a
     photon's spatial position, not its wavelength).
 
-    Halo velocity = a COMBINED average of every bin beyond
+    Two-halo velocity = a COMBINED average of every bin beyond
     `boundary_radius` -- combining is fine on this side, unlike the core
     side, because the profile is already established to be comparatively
     flat out there.
 
     No new bootstrap or restacking: both the core point estimate's error
-    (the innermost bin's own existing 16/84) and the halo combine's error
-    reuse boot's EXISTING per-draw centroid arrays (centroid_v_all),
+    (the innermost bin's own existing 16/84) and the two-halo combine's
+    error reuse boot's EXISTING per-draw centroid arrays (centroid_v_all),
     combined PER DRAW across the outer bins and then percentiled -- this is
     the statistically correct way to combine correlated per-bin bootstrap
     draws (same galaxies/resample in every bin of one draw), not two
@@ -2006,7 +2033,7 @@ def measure_core_halo_velocity(
     boundary_radius : float, or a dict with a 'boundary_radius' key (e.g.
         fitting.find_core_halo_boundary's return value).
     r_edges : bin edges; None -> boot['r_edges'].
-    halo_combine : 'inv_var' (default) -- weight each outer bin by
+    twohalo_combine : 'inv_var' (default) -- weight each outer bin by
         1/sigma_bin**2, sigma_bin = 0.5*(centroid_v_hi - centroid_v_lo) read
         from boot's OWN summary (one FIXED weight per bin, computed once
         from the overall bootstrap spread and reused for every draw --
@@ -2019,15 +2046,15 @@ def measure_core_halo_velocity(
 
     Returns
     -------
-    dict : core_v_fid/_lo/_hi (innermost bin, unmodified); halo_v_fid,
-        halo_v_med/_lo/_hi, halo_v_all (nboot,); diff_fid = core_v_fid -
-        halo_v_fid, diff_med/_lo/_hi, diff_all (nboot,, core_bin_index's own
-        draw MINUS that same draw's halo_v_all -- correctly correlated, not
-        independently combined); boundary_radius, outer_mask, n_outer_bins,
-        halo_combine, core_bin_index.
+    dict : core_v_fid/_lo/_hi (innermost bin, unmodified); twohalo_v_fid,
+        twohalo_v_med/_lo/_hi, twohalo_v_all (nboot,); diff_fid = core_v_fid
+        - twohalo_v_fid, diff_med/_lo/_hi, diff_all (nboot,, core_bin_index's
+        own draw MINUS that same draw's twohalo_v_all -- correctly
+        correlated, not independently combined); boundary_radius,
+        outer_mask, n_outer_bins, twohalo_combine, core_bin_index.
     """
-    if halo_combine not in ("inv_var", "biweight"):
-        raise ValueError("halo_combine must be 'inv_var' or 'biweight'")
+    if twohalo_combine not in ("inv_var", "biweight"):
+        raise ValueError("twohalo_combine must be 'inv_var' or 'biweight'")
     boundary = _resolve_boundary_radius(boundary_radius)
     r_edges = np.asarray(r_edges if r_edges is not None else boot["r_edges"], dtype=float)
     r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
@@ -2047,56 +2074,58 @@ def measure_core_halo_velocity(
     core_v_hi = float(cv_hi[core_bin_index])
 
     outer_all = cv_all[:, outer_mask]   # (nboot, n_outer)
-    if halo_combine == "inv_var":
+    if twohalo_combine == "inv_var":
         sigma_bin = 0.5 * (cv_hi[outer_mask] - cv_lo[outer_mask])
         w = np.where(np.isfinite(sigma_bin) & (sigma_bin > 0), 1.0 / sigma_bin ** 2, 0.0)
         if not np.any(w > 0):
-            raise ValueError("measure_core_halo_velocity: no finite positive-sigma outer "
-                             "bins for inv_var combine; try halo_combine='biweight'.")
+            raise ValueError("measure_core_twohalo_velocity: no finite positive-sigma outer "
+                             "bins for inv_var combine; try twohalo_combine='biweight'.")
         with np.errstate(invalid="ignore", divide="ignore"):
             num = np.nansum(np.where(np.isfinite(outer_all), outer_all * w[None, :], 0.0), axis=1)
             denom = np.nansum(np.where(np.isfinite(outer_all), w[None, :], 0.0), axis=1)
-            halo_v_all = np.where(denom > 0, num / denom, np.nan)
+            twohalo_v_all = np.where(denom > 0, num / denom, np.nan)
         good_fid = cv_fid[outer_mask]
         fid_finite = np.isfinite(good_fid)
-        halo_v_fid = float(np.sum(good_fid[fid_finite] * w[fid_finite]) / np.sum(w[fid_finite]))
+        twohalo_v_fid = float(np.sum(good_fid[fid_finite] * w[fid_finite]) / np.sum(w[fid_finite]))
     else:  # biweight
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            halo_v_all = np.array([
+            twohalo_v_all = np.array([
                 float(biweight_location(row[np.isfinite(row)])) if np.isfinite(row).sum() >= 2
                 else np.nan for row in outer_all])
             good_fid = cv_fid[outer_mask]
             good_fid = good_fid[np.isfinite(good_fid)]
-            halo_v_fid = float(biweight_location(good_fid)) if good_fid.size >= 2 else np.nan
+            twohalo_v_fid = float(biweight_location(good_fid)) if good_fid.size >= 2 else np.nan
 
-    halo_v_med = float(np.nanmedian(halo_v_all))
-    halo_v_lo = float(np.nanpercentile(halo_v_all, 16))
-    halo_v_hi = float(np.nanpercentile(halo_v_all, 84))
+    twohalo_v_med = float(np.nanmedian(twohalo_v_all))
+    twohalo_v_lo = float(np.nanpercentile(twohalo_v_all, 16))
+    twohalo_v_hi = float(np.nanpercentile(twohalo_v_all, 84))
 
-    diff_fid = core_v_fid - halo_v_fid
-    diff_all = cv_all[:, core_bin_index] - halo_v_all
+    diff_fid = core_v_fid - twohalo_v_fid
+    diff_all = cv_all[:, core_bin_index] - twohalo_v_all
     diff_med = float(np.nanmedian(diff_all))
     diff_lo = float(np.nanpercentile(diff_all, 16))
     diff_hi = float(np.nanpercentile(diff_all, 84))
 
     return {
         "core_v_fid": core_v_fid, "core_v_lo": core_v_lo, "core_v_hi": core_v_hi,
-        "halo_v_fid": halo_v_fid, "halo_v_med": halo_v_med,
-        "halo_v_lo": halo_v_lo, "halo_v_hi": halo_v_hi, "halo_v_all": halo_v_all,
+        "twohalo_v_fid": twohalo_v_fid, "twohalo_v_med": twohalo_v_med,
+        "twohalo_v_lo": twohalo_v_lo, "twohalo_v_hi": twohalo_v_hi, "twohalo_v_all": twohalo_v_all,
         "diff_fid": diff_fid, "diff_med": diff_med,
         "diff_lo": diff_lo, "diff_hi": diff_hi, "diff_all": diff_all,
         "boundary_radius": boundary, "outer_mask": outer_mask,
-        "n_outer_bins": n_outer, "halo_combine": halo_combine,
+        "n_outer_bins": n_outer, "twohalo_combine": twohalo_combine,
         "core_bin_index": core_bin_index,
     }
 
 
-def measure_halo_luminosity(boot: dict, boundary_radius, *, r_edges=None) -> dict:
+def measure_twohalo_luminosity(boot: dict, boundary_radius, *, r_edges=None) -> dict:
     """
-    subsample-derived-properties.md Part 3, halo side.
+    subsample-derived-properties.md Part 3, two-halo side. Renamed from
+    measure_halo_luminosity (2026-07-21) -- see the module-level note above
+    this section for why.
 
-    Halo luminosity = each outer bin's own surface-brightness value
+    Two-halo luminosity = each outer bin's own surface-brightness value
     (boot['total_flux_fid'], in L_kpc2 -- luminosity per kpc^2, the same
     per-bin quantity fitting.py fits) multiplied by THAT bin's OWN
     geometric annulus area (pi*(r_out^2 - r_in^2), _annulus_area_kpc2),
@@ -2130,10 +2159,10 @@ def measure_halo_luminosity(boot: dict, boundary_radius, *, r_edges=None) -> dic
 
     Returns
     -------
-    dict : halo_lum_fid, halo_lum_med/_lo/_hi, halo_lum_all (nboot,) or
-        None -- all true luminosities (erg/s), NOT surface brightness --
-        boundary_radius, outer_mask, n_outer_bins, area_kpc2 (per outer
-        bin, the areas actually used), unit_info.
+    dict : twohalo_lum_fid, twohalo_lum_med/_lo/_hi, twohalo_lum_all
+        (nboot,) or None -- all true luminosities (erg/s), NOT surface
+        brightness -- boundary_radius, outer_mask, n_outer_bins, area_kpc2
+        (per outer bin, the areas actually used), unit_info.
     """
     if "total_flux_fid" not in boot:
         raise KeyError("boot missing total_flux_fid; re-run with "
@@ -2151,24 +2180,24 @@ def measure_halo_luminosity(boot: dict, boundary_radius, *, r_edges=None) -> dic
     area_outer = area[outer_mask]
 
     tf_fid = np.asarray(boot["total_flux_fid"], dtype=float)
-    halo_lum_fid = float(np.nansum(tf_fid[outer_mask] * area_outer))
+    twohalo_lum_fid = float(np.nansum(tf_fid[outer_mask] * area_outer))
 
-    halo_lum_all = None
-    halo_lum_med = halo_lum_lo = halo_lum_hi = float("nan")
+    twohalo_lum_all = None
+    twohalo_lum_med = twohalo_lum_lo = twohalo_lum_hi = float("nan")
     if "total_flux_all" in boot:
         tf_all = np.asarray(boot["total_flux_all"], dtype=float)   # (nboot, nrad)
-        halo_lum_all = np.nansum(tf_all[:, outer_mask] * area_outer[None, :], axis=1)
-        halo_lum_med = float(np.nanmedian(halo_lum_all))
-        halo_lum_lo = float(np.nanpercentile(halo_lum_all, 16))
-        halo_lum_hi = float(np.nanpercentile(halo_lum_all, 84))
+        twohalo_lum_all = np.nansum(tf_all[:, outer_mask] * area_outer[None, :], axis=1)
+        twohalo_lum_med = float(np.nanmedian(twohalo_lum_all))
+        twohalo_lum_lo = float(np.nanpercentile(twohalo_lum_all, 16))
+        twohalo_lum_hi = float(np.nanpercentile(twohalo_lum_all, 84))
     else:
-        warnings.warn("measure_halo_luminosity: boot has no total_flux_all; "
+        warnings.warn("measure_twohalo_luminosity: boot has no total_flux_all; "
                       "returning the fiducial value only (no bootstrap error band).")
 
     return {
-        "halo_lum_fid": halo_lum_fid, "halo_lum_med": halo_lum_med,
-        "halo_lum_lo": halo_lum_lo, "halo_lum_hi": halo_lum_hi,
-        "halo_lum_all": halo_lum_all,
+        "twohalo_lum_fid": twohalo_lum_fid, "twohalo_lum_med": twohalo_lum_med,
+        "twohalo_lum_lo": twohalo_lum_lo, "twohalo_lum_hi": twohalo_lum_hi,
+        "twohalo_lum_all": twohalo_lum_all,
         "boundary_radius": boundary, "outer_mask": outer_mask,
         "n_outer_bins": n_outer, "area_kpc2": area_outer,
         "unit_info": boot.get("unit_info"),
@@ -2177,29 +2206,30 @@ def measure_halo_luminosity(boot: dict, boundary_radius, *, r_edges=None) -> dic
 
 def measure_outer_properties(
     boot: dict, boundary_radius, *, r_edges=None,
-    halo_combine: str = "inv_var", core_bin_index: int = 0,
+    twohalo_combine: str = "inv_var", core_bin_index: int = 0,
 ) -> dict:
     """
     Package wrapper (per Austin's request to compute the "simple" derived
     numbers together as one call): everything in subsample-derived-
     properties.md Parts 2-3 that needs NO new stacking/bootstrap pass --
-    core velocity, halo velocity, core-halo velocity difference
-    (measure_core_halo_velocity) and halo luminosity
-    (measure_halo_luminosity) -- for one subsample, given its core/halo
-    boundary. Deliberately excludes core luminosity, the one piece that
-    DOES need a genuinely new per-galaxy-rescaled restacking + its own
+    core velocity, two-halo velocity, core-vs-two-halo velocity difference
+    (measure_core_twohalo_velocity) and two-halo luminosity
+    (measure_twohalo_luminosity) -- for one subsample, given its core/
+    two-halo boundary. Deliberately excludes core luminosity, the one piece
+    that DOES need a genuinely new per-galaxy-rescaled restacking + its own
     bootstrap pass -- see measure_psf_corrected_core_luminosity, called
-    separately (and combined with this function's halo_lum_* afterward for
-    the core/halo luminosity ratio).
+    separately (and combined with this function's twohalo_lum_* afterward
+    for the core/two-halo luminosity ratio).
 
-    Returns one merged dict: every key from measure_core_halo_velocity plus
-    every key from measure_halo_luminosity (boundary_radius/outer_mask/
-    n_outer_bins are shared/redundant between the two -- they agree by
-    construction since both come from the same boundary_radius/r_edges).
+    Returns one merged dict: every key from measure_core_twohalo_velocity
+    plus every key from measure_twohalo_luminosity (boundary_radius/
+    outer_mask/n_outer_bins are shared/redundant between the two -- they
+    agree by construction since both come from the same boundary_radius/
+    r_edges).
     """
-    vel = measure_core_halo_velocity(boot, boundary_radius, r_edges=r_edges,
-                                     halo_combine=halo_combine, core_bin_index=core_bin_index)
-    lum = measure_halo_luminosity(boot, boundary_radius, r_edges=r_edges)
+    vel = measure_core_twohalo_velocity(boot, boundary_radius, r_edges=r_edges,
+                                        twohalo_combine=twohalo_combine, core_bin_index=core_bin_index)
+    lum = measure_twohalo_luminosity(boot, boundary_radius, r_edges=r_edges)
     out = dict(vel)
     for k, v in lum.items():
         out.setdefault(k, v)
@@ -2227,6 +2257,14 @@ def measure_psf_corrected_core_luminosity(
     galaxy" reasoning: each galaxy's own z gives it its own kpc-per-arcsec
     scaling, so a PSF that is fixed in ANGULAR size corresponds to a
     different kpc width for every galaxy).
+
+    NOTE (2026-07-22): this function only corrects the core bin -- the
+    flux this correction implies leaked OUT of the core aperture is not
+    removed from measure_onehalo_luminosity's zone, which double-counts
+    it. If you need a leak-aware one-halo number alongside this core
+    correction, use measure_psf_corrected_core_onehalo_luminosity instead
+    (does both, in one restack + bootstrap pass); this function remains
+    correct and is still the cheaper choice when only the core is needed.
 
     Procedure (mirrors the spec exactly):
       1. PSF model: a FIXED literature Moffat (Lujan Niemeyer 2022; default
@@ -2257,12 +2295,13 @@ def measure_psf_corrected_core_luminosity(
          per kpc^2), ONLY for that one bin. Core luminosity = that value
          times the core's OWN circular aperture area, pi*R_inner_kpc^2
          (_annulus_area_kpc2 with r_lo=0 -- the same area-scaling
-         measure_halo_luminosity applies per outer bin, since a circle is
+         measure_twohalo_luminosity applies per outer bin, since a circle is
          just the r_lo=0 case of an annulus) -- a genuine luminosity
          (erg/s), not a surface-brightness value left unscaled (per
          Austin's correction: reporting the unscaled surface brightness
-         would not even be comparable to the halo side's OWN area-scaled
-         luminosity, let alone summable with it for a core+halo total).
+         would not even be comparable to the two-halo side's OWN
+         area-scaled luminosity, let alone summable with it for a
+         core+two-halo total).
 
     Bootstrap alignment (important): uses the EXACT SAME rng seed and
     per-draw galaxy-index sequence as `boot`'s own bootstrap (read from
@@ -2272,8 +2311,8 @@ def measure_psf_corrected_core_luminosity(
     consuming no rng draws before it, same as bootstrap_all's fiducial
     step). This means core_lum_all[b] and boot['total_flux_all'][b, :] are
     THE SAME resample of THE SAME galaxies for every b -- required for a
-    correct per-draw core/halo RATIO error (ratio_b = core_lum_all[b] /
-    halo_lum_all[b]), since the two are not independent draws of
+    correct per-draw core/two-halo RATIO error (ratio_b = core_lum_all[b] /
+    twohalo_lum_all[b]), since the two are not independent draws of
     independent quantities (same galaxies, same noise realizations) and
     combining two separately-bootstrapped error bars would misstate the
     ratio's real uncertainty (the spec's explicit warning).
@@ -2445,30 +2484,47 @@ def measure_psf_corrected_core_luminosity(
 # =====================================================================
 # subsample-derived-properties.md Part 3b -- the middle zone: one-halo
 # (CGM) term luminosity, strictly between the PSF-corrected core bin and
-# the fitted core/halo crossover (`boundary_radius`). Added 2026-07-18,
+# the fitted core/two-halo crossover (`boundary_radius`). Added 2026-07-18,
 # deliberately as NEW, ADDITIVE functions rather than edits to
-# measure_halo_luminosity / measure_psf_corrected_core_luminosity /
-# measure_core_halo_velocity / measure_outer_properties above -- per
-# Austin's explicit instruction that this should "not be intrusive or
-# change the previous 2 measurements," it just fits a new measurement into
-# the gap between them. Nothing above this comment block was modified.
+# measure_halo_luminosity (as it was named then) / measure_psf_corrected_
+# core_luminosity / measure_core_halo_velocity (as it was named then) /
+# measure_outer_properties above -- per Austin's explicit instruction at
+# the time that this should "not be intrusive or change the previous 2
+# measurements," it just fit a new measurement into the gap between them.
 #
-# Naming note (a deliberate DEVIATION from the spec's original suggestion
-# to rename measure_halo_luminosity -> measure_two_halo_luminosity): that
-# rename is exactly the kind of change to the existing measurement Austin
-# just said not to make, so measure_halo_luminosity keeps its name and
-# behavior completely unchanged. The new zone below is named "onehalo"
-# instead of reusing "halo" for two reasons: it avoids colliding with
-# measure_halo_luminosity's existing output keys (halo_lum_fid etc.) when
-# both are used together, and "one-halo term" / "two-halo term" is itself
-# standard halo-model/clustering terminology for exactly this same-halo-vs-
-# different-halo split -- arguably a more precise pair of names than
-# "halo"/"halo" would have been anyway. So, concretely: this pipeline's
-# EXISTING "halo luminosity" (measure_halo_luminosity, unchanged) is what a
-# clustering paper would call the two-halo term -- it is flux from random
-# density correlations and cosmic-web filaments along the line of sight,
-# not this galaxy's own circumgalactic gas. measure_onehalo_luminosity
-# below is the new middle zone, genuinely CGM/one-halo-term-dominated.
+# HISTORY UPDATE (2026-07-21): the naming deviation this comment block used
+# to describe -- "measure_halo_luminosity keeps its name, we deliberately do
+# NOT rename it to measure_two_halo_luminosity" -- was Austin's call at the
+# time, and he REVERSED it on 2026-07-21, asking explicitly for the "halo"
+# -> "two-halo" rename everywhere it meant this same outer/clustering zone.
+# That rename is now done above (measure_twohalo_luminosity,
+# measure_core_twohalo_velocity) -- see docs/research-notes.md and this
+# module's Section 4b header comment for the full history. This comment
+# block is kept for the reasoning trail (why "onehalo" was chosen as its
+# own name rather than initially colliding with "halo" below), not because
+# the additive-only naming decision it describes is still in effect.
+#
+# Naming note (why "onehalo", not just reusing "halo"): even setting aside
+# the 2026-07-18 additive-only constraint, "one-halo term" / "two-halo
+# term" is itself standard halo-model/clustering terminology for exactly
+# this same-halo-vs-different-halo split -- a more precise pair of names
+# than "halo"/"halo" would ever have been, which is exactly why the
+# 2026-07-21 rename converged on the same "onehalo"/"twohalo" vocabulary
+# rather than inventing something new. Concretely: this pipeline's "halo
+# luminosity" (now measure_twohalo_luminosity) is what a clustering paper
+# calls the two-halo term -- it is flux from random density correlations
+# and cosmic-web filaments along the line of sight, not this galaxy's own
+# circumgalactic gas. measure_onehalo_luminosity below is the middle zone,
+# genuinely CGM/one-halo-term-dominated.
+#
+# NOTE (2026-07-22): measure_onehalo_luminosity's zone sum below is the
+# RAW (PSF-uncorrected) flux in that radial range -- it does not remove
+# the light measure_psf_corrected_core_luminosity's own model says leaked
+# OUT of the core aperture and into these same bins, which double-counts
+# that light (once boosted into the core, once still sitting here raw).
+# See measure_psf_corrected_core_onehalo_luminosity (below the core
+# correction) for the leak-aware version; this function is still the
+# right, free (no restack) choice for a fast/exploratory raw number.
 # =====================================================================
 
 def measure_onehalo_luminosity(boot: dict, boundary_radius, *, r_edges=None,
@@ -2479,19 +2535,19 @@ def measure_onehalo_luminosity(boot: dict, boundary_radius, *, r_edges=None,
     The one-halo (CGM) zone: bins strictly between the core bin
     (`core_bin_index`, excluded -- already measured separately and
     PSF-corrected by measure_psf_corrected_core_luminosity) and the fitted
-    core/halo crossover `boundary_radius` (fitting.find_core_halo_boundary).
-    This is the radial range dominated by the fit's INNER exponential term
-    (A1*exp(-r/h1)) -- h1 being what Austin calls "the halo scale length"
-    (see lya-halos-expcore-h1-is-the-halo-scale) -- as distinct from
-    measure_halo_luminosity's existing zone (everything beyond
-    boundary_radius), which despite its name is dominated by the fit's
-    OUTER term and is physically the two-halo/clustering contribution
-    (random correlations + cosmic-web filaments), not this galaxy's own
-    halo gas. The two zones partition the profile beyond the core bin with
-    no gap and no double-counting, since both use the SAME boundary_radius.
+    core/two-halo crossover `boundary_radius` (fitting.find_core_halo_
+    boundary). This is the radial range dominated by the fit's INNER
+    exponential term (A1*exp(-r/h1)) -- h1 being what Austin calls "the
+    halo scale length" (see lya-halos-expcore-h1-is-the-halo-scale) -- as
+    distinct from measure_twohalo_luminosity's zone (everything beyond
+    boundary_radius), which is dominated by the fit's OUTER term and is
+    physically the two-halo/clustering contribution (random correlations +
+    cosmic-web filaments), not this galaxy's own halo gas. The two zones
+    partition the profile beyond the core bin with no gap and no
+    double-counting, since both use the SAME boundary_radius.
 
     Method: empirical zone-sum, the EXACT SAME recipe
-    measure_halo_luminosity already uses (each bin's own total_flux_fid
+    measure_twohalo_luminosity already uses (each bin's own total_flux_fid
     times that bin's own geometric annulus area, summed across the zone's
     bins) -- just applied to a different radius range. Chosen over
     integrating the fit's h1 term directly (which would attribute flux by
@@ -2500,14 +2556,14 @@ def measure_onehalo_luminosity(boot: dict, boundary_radius, *, r_edges=None,
     documented as seed- and gamma_fixed-sensitive on sparse bins -- see
     Part 3b's "empirical zone-sum vs model-decomposed" discussion for the
     full reasoning). No new stacking or bootstrap pass: the error band
-    reuses boot['total_flux_all'] exactly the way measure_halo_luminosity's
-    does.
+    reuses boot['total_flux_all'] exactly the way measure_twohalo_
+    luminosity's does.
 
     Because this reuses the same total_flux_all draws as
-    measure_halo_luminosity and measure_psf_corrected_core_luminosity's
+    measure_twohalo_luminosity and measure_psf_corrected_core_luminosity's
     core_lum_all is built replaying boot's own bootstrap sequence, all
     three zones' *_all arrays are aligned draw-for-draw -- any pairwise or
-    three-way ratio between core/onehalo/halo(=two-halo) can be computed
+    three-way ratio between core/onehalo/twohalo can be computed
     PER DRAW and then percentiled (see measure_three_zone_ratios below),
     not by naively combining independently-derived error bars.
 
@@ -2517,12 +2573,12 @@ def measure_onehalo_luminosity(boot: dict, boundary_radius, *, r_edges=None,
         (needs total_flux_fid, r_edges; total_flux_all for the error band).
     boundary_radius : float, or a dict with a 'boundary_radius' key (e.g.
         fitting.find_core_halo_boundary's return value) -- pass the SAME
-        value given to measure_halo_luminosity for this subsample, so the
-        two zones actually partition the profile consistently.
+        value given to measure_twohalo_luminosity for this subsample, so
+        the two zones actually partition the profile consistently.
     r_edges : bin edges, in kpc; None -> boot['r_edges'].
     core_bin_index : which bin is "the core" and therefore EXCLUDED from
         this zone (default 0 -- matches measure_psf_corrected_core_
-        luminosity's and measure_core_halo_velocity's own default).
+        luminosity's and measure_core_twohalo_velocity's own default).
 
     Returns
     -------
@@ -2591,29 +2647,576 @@ def measure_onehalo_luminosity(boot: dict, boundary_radius, *, r_edges=None,
     }
 
 
-def measure_three_zone_ratios(core_lum: dict, onehalo_lum: dict, halo_lum: dict) -> dict:
+# =====================================================================
+# PSF-leak-corrected one-halo luminosity. Added 2026-07-22.
+#
+# measure_psf_corrected_core_luminosity (above) and measure_onehalo_
+# luminosity (above) are each internally correct in what they claim to
+# measure, but not jointly consistent: the core correction's own model
+# says a fraction (1-EE_i) of a galaxy's reconstructed point-source flux
+# is scattered by the PSF OUTSIDE the core aperture -- and that scattered
+# flux lands, completely unflagged, in exactly the radial bins
+# measure_onehalo_luminosity sums over. Boosting the core without ever
+# removing that same light from the one-halo zone double-counts it: once
+# as reconstructed core luminosity, once as raw (uncorrected) one-halo
+# flux. measure_psf_corrected_core_onehalo_luminosity below closes that
+# gap by extending the SAME per-galaxy Moffat model (already used for the
+# core's EE_i = 1/c_i) out to every one-halo-zone bin edge, subtracting
+# each bin's predicted PSF-leaked contribution from that galaxy's raw
+# flux BEFORE stacking -- mirroring measure_psf_corrected_core_
+# luminosity's own per-galaxy-rescale-then-restack structure, just with a
+# per-bin subtraction in place of a single whole-cube multiply. Core and
+# one-halo are computed in ONE per-galaxy correction + one restack + one
+# bootstrap pass (per Austin's request to fold both into the same loop
+# rather than pay for two separate restacks), so this supersedes calling
+# measure_psf_corrected_core_luminosity and measure_onehalo_luminosity
+# separately whenever BOTH a PSF-corrected core and a leak-aware one-halo
+# number are wanted. The two older functions are UNCHANGED and still the
+# right call when only one zone is needed, or for a fast first-pass
+# raw one-halo number -- see each one's own docstring; the raw one-halo
+# number is also reproduced here as a diagnostic (onehalo_lum_raw_*) for
+# a direct cross-check.
+# =====================================================================
+
+def measure_psf_corrected_core_onehalo_luminosity(
+    config: "PipelineConfig", product: "GalaxyProduct", stacks: dict, boot: dict,
+    boundary_radius, *,
+    psf_fwhm_arcsec: float = 1.3, psf_beta: float = 3.0,
+    inner_bin_index: int = 0,
+    nboot: int | None = None, seed: int | None = None, stack_method: str | None = None,
+    bounds=None, cont_bounds=None, cont_method=None, cont_order=None,
+    clip_negative_sides: bool = False,
+    r_edges=None,
+    bootstrap_diagnostics: bool = False,
+    assume_no_leak_beyond_boundary: bool = False,
+    verbose: bool = True,
+) -> tuple[dict, dict]:
+    """
+    Core-side aperture correction AND one-halo PSF-leak subtraction, done
+    together in one per-galaxy-rescaled restack + bootstrap pass.
+
+    Extends measure_psf_corrected_core_luminosity's per-galaxy point-source
+    model (a fixed literature Moffat, converted to each galaxy's own kpc
+    PSF width via its z) from a single number -- EE_i at the core aperture
+    -- to a full encircled-energy PROFILE, evaluated at every one-halo-zone
+    bin edge out to boundary_radius. That profile gives, per galaxy, the
+    fraction of its reconstructed point-source flux the model predicts
+    lands in each specific one-halo bin, not just how much is missing from
+    the core.
+
+    The correction, per galaxy i:
+      - EE_i(R_inner) -- unchanged: c_i = 1/EE_i(R_inner) rescales the core
+        bin exactly as measure_psf_corrected_core_luminosity does.
+      - EE_i(r) at every zone-bin edge beyond R_inner -- NEW. The fraction
+        of the SAME reconstructed total the model predicts lands in zone
+        bin j is leak_frac_i_j = EE_i(r_hi,j) - EE_i(r_lo,j).
+      - Expressed as a ratio to the core aperture's own fraction,
+        leak_ratio_i_j = leak_frac_i_j / EE_i(R_inner), this applies
+        directly to galaxy i's own RAW (pre-correction) core-bin spectrum
+        -- no separate noisy per-galaxy flux extraction needed, since
+        raw_core_i = F_i_total * EE_i(R_inner) by definition of EE, so
+        leaked_i_j = raw_core_i * leak_ratio_i_j. Each zone bin's corrected
+        spectrum is then raw_zone_bin - leak_ratio_i_j * raw_core_bin -- a
+        spectral (not just amplitude) subtraction, valid because the PSF
+        smears a photon's spatial position, not its wavelength (the same
+        point measure_core_twohalo_velocity's docstring makes for why no
+        PSF correction is needed on the velocity side).
+      - Bins beyond boundary_radius (the two-halo zone) are left
+        untouched, matching measure_twohalo_luminosity's existing "PSF
+        contamination is negligible out there" convention -- this
+        function doesn't re-derive that claim, just doesn't undo it.
+
+    assume_no_leak_beyond_boundary (new, optional, default False): the much
+    cheaper conservation-only mode. IF you additionally assume NO leaked
+    flux crosses boundary_radius at all, the zone TOTAL (not bin-by-bin)
+    follows from pure flux conservation -- onehalo_true = onehalo_raw -
+    (core_lum - raw_core_lum), i.e. whatever the core correction added is,
+    by assumption, sitting entirely inside the one-halo zone -- so it can
+    be subtracted as one number with NO per-bin EE profile and NO restack
+    of the zone bins at all. In this mode the bootstrap only ever restacks
+    2 columns per draw (the corrected core and the raw core, needed to get
+    core_lum_all/raw_core_lum_all from the SAME resample), vs. 1+n_zone
+    (or 1+2*n_zone with bootstrap_diagnostics=True) in the default
+    bin-by-bin mode -- i.e. it's back to the same per-draw cost the
+    core-only correction always paid, before this whole one-halo piece
+    existed. onehalo_lum_all's uncertainty: if boot['total_flux_all']
+    exists AND nboot/seed were left at their boot['meta'] defaults (so
+    this function's draws align with boot's own), the zone's OWN
+    galaxy-resampling scatter is included (onehalo_lum_all =
+    boot['total_flux_all']-derived raw draws minus the per-draw added-to-
+    core amount); otherwise it falls back to subtracting that same
+    per-draw amount from the fixed FIDUCIAL raw total, which understates
+    the zone's own bootstrap scatter (only the core's draw-to-draw
+    variation is propagated) -- a warning is raised when that fallback is
+    used. bootstrap_diagnostics has no effect in this mode (there is no
+    zone restack to toggle). The tradeoff vs. the default mode: this only
+    recovers a zone TOTAL, not a bin-by-bin corrected profile, and if any
+    non-negligible fraction of the leaked light actually does cross
+    boundary_radius, this mode over-subtracts from the one-halo zone by
+    exactly that amount (the default mode's own convention already treats
+    that cross-boundary leak as negligible on the two-halo side, same as
+    measure_twohalo_luminosity does, so this isn't a new assumption, just
+    applied one zone earlier).
+
+    Performance (applies to BOTH modes): the cube is first sliced to
+    _measurement_window(bounds, cont_bounds) -- the same minimal
+    wavelength span (line window + both continuum sidebands, +2 A pad)
+    that measure_all_bins/bootstrap_all already slice to before their own
+    bootstrap, because astropy's biweight scales worse than linearly in
+    nwave. Profiling on a realistic-scale run showed the biweight combine
+    itself (not the flux-integration step below) dominates total runtime
+    by roughly an order of magnitude, so this crop -- not the
+    flux-integration vectorization -- is the main per-draw lever; nothing
+    downstream ever reads outside this window, so results are unchanged,
+    only the wave axis stacked every draw shrinks. Separately, the per-draw
+    flux integration (blue/red side-ratio over the line window) is done as
+    ONE vectorized call across every column of the resampled stack per
+    draw instead of a Python-level call per bin, whenever cont_method=
+    'median' (the pipeline default) -- the static wave-only masks
+    (continuum sideband, blue/red line window) are built ONCE up front and
+    reused every draw rather than recomputed per-bin per-draw. Falls back
+    to the slower per-bin path (numerically identical, just not
+    vectorized) for cont_method='poly'. In the default (bin-by-bin) mode,
+    bootstrap_diagnostics (default False) controls whether the raw
+    (uncorrected) zone bins are ALSO restacked on every draw just to
+    populate onehalo_lum_raw_all/leaked_lum_all -- with it off, those two
+    _all arrays are None and the *_fid diagnostic values are instead read
+    straight from boot['total_flux_fid'] (already-computed, zero extra
+    cost) rather than a restack, roughly halving the per-draw column count
+    (1+n_zone instead of 1+2*n_zone).
+
+    Parameters
+    ----------
+    config, product, stacks, boot : same as measure_psf_corrected_core_
+        luminosity (needs stacks['cube_flux']/['cube_err'] via
+        build_stacks(..., keep_cube=True); boot supplies nboot/seed/
+        stack_method/ngal to replicate).
+    boundary_radius : float, or a dict with a 'boundary_radius' key (e.g.
+        fitting.find_core_halo_boundary's return value) -- the SAME value
+        passed to measure_onehalo_luminosity/measure_twohalo_luminosity
+        for this subsample, so the zones partition consistently.
+    psf_fwhm_arcsec, psf_beta : the fixed literature Moffat (same defaults
+        as measure_psf_corrected_core_luminosity).
+    inner_bin_index : which bin is "the core" (default 0).
+    nboot, seed, stack_method : override boot['meta']'s values; leave None
+        to reuse them exactly, so core_lum_all/onehalo_lum_all stay
+        draw-for-draw comparable to boot['total_flux_all']/twohalo_lum_all
+        (same replay convention measure_psf_corrected_core_luminosity
+        uses -- also what assume_no_leak_beyond_boundary needs to get the
+        fully-aligned onehalo_lum_all path instead of the fixed-baseline
+        fallback; see above).
+    bounds, cont_bounds, cont_method, cont_order : line-window/continuum
+        convention; None -> resolved from `config`.
+    r_edges : bin edges, in kpc; None -> stacks['r_edges'].
+    bootstrap_diagnostics : default-mode only (ignored when
+        assume_no_leak_beyond_boundary=True); False (default, fast) -- get
+        onehalo_lum_raw_fid/leaked_lum_fid for free from boot[
+        'total_flux_fid'], no restack, no _all arrays for either. True --
+        also restack+bootstrap the raw zone bins so onehalo_lum_raw_all/
+        leaked_lum_all are populated, at roughly double the per-draw
+        column count. See "Performance" above.
+    assume_no_leak_beyond_boundary : False (default) -- full per-galaxy,
+        per-bin correction described above. True -- the cheap
+        conservation-only mode; see its own paragraph above.
+    verbose : print a run header + progress bar.
+
+    Returns
+    -------
+    (core_lum, onehalo_lum) : two dicts, key-compatible with
+        measure_psf_corrected_core_luminosity's and measure_onehalo_
+        luminosity's own return dicts respectively (same key names), so
+        they drop straight into measure_three_zone_ratios and
+        describe_subsample_properties unchanged.
+
+        core_lum    : core_lum_fid/_med/_lo/_hi/_all, EE, c_i, fwhm_kpc,
+            R_inner_kpc, core_area_kpc2, psf_fwhm_arcsec, psf_beta,
+            inner_bin_index, unit_info, meta.
+        onehalo_lum : onehalo_lum_fid/_med/_lo/_hi/_all, boundary_radius,
+            zone_mask, n_zone_bins, area_kpc2, core_bin_index, unit_info,
+            meta, PLUS two diagnostic keys not in measure_onehalo_
+            luminosity's own output -- onehalo_lum_raw_fid/_all (the
+            zone's UNcorrected total, for a direct sanity check against
+            measure_onehalo_luminosity's own number) and leaked_lum_fid/
+            _all (onehalo_lum_raw - onehalo_lum: how much PSF-leaked core
+            light was actually removed -- in assume_no_leak_beyond_
+            boundary mode this is exactly the amount added to the core,
+            by construction). onehalo_lum_raw_all is None unless it can be
+            obtained for free/aligned (bootstrap_diagnostics=True in the
+            default mode; a boot['total_flux_all']-aligned lookup in
+            assume_no_leak_beyond_boundary mode) -- leaked_lum_all is
+            always populated in assume_no_leak_beyond_boundary mode
+            (it equals the per-draw added-to-core amount either way), and
+            follows onehalo_lum_raw_all's availability otherwise. The
+            *_fid values are always populated.
+    """
+    if "cube_flux" not in stacks or "cube_err" not in stacks:
+        raise KeyError("stacks needs the per-galaxy cube -- re-run Stage 2 with "
+                       "build_stacks(..., keep_cube=True) (the default).")
+
+    bin_mode = stacks.get("bin_mode", "virial")
+    if bin_mode != "kpc" and verbose:
+        warnings.warn(
+            f"measure_psf_corrected_core_onehalo_luminosity: stacks['bin_mode'] "
+            f"is {bin_mode!r}, not 'kpc' -- both R_inner and the one-halo zone "
+            f"edges are read directly from r_edges and assumed to already be in "
+            f"kpc, matching psf_fwhm_arcsec's per-galaxy kpc conversion. Re-bin "
+            f"in kpc for a physically meaningful correction.")
+
+    r_edges = np.asarray(r_edges if r_edges is not None else stacks["r_edges"], dtype=float)
+    n_bins = len(r_edges) - 1
+    if not (0 <= inner_bin_index < n_bins):
+        raise ValueError(f"inner_bin_index={inner_bin_index} out of range for {n_bins} bins")
+    R_inner_kpc = float(r_edges[inner_bin_index + 1])
+
+    boundary = _resolve_boundary_radius(boundary_radius)
+    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
+    zone_mask = (np.arange(n_bins) > inner_bin_index) & (r_mid <= boundary)
+    n_zone = int(zone_mask.sum())
+    if n_zone < 1:
+        raise ValueError(
+            f"measure_psf_corrected_core_onehalo_luminosity: no bins strictly "
+            f"between inner_bin_index={inner_bin_index} (outer edge "
+            f"r_edges[{inner_bin_index + 1}]={r_edges[inner_bin_index + 1]:.4g}) "
+            f"and boundary_radius={boundary:.4g} -- nothing to leak-correct. "
+            f"Check the fit / boundary units, or treat this row as flag-worthy.")
+    zone_bin_idx = np.where(zone_mask)[0]
+    area_zone = _annulus_area_kpc2(r_edges[zone_bin_idx], r_edges[zone_bin_idx + 1])
+    core_area_kpc2 = float(_annulus_area_kpc2(0.0, R_inner_kpc))
+
+    cube_flux = np.asarray(stacks["cube_flux"], dtype=float)
+    cube_err = np.asarray(stacks["cube_err"], dtype=float)
+    ngal = cube_flux.shape[0]
+
+    z = np.asarray(product.catalog[config.z_col], dtype=float)
+    if z.size != ngal:
+        raise ValueError(
+            f"product.catalog has {z.size} galaxies but stacks['cube_flux'] has "
+            f"{ngal}; product and stacks must be the SAME sample, in the SAME "
+            f"galaxy order.")
+
+    boot_meta = boot.get("meta", {}) or {}
+    boot_ngal = boot_meta.get("ngal")
+    if boot_ngal is not None and int(boot_ngal) != ngal:
+        raise ValueError(
+            f"stacks has {ngal} galaxies but boot was measured on "
+            f"{boot_ngal}; results would not align draw-for-draw with "
+            f"boot['total_flux_all']. Pass the matching stacks/boot pair.")
+
+    nboot = int(nboot if nboot is not None else boot_meta.get("nboot", 1000))
+    seed = seed if seed is not None else boot_meta.get("seed", 1)
+    sm = stack_method or boot_meta.get("stack_method") or getattr(config, "measure_stack_method", "biweight")
+
+    lya = float(getattr(config, "LYA_REST", LYA_REST))
+    b_bounds = tuple(bounds) if bounds is not None else tuple(getattr(config, "line_window", (lya - 4, lya + 4)))
+    cb = cont_bounds if cont_bounds is not None else getattr(config, "cont_bounds", DEFAULT_CONT_BOUNDS)
+    cm = cont_method if cont_method is not None else getattr(config, "cont_method", DEFAULT_CONT_METHOD)
+    co = cont_order if cont_order is not None else getattr(config, "cont_order", DEFAULT_CONT_ORDER)
+
+    # -- slice to the minimal measurement window BEFORE anything below reads
+    #    the cube -- same helper/margin bootstrap_all already uses, and for
+    #    the same reason (biweight scales worse than linearly in nwave, and
+    #    profiling shows it dominates this function's runtime by ~10x over
+    #    everything else combined). Nothing downstream reads outside it. --
+    wave_full = np.asarray(stacks["rest_wave"], dtype=float)
+    w_lo, w_hi = _measurement_window(b_bounds, cb, pad=2.0)
+    wsel = (wave_full >= w_lo) & (wave_full <= w_hi)
+    if not np.any(wsel):
+        raise ValueError(
+            f"measure_psf_corrected_core_onehalo_luminosity: no rest_wave "
+            f"pixels fall inside the measurement window [{w_lo:.4g}, "
+            f"{w_hi:.4g}] A -- check stacks['rest_wave'] units/coverage.")
+    wave = wave_full[wsel]
+    cube_flux = cube_flux[:, :, wsel]
+    cube_err = cube_err[:, :, wsel]
+
+    # -- per-galaxy PSF geometry: computed ONCE, reused for every bootstrap
+    #    draw -- EE depends only on each galaxy's own z, not on which
+    #    galaxies a given draw happens to resample. --
+    kpc_per_arcsec = np.array(
+        [cosmo.angular_diameter_distance(zi).to(u.kpc).value / 206265 for zi in z])
+    fwhm_kpc = psf_fwhm_arcsec * kpc_per_arcsec
+
+    if assume_no_leak_beyond_boundary:
+        # only need EE at the core aperture itself -- same single number
+        # measure_psf_corrected_core_luminosity computes, no per-bin profile.
+        EE_core = np.clip(
+            fitting.moffat_encircled_energy_fraction(R_inner_kpc, fwhm_kpc, beta=psf_beta),
+            1e-6, 1.0)
+        c_i = 1.0 / EE_core
+    else:
+        # Bins are contiguous by construction (r_mid is monotonic), so the
+        # zone's own edges run from R_inner (== the core's outer edge, no
+        # gap) out to the last zone bin's outer edge -- n_zone+1 edges total.
+        zone_edges = r_edges[inner_bin_index + 1: zone_bin_idx[-1] + 2]
+        EE_edges = fitting.moffat_encircled_energy_fraction(
+            zone_edges[None, :], fwhm_kpc[:, None], beta=psf_beta)   # (ngal, n_zone+1)
+        EE_core = np.clip(EE_edges[:, 0], 1e-6, 1.0)   # same quantity/guard as
+                                                        # measure_psf_corrected_core_luminosity's EE
+        c_i = 1.0 / EE_core
+        leak_frac = np.diff(EE_edges, axis=1)          # (ngal, n_zone); bin j <-> zone_bin_idx[j]
+        # leak_frac_i_j / EE_core is a LUMINOSITY ratio (leaked luminosity
+        # into bin j per unit of core-APERTURE luminosity) -- but the
+        # subtraction below happens in SURFACE-BRIGHTNESS space (per-pixel,
+        # against raw_core_flux, which is SB normalized by core_area_kpc2),
+        # and the result later gets converted back to luminosity using bin
+        # j's OWN area (area_zone), not core_area_kpc2. Without correcting
+        # for that area mismatch, the subtracted amount is wrong by a factor
+        # of area_zone_j/core_area_kpc2 for every bin (over-subtracts when
+        # a zone bin's annulus is bigger than the core aperture, which is
+        # the usual case) -- caught via injection-recovery testing
+        # (2026-07-22): a known-truth synthetic profile came back with a
+        # NEGATIVE one-halo luminosity, off by >100%, tracing to exactly
+        # this missing core_area_kpc2/area_zone factor.
+        leak_ratio = (leak_frac / EE_core[:, None]) * (core_area_kpc2 / area_zone)[None, :]
+
+    # -- build the sub-cube actually restacked every draw. --
+    raw_core_flux = cube_flux[:, inner_bin_index, :]
+    raw_core_err = cube_err[:, inner_bin_index, :]
+    corrected_core_flux = raw_core_flux * c_i[:, None]
+    corrected_core_err = raw_core_err * c_i[:, None]
+
+    if assume_no_leak_beyond_boundary:
+        # column layout: [0] corrected core | [1] raw core (needed to get the
+        # per-draw added-to-core amount from the SAME resample) -- the zone
+        # bins are never restacked at all in this mode.
+        combined_flux = np.concatenate(
+            [corrected_core_flux[:, None, :], raw_core_flux[:, None, :]], axis=1)
+        combined_err = np.concatenate(
+            [corrected_core_err[:, None, :], raw_core_err[:, None, :]], axis=1)
+    else:
+        raw_zone_flux = cube_flux[:, zone_bin_idx, :]     # (ngal, n_zone, nwave)
+        raw_zone_err = cube_err[:, zone_bin_idx, :]
+        leaked_flux = leak_ratio[:, :, None] * raw_core_flux[:, None, :]
+        leaked_err = np.abs(leak_ratio[:, :, None]) * raw_core_err[:, None, :]
+        corrected_zone_flux = raw_zone_flux - leaked_flux
+        corrected_zone_err = np.sqrt(raw_zone_err ** 2 + leaked_err ** 2)
+
+        if bootstrap_diagnostics:
+            combined_flux = np.concatenate(
+                [corrected_core_flux[:, None, :], corrected_zone_flux, raw_zone_flux], axis=1)
+            combined_err = np.concatenate(
+                [corrected_core_err[:, None, :], corrected_zone_err, raw_zone_err], axis=1)
+            # column layout: [0] corrected core | [1 : 1+n_zone] corrected zone
+            # bins | [1+n_zone : 1+2*n_zone] raw zone bins (diagnostic only)
+        else:
+            combined_flux = np.concatenate(
+                [corrected_core_flux[:, None, :], corrected_zone_flux], axis=1)
+            combined_err = np.concatenate(
+                [corrected_core_err[:, None, :], corrected_zone_err], axis=1)
+            # column layout: [0] corrected core | [1 : 1+n_zone] corrected zone bins
+
+    weights = stacks.get("cube_weights")
+    w_all = None if weights is None else np.asarray(weights, dtype=float)
+    w_all_c = w_all
+    if w_all is not None and w_all.ndim == 2:
+        if assume_no_leak_beyond_boundary:
+            cols = np.array([inner_bin_index, inner_bin_index])
+        elif bootstrap_diagnostics:
+            cols = np.concatenate(([inner_bin_index], zone_bin_idx, zone_bin_idx))
+        else:
+            cols = np.concatenate(([inner_bin_index], zone_bin_idx))
+        w_all_c = w_all[:, cols]
+
+    def _bin_flux(spec_1d):
+        res = blue_red_side_ratio(wave, spec_1d, bounds=b_bounds, cont_bounds=cb,
+                                  lya_center=lya, cont_method=cm, cont_order=co,
+                                  clip_negative=clip_negative_sides)
+        return (res["blue_flux"] + res["red_flux"]) if res["success"] else np.nan
+
+    # -- vectorized blue/red integrated-flux extraction: the static
+    #    (wave-only) masks are built ONCE and reused for every column of
+    #    every draw, instead of blue_red_side_ratio recomputing them from
+    #    scratch on every single per-bin call. Numerically identical to
+    #    looping _bin_flux for cont_method='median' (the pipeline default);
+    #    anything else falls back to that slower per-row path unchanged. --
+    _fast_path = (cm == "median")
+    if _fast_path:
+        cont_mask = np.zeros_like(wave, dtype=bool)
+        for lo, hi in cb:
+            cont_mask |= (wave >= lo) & (wave <= hi)
+        blue_mask = (wave >= b_bounds[0]) & (wave < lya)
+        red_mask = (wave >= lya) & (wave <= b_bounds[1])
+        if not (cont_mask.any() and blue_mask.any() and red_mask.any()):
+            _fast_path = False   # degenerate wave grid -- fall back rather than mis-handle it
+
+    def _bin_flux_batch(spec_2d):
+        """spec_2d: (n_cols, nwave). Returns (n_cols,) blue+red integrated
+        flux, NaN where a column fails -- see the comment above for why this
+        matches looping _bin_flux over spec_2d's rows exactly."""
+        if not _fast_path:
+            return np.array([_bin_flux(spec_2d[k]) for k in range(spec_2d.shape[0])])
+        finite = np.isfinite(spec_2d)
+        cm2 = cont_mask[None, :] & finite
+        masked_cont = np.where(cm2, spec_2d, np.nan)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)   # all-masked row -> nan, handled below
+            cont_val = np.nanmedian(masked_cont, axis=1)
+        cont_val = np.where(cm2.any(axis=1), cont_val, 0.0)
+        y = spec_2d - cont_val[:, None]
+        if clip_negative_sides:
+            y = np.where(y > 0, y, 0.0)
+        yfin = np.isfinite(y)
+        bm2 = blue_mask[None, :] & yfin
+        rm2 = red_mask[None, :] & yfin
+        blue_flux = np.where(bm2, y, 0.0).sum(axis=1)
+        red_flux = np.where(rm2, y, 0.0).sum(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            bor = np.where(red_flux != 0, blue_flux / red_flux, np.nan)
+        success = bm2.any(axis=1) & rm2.any(axis=1) & np.isfinite(bor)
+        return np.where(success, blue_flux + red_flux, np.nan)
+
+    def _raw_onehalo_from_boot(key):
+        tf = boot.get(key)
+        if tf is None:
+            return None
+        tf = np.asarray(tf)
+        return tf[..., zone_mask] * area_zone if tf.ndim == 1 else (tf[:, zone_mask] * area_zone[None, :])
+
+    fid_stack, _ = stack_galaxies(combined_flux, combined_err, method=sm, weights=w_all_c)
+    fid_vals = _bin_flux_batch(fid_stack)
+    core_lum_fid = float(fid_vals[0]) * core_area_kpc2
+
+    if "total_flux_fid" in boot:
+        # free -- reuses boot's own already-computed raw zone flux, exactly
+        # what measure_onehalo_luminosity's own onehalo_lum_fid would give.
+        onehalo_lum_raw_fid = float(np.nansum(_raw_onehalo_from_boot("total_flux_fid")))
+    else:
+        onehalo_lum_raw_fid = None   # resolved below once we know the mode
+
+    if assume_no_leak_beyond_boundary:
+        raw_core_lum_fid = float(fid_vals[1]) * core_area_kpc2
+        added_fid = core_lum_fid - raw_core_lum_fid
+        if onehalo_lum_raw_fid is None:
+            warnings.warn("measure_psf_corrected_core_onehalo_luminosity: boot has no "
+                          "total_flux_fid -- onehalo_lum_raw_fid/leaked_lum_fid/"
+                          "onehalo_lum_fid will be NaN.")
+            onehalo_lum_raw_fid = float("nan")
+        onehalo_lum_fid = onehalo_lum_raw_fid - added_fid
+    else:
+        onehalo_lum_fid = float(np.nansum(fid_vals[1:1 + n_zone] * area_zone))
+        if bootstrap_diagnostics:
+            onehalo_lum_raw_fid = float(np.nansum(fid_vals[1 + n_zone:1 + 2 * n_zone] * area_zone))
+        elif onehalo_lum_raw_fid is None:
+            warnings.warn("measure_psf_corrected_core_onehalo_luminosity: boot has no "
+                          "total_flux_fid and bootstrap_diagnostics=False -- "
+                          "onehalo_lum_raw_fid/leaked_lum_fid will be NaN.")
+            onehalo_lum_raw_fid = float("nan")
+
+    rng = np.random.default_rng(seed)
+    core_lum_all = np.full(nboot, np.nan)
+    desc = run_header("psf-corrected core + one-halo bootstrap", verbose=verbose,
+                      nboot=nboot, stack=sm, seed=seed,
+                      psf_fwhm_arcsec=psf_fwhm_arcsec, psf_beta=psf_beta,
+                      assume_no_leak_beyond_boundary=assume_no_leak_beyond_boundary,
+                      bootstrap_diagnostics=(bootstrap_diagnostics and not assume_no_leak_beyond_boundary))
+
+    if assume_no_leak_beyond_boundary:
+        raw_core_lum_all = np.full(nboot, np.nan)
+        for b in tqdm(range(nboot), disable=not verbose, desc=desc):
+            idx = rng.integers(0, ngal, ngal)
+            stack_bs, _ = stack_galaxies(combined_flux[idx], combined_err[idx], method=sm,
+                                         weights=(w_all_c[idx] if w_all_c is not None else None))
+            vals = _bin_flux_batch(stack_bs)
+            core_lum_all[b] = vals[0] * core_area_kpc2
+            raw_core_lum_all[b] = vals[1] * core_area_kpc2
+        added_all = core_lum_all - raw_core_lum_all
+
+        aligned = ("total_flux_all" in boot and seed == boot_meta.get("seed")
+                  and nboot == int(boot_meta.get("nboot", nboot)))
+        onehalo_lum_raw_all = None
+        if aligned:
+            onehalo_lum_raw_all = np.nansum(_raw_onehalo_from_boot("total_flux_all"), axis=1)
+            onehalo_lum_all = onehalo_lum_raw_all - added_all
+        else:
+            if "total_flux_all" in boot:
+                warnings.warn(
+                    "measure_psf_corrected_core_onehalo_luminosity: "
+                    "assume_no_leak_beyond_boundary=True but nboot/seed differ "
+                    "from boot['meta'] -- onehalo_lum_all will subtract the "
+                    "per-draw added-to-core amount from a FIXED fiducial raw "
+                    "baseline instead of boot['total_flux_all'], understating "
+                    "the one-halo zone's own bootstrap scatter (only the "
+                    "core's draw-to-draw variation is propagated). Leave "
+                    "nboot/seed at their boot['meta'] defaults to avoid this.")
+            onehalo_lum_all = onehalo_lum_raw_fid - added_all
+        leaked_lum_all = added_all   # == onehalo_lum_raw_all - onehalo_lum_all either way, by construction
+    else:
+        onehalo_lum_all = np.full(nboot, np.nan)
+        onehalo_lum_raw_all = np.full(nboot, np.nan) if bootstrap_diagnostics else None
+        for b in tqdm(range(nboot), disable=not verbose, desc=desc):
+            idx = rng.integers(0, ngal, ngal)
+            stack_bs, _ = stack_galaxies(combined_flux[idx], combined_err[idx], method=sm,
+                                         weights=(w_all_c[idx] if w_all_c is not None else None))
+            vals = _bin_flux_batch(stack_bs)
+            core_lum_all[b] = vals[0] * core_area_kpc2
+            onehalo_lum_all[b] = np.nansum(vals[1:1 + n_zone] * area_zone)
+            if bootstrap_diagnostics:
+                onehalo_lum_raw_all[b] = np.nansum(vals[1 + n_zone:1 + 2 * n_zone] * area_zone)
+        leaked_lum_all = (onehalo_lum_raw_all - onehalo_lum_all) if bootstrap_diagnostics else None
+
+    def _summ(all_arr):
+        return (float(np.nanmedian(all_arr)), float(np.nanpercentile(all_arr, 16)),
+                float(np.nanpercentile(all_arr, 84)))
+
+    core_lum_med, core_lum_lo, core_lum_hi = _summ(core_lum_all)
+    onehalo_lum_med, onehalo_lum_lo, onehalo_lum_hi = _summ(onehalo_lum_all)
+    leaked_lum_fid = onehalo_lum_raw_fid - onehalo_lum_fid
+
+    meta = {"nboot": nboot, "ngal": ngal, "stack_method": sm, "seed": seed,
+            "bounds": b_bounds, "cont_bounds": cb, "cont_method": cm, "cont_order": co,
+            "measurement_window": (w_lo, w_hi),
+            "bootstrap_diagnostics": bootstrap_diagnostics,
+            "assume_no_leak_beyond_boundary": assume_no_leak_beyond_boundary}
+
+    core_lum = {
+        "core_lum_fid": core_lum_fid, "core_lum_med": core_lum_med,
+        "core_lum_lo": core_lum_lo, "core_lum_hi": core_lum_hi,
+        "core_lum_all": core_lum_all,
+        "EE": EE_core, "c_i": c_i, "fwhm_kpc": fwhm_kpc, "R_inner_kpc": R_inner_kpc,
+        "core_area_kpc2": core_area_kpc2,
+        "psf_fwhm_arcsec": psf_fwhm_arcsec, "psf_beta": psf_beta,
+        "inner_bin_index": inner_bin_index,
+        "unit_info": stacks.get("unit_info"),
+        "meta": dict(meta),
+    }
+    onehalo_lum = {
+        "onehalo_lum_fid": onehalo_lum_fid, "onehalo_lum_med": onehalo_lum_med,
+        "onehalo_lum_lo": onehalo_lum_lo, "onehalo_lum_hi": onehalo_lum_hi,
+        "onehalo_lum_all": onehalo_lum_all,
+        "onehalo_lum_raw_fid": onehalo_lum_raw_fid, "onehalo_lum_raw_all": onehalo_lum_raw_all,
+        "leaked_lum_fid": leaked_lum_fid, "leaked_lum_all": leaked_lum_all,
+        "boundary_radius": boundary, "zone_mask": zone_mask,
+        "n_zone_bins": n_zone, "area_kpc2": area_zone,
+        "core_bin_index": inner_bin_index,
+        "unit_info": stacks.get("unit_info"),
+        "meta": dict(meta),
+    }
+    return core_lum, onehalo_lum
+
+
+def measure_three_zone_ratios(core_lum: dict, onehalo_lum: dict, twohalo_lum: dict) -> dict:
     """
     subsample-derived-properties.md Part 3b -- the "more accurate core vs
-    halo summary" this whole addition is for. Combines three ALREADY-
+    two-halo summary" this whole addition is for. Combines three ALREADY-
     COMPUTED results:
 
         core_lum    <- measure_psf_corrected_core_luminosity (unchanged)
         onehalo_lum <- measure_onehalo_luminosity (new, this addition)
-        halo_lum    <- measure_halo_luminosity (unchanged) -- despite its
-                       name, this is the TWO-HALO/clustering-term zone
-                       (random density correlations + cosmic-web filaments
-                       along the line of sight), NOT this galaxy's own CGM.
+        twohalo_lum <- measure_twohalo_luminosity -- the large-scale
+                       clustering-term zone (random density correlations +
+                       cosmic-web filaments along the line of sight), NOT
+                       this galaxy's own CGM.
 
     Does no new stacking or bootstrapping -- purely arithmetic on results
     that already exist. The point of this function is specifically to get
-    the RATIOS right: onehalo_lum_all, core_lum_all, and halo_lum_all are
-    all aligned draw-for-draw (core_lum_all replays boot's own bootstrap
-    sequence; onehalo_lum_all/halo_lum_all both come straight from that
-    same boot['total_flux_all']), so every ratio below is computed PER DRAW
-    (ratio_b = a_all[b] / b_all[b]) and THEN percentiled -- not two
-    independently-bootstrapped numbers divided after the fact, which would
-    misstate the ratio's real uncertainty since the three quantities share
-    the same galaxies/noise realizations in every draw.
+    the RATIOS right: onehalo_lum_all, core_lum_all, and twohalo_lum_all
+    are all aligned draw-for-draw (core_lum_all replays boot's own
+    bootstrap sequence; onehalo_lum_all/twohalo_lum_all both come straight
+    from that same boot['total_flux_all']), so every ratio below is
+    computed PER DRAW (ratio_b = a_all[b] / b_all[b]) and THEN percentiled
+    -- not two independently-bootstrapped numbers divided after the fact,
+    which would misstate the ratio's real uncertainty since the three
+    quantities share the same galaxies/noise realizations in every draw.
 
     Parameters
     ----------
@@ -2621,9 +3224,9 @@ def measure_three_zone_ratios(core_lum: dict, onehalo_lum: dict, halo_lum: dict)
         core_lum_fid, core_lum_all).
     onehalo_lum : dict from measure_onehalo_luminosity (needs
         onehalo_lum_fid, onehalo_lum_all).
-    halo_lum : dict from measure_halo_luminosity (needs halo_lum_fid,
-        halo_lum_all) -- the EXISTING, unrenamed function; this is the
-        two-halo-dominated zone despite the key names saying "halo".
+    twohalo_lum : dict from measure_twohalo_luminosity (needs
+        twohalo_lum_fid, twohalo_lum_all) -- the large-scale/clustering
+        zone.
 
     Returns
     -------
@@ -2634,16 +3237,16 @@ def measure_three_zone_ratios(core_lum: dict, onehalo_lum: dict, halo_lum: dict)
             clustering/2-halo contribution is relative to this galaxy's
             own CGM halo.
         twohalo_over_total_fid/_med/_lo/_hi/_all -- fraction of the total
-            (core+onehalo+halo) luminosity attributable to random
+            (core+onehalo+twohalo) luminosity attributable to random
             correlations/filaments rather than this galaxy's own emission
             -- the likely headline "how contaminated is the naive halo
             luminosity by 2-halo flux" number.
-        total_lum_fid, total_lum_all -- core+onehalo+halo, fiducial and
+        total_lum_fid, total_lum_all -- core+onehalo+twohalo, fiducial and
             per-draw (None if any input lacks its _all array).
     """
     core_fid, core_all = core_lum["core_lum_fid"], core_lum.get("core_lum_all")
     oh_fid, oh_all = onehalo_lum["onehalo_lum_fid"], onehalo_lum.get("onehalo_lum_all")
-    th_fid, th_all = halo_lum["halo_lum_fid"], halo_lum.get("halo_lum_all")
+    th_fid, th_all = twohalo_lum["twohalo_lum_fid"], twohalo_lum.get("twohalo_lum_all")
 
     def _ratio(num_fid, den_fid, num_all, den_all, label):
         fid = num_fid / den_fid if den_fid else float("nan")

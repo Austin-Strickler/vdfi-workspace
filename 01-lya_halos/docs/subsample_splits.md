@@ -41,7 +41,7 @@ Splitting the stack loses statistical power (roughly √N per split), so each ca
 ### 6. Environment / satellite clustering
 
 - Tests the satellite-clustering explanation for a redshifted centroid
-- Stretch goal: needs an overdensity/pair catalog not yet in hand — earmark for this paper, don't let it block the rest of Paper 1
+- Pull from Chartab+2020 CANDELS catalogs for overdensity numbers per galaxy
 
 ### 7. Lyα equivalent width (EW)
 
