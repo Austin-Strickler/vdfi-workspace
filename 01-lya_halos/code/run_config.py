@@ -118,6 +118,26 @@ cfg = PipelineConfig(
                                           #   lower peak RAM on huge outer bins, slightly more
                                           #   loop overhead. None -> single-shot (old behavior).
 
+    # --- combine speed (specs/extraction-speedup.md 9) ------------------
+    # combine_threads is bit-identical for EVERY method and is NOT part of the
+    # cache signature, so raising it never invalidates cached galaxies.
+    combine_threads = 8,                  #   1 -> serial reference. 8 measured best on the
+                                          #   12-vCPU JupyterHub VM (4.63x); 12 is SLOWER than
+                                          #   8 -- memory bandwidth, not cores. Re-measure on
+                                          #   another machine: combine_fast.benchmark_threads().
+    combine_min_fibers = 50_000,          #   smaller pools combine serially (dispatch overhead
+                                          #   exceeds the gain on the inner bins).
+    # The fused estimator DOES shift Err by ~1e-7, so unlike the knobs above it
+    # IS hashed into the cache signature -- turning it on invalidates existing
+    # cached galaxies on purpose. Biweight only.
+    combine_fused = False,                #   1.27x. Flux stays EXACTLY bit-identical; Err moves
+                                          #   ~1.5e-7 relative (astropy holds two precisions of
+                                          #   the same MAD -- see extract.biweight_fused).
+    combine_fused_strict = False,         #   also reproduce Err exactly, but only ~1.02x alone;
+                                          #   worthwhile only together with transpose.
+    combine_fused_transpose = False,      #   +1.3x more; reassociates the nansum so flux moves
+                                          #   ~1e-15 relative (float32 stores ~1e-7).
+
 # ===== STAGE 3 LINE MEASUREMENT ==================================
     # NOTE: Lya rest wavelength is FIXED -> PipelineConfig.LYA_REST (1215.67 A, vacuum).
     line_window = [LYA_REST-3, LYA_REST+3],     # [lo, hi] rest-frame A bracketing LYA_REST

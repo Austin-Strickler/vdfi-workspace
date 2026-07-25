@@ -81,33 +81,64 @@ def test_config_and_paths():
     assert cfg.normalized_field() == "AEGIS"             # alias collapses
     hdr = cfg.to_header_dict(ngal=5, source_id="all_flux_final.fits")
     assert hdr["FIELD"] == "AEGIS" and hdr["BINMODE"] == "virial"
-    assert hdr["MINBGFIB"] == 25
+    # assert against the config, not a literal: this previously hardcoded 25 and
+    # silently went stale when the default moved to 999999
+    assert hdr["MINBGFIB"] == cfg.min_bg_fibers
 
     # cache nests under outputs by default and follows output_dir
     assert cfg.resolved_cache_dir() == os.path.join(cfg.output_dir, "cache")
     moved = replace(cfg, output_dir="/tmp/run_x")
     assert moved.resolved_cache_dir() == os.path.join("/tmp/run_x", "cache")
     assert replace(cfg, cache_dir="/scratch/c").resolved_cache_dir() == "/scratch/c"
+    # per-run cache is one directory PER SIGNATURE beneath it
+    assert cfg.resolved_run_cache_dir() == os.path.join(
+        cfg.resolved_cache_dir(), cfg.extract_signature())
 
-    # catalog-tagged FITS name; legacy name available; tag tracks catalog_path.
+    # Current FITS name = field + catalog + bin count + extraction signature.
     # We check STRUCTURE rather than a hardcoded literal so the test does not
-    # break every time the naming scheme grows a new token (e.g. radial bins);
-    # it asserts the invariants the name must satisfy, not its exact spelling.
-    tagged = cfg.descriptive_filename(catalog_tag=True)
-    legacy = cfg.descriptive_filename(catalog_tag=False)
-    assert tagged.startswith("galaxy_") and tagged.endswith(".fits")
-    assert legacy.startswith("galaxy_") and legacy.endswith(".fits")
-    # the catalog tag appears ONLY in the tagged name
-    tag = cfg.catalog_tag()
-    assert tag in tagged and tag not in legacy and tagged != legacy
-    # the defining knobs are all encoded in the (untagged) name
-    for token in (cfg.normalized_field(), cfg.catalog, cfg.bin_mode,
-                  cfg.fiber_combine_method, cfg.mask_method):
-        assert token in legacy, f"{token!r} missing from descriptive_filename {legacy!r}"
+    # break every time the naming scheme grows a new token; it asserts the
+    # invariants the name must satisfy, not its exact spelling.
+    name = cfg.descriptive_filename()
+    assert name.startswith("galaxy_") and name.endswith(".fits")
+    for token in (cfg.normalized_field(), cfg.catalog,
+                  f"b{len(cfg.bins) - 1}", cfg.extract_signature()):
+        assert token in name, f"{token!r} missing from descriptive_filename {name!r}"
+
+    # THE INVARIANT THIS SCHEME EXISTS FOR: any knob that busts the per-galaxy
+    # cache must also change the FITS name, so a re-extraction can never
+    # overwrite the previous one. The old hand-listed name encoded 8 knobs while
+    # the cache hashed ~30; these are drawn from the ~22 that used to slip
+    # through silently.
+    for knob in ({"bg_smooth_sigma_A": 45.0}, {"min_bg_fibers": 12},
+                 {"nwave": 512}, {"z_col": "z_spec"},
+                 {"mask_percentile_image": 77.0}, {"line_mask_halfwidth_A": 7.5}):
+        v = replace(cfg, **knob)
+        assert v.extract_signature() != cfg.extract_signature(), knob
+        assert v.descriptive_filename() != name, f"{knob} busts cache but NOT the FITS name"
+
+    # ...while knobs that provably cannot change the numbers leave both alone,
+    # so a cache built at 1 thread stays valid at 8 (see extraction-speedup 9.-1)
+    for knob in ({"combine_threads": 8}, {"combine_min_fibers": 10_000}):
+        try:
+            v = replace(cfg, **knob)
+        except TypeError:
+            continue                                   # field not on this config
+        assert v.extract_signature() == cfg.extract_signature(), knob
+        assert v.descriptive_filename() == name, knob
+
     other = replace(cfg, catalog_path="catalogs/example_zcut.txt")
-    assert other.descriptive_filename() != tagged        # different catalog -> different file
+    assert other.descriptive_filename() != name          # different catalog -> different file
+
+    # older spellings still constructible, which is what lets io fall back to
+    # already-extracted files instead of forcing a re-run
+    tagged = cfg.descriptive_filename(scheme="tagged", catalog_tag=True)
+    legacy = cfg.descriptive_filename(scheme="tagged", catalog_tag=False, bins_tag=False)
+    tag = cfg.catalog_tag()
+    assert tag in tagged and tag not in legacy and tagged != legacy != name
+    for token in (cfg.bin_mode, cfg.fiber_combine_method, cfg.mask_method):
+        assert token in legacy, f"{token!r} missing from legacy name {legacy!r}"
     print("[1] config, provenance, derived paths OK:",
-          {k: hdr[k] for k in ("FIELD", "BINMODE", "COMBINE")})
+          {k: hdr[k] for k in ("FIELD", "BINMODE", "COMBINE")}, "|", name)
 
 
 # ---------------------------------------------------------------------
@@ -183,6 +214,67 @@ def test_stack_measure_flow(tmpdir):
           f"per-pixel err {results['stack_error']['stack_err'].shape}")
 
 
+def test_galaxy_slicing_split(tmpdir):
+    """
+    THE Slurm-array invariant: splitting one extraction across array tasks must
+    produce exactly the run a single process would have produced.
+
+    Three things can break and all three are silent:
+      1. cache keys named by loop index instead of global row -> tasks overwrite
+         each other and you get N/ntasks galaxies with no error anywhere
+      2. gal_offset leaking into the extraction signature -> each task builds
+         its own cache/<sig>/ and the slices never meet
+      3. the assemble pass reading the cache back in the wrong order
+
+    So: run serially, wipe the cache, run the SAME work as 3 offset tasks, and
+    assert the reassembled arrays are bit-identical to the serial ones.
+    """
+    import shutil
+    from utils_lya_halo import extract
+
+    rng = np.random.default_rng(7)
+    ngal, nexp, nfib, nwave = 10, 2, 900, 24
+    vdfi = dict(
+        RA=150.0 + rng.normal(0, 0.02, (nexp, nfib)),
+        DEC=2.0 + rng.normal(0, 0.02, (nexp, nfib)),
+        spectra=rng.normal(0, 1, (nexp, nfib, nwave)).astype("f4"),
+        error=np.abs(rng.normal(1, 0.1, (nexp, nfib, nwave))).astype("f4"),
+        wave=np.linspace(3470, 5540, nwave),
+    )
+    tbl = Table({"RA": 150.0 + rng.normal(0, 0.01, ngal),
+                 "DEC": 2.0 + rng.normal(0, 0.01, ngal),
+                 "z": rng.uniform(2.0, 2.6, ngal),
+                 "MASS_50": rng.uniform(9.5, 10.5, ngal),
+                 "ID": np.arange(ngal)})
+    bad = np.zeros((nexp, nfib), bool)
+    cfg = PipelineConfig(field="AEGIS", catalog="MOSDEF", output_dir=tmpdir,
+                         bins=[0, 50, 200, 1000], bin_mode="kpc",
+                         mask_method="none", nwave=nwave, wave_min=3470,
+                         wave_max=5540, smooth_bg=False, min_bg_fibers=9999999)
+    go = lambda c: extract.extract_fibers(c, vdfi, tbl, bad, use_cache=True)
+
+    serial = go(cfg)
+    cdir = cfg.resolved_run_cache_dir()
+    expected = sorted(f for f in os.listdir(cdir) if f.endswith(".npz"))
+    assert len(expected) == ngal
+
+    shutil.rmtree(cdir)                       # cold cache: the tasks must really compute
+    for offset, count in [(0, 4), (4, 4), (8, 2)]:
+        c = replace(cfg, gal_offset=offset, num_gal=count)
+        # every task must resolve to the SAME cache dir, or the split is pointless
+        assert c.resolved_run_cache_dir() == cdir
+        assert c.descriptive_filename() == cfg.descriptive_filename()
+        assert go(c)[0].shape[0] == count
+
+    got = sorted(f for f in os.listdir(cdir) if f.endswith(".npz"))
+    assert got == expected, f"cache filename collision: {len(got)} files for {ngal} galaxies"
+
+    for name, a, b in zip(("spec", "err", "nfib", "bg", "vr"), serial, go(cfg)):
+        assert np.array_equal(a, b, equal_nan=True), f"{name} differs after split+assemble"
+    print(f"[4] galaxy slicing OK: 3-task split -> assemble == serial, "
+          f"bit-identical, {len(got)} cache files")
+
+
 def test_guide_in_sync():
     """The field guide must not drift: every entry resolves to a live function."""
     from utils_lya_halo import check_guide
@@ -203,6 +295,7 @@ def main():
         test_config_and_paths()
         test_fits_roundtrip(tmp)
         test_stack_measure_flow(tmp)
+        test_galaxy_slicing_split(tmp)
         test_guide_in_sync()
     print("\nALL SMOKE CHECKS PASSED")
 

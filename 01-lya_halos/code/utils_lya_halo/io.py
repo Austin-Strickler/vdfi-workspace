@@ -172,31 +172,53 @@ def _resolve_galaxy_fits_path(config, field: str, verbose: bool = True):
     """
     Return an EXISTING galaxy-FITS path for `field`, or None.
 
-    Prefers the current catalog- AND bins-tagged name. If absent, falls back to
-    older names written by earlier pipeline versions, newest-scheme first:
-      1. catalog+bins tagged   (current)            -- name encodes bins, used as-is
-      2. catalog tagged only   (pre-bins-tag)       -- bins NOT in name; only used
+    Prefers the current signature-named file. If absent, falls back to older
+    names written by earlier pipeline versions, newest-scheme first:
+      1. signature-named       (current)            -- name encodes EVERY knob, used as-is
+      2. catalog+bins tagged   (pre-signature)      -- name encodes bins, used as-is
+      3. catalog tagged only   (pre-bins-tag)       -- bins NOT in name; only used
                                                        if the header BINS matches config
-      3. untagged              (legacy, pre-catalog-tag) -- same header-BINS guard
-    The header guard on (2)/(3) is what makes adding the bins tag safe for files
+      4. untagged              (legacy, pre-catalog-tag) -- same header-BINS guard
+    The header guard on (3)/(4) is what makes adding a name token safe for files
     made before it existed: a stale file with different bins is skipped (so you
     re-extract cleanly) instead of being loaded as if it matched. A one-line
     warning is printed whenever a fallback name is used.
+
+    (2) is why moving the signature into the name costs no re-extraction: a
+    completed AEGIS/COSMOS FITS under the old spelling still resolves here. It
+    is only accepted on an exact name match, though -- the old name cannot prove
+    it was written with the current knobs (that inability IS the bug this change
+    fixes), so treat a "using older galaxy FITS" warning as a prompt to re-run
+    Stage 1 when the numbers matter, not as an all-clear.
     """
     import os
     from dataclasses import replace
     cfg_field = replace(config, field=field)
 
-    canonical = os.path.join(
-        config.output_dir, cfg_field.descriptive_filename(catalog_tag=True, bins_tag=True))
+    canonical = os.path.join(config.output_dir, cfg_field.descriptive_filename())
     if os.path.exists(canonical):
         return canonical
+
+    # Pre-signature name: bins ARE encoded, so no header guard needed.
+    tagged = os.path.join(
+        config.output_dir,
+        cfg_field.descriptive_filename(catalog_tag=True, bins_tag=True, scheme="tagged"))
+    if os.path.exists(tagged):
+        if verbose:
+            print(f"WARNING: using pre-signature galaxy FITS "
+                  f"'{os.path.basename(tagged)}'. Its name does not record every "
+                  f"extraction knob, so it cannot be verified against this config "
+                  f"beyond its bins -- re-run Stage 1 to write "
+                  f"'{os.path.basename(canonical)}'.")
+        return tagged
 
     # Older naming schemes: bins are not encoded in the name, so verify the
     # file's header bins match this config before trusting it.
     fallbacks = [
-        cfg_field.descriptive_filename(catalog_tag=True, bins_tag=False),   # pre-bins-tag
-        cfg_field.descriptive_filename(catalog_tag=False, bins_tag=False),  # legacy
+        cfg_field.descriptive_filename(catalog_tag=True, bins_tag=False,
+                                       scheme="tagged"),   # pre-bins-tag
+        cfg_field.descriptive_filename(catalog_tag=False, bins_tag=False,
+                                       scheme="tagged"),   # legacy
     ]
     for name in fallbacks:
         p = os.path.join(config.output_dir, name)

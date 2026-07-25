@@ -564,6 +564,7 @@ def plot_line_panels(
     boot: dict | None = None,
     stack_method: str = "biweight",
     bounds=None,
+    config=None,
     cont_bounds=DEFAULT_CONT_BOUNDS,
     cont_method: str = "poly",
     cont_order: int = 1,
@@ -637,7 +638,18 @@ def plot_line_panels(
     stacks       : Stage-2 dict (keep_cube=True for the boot error band)
     boot         : Stage-3 bootstrap result; None -> no error band / centroid marker
     stack_method : which stacks[method] to display
-    bounds       : line window (lo, hi) Å; None -> (lya_center-4, lya_center+4)
+    bounds       : line window (lo, hi) Å. None -> resolved in priority order:
+                   (1) config.line_window if `config` is given, (2) the
+                   stacks["provenance"]["line_window"] this stacks dict was
+                   actually built with (stamped by build_stacks), (3) only if
+                   neither is available, the hardcoded (lya_center-4,
+                   lya_center+4) fallback. This means the panel's shaded
+                   window always matches the bounds actually used to make the
+                   stack, instead of silently showing a fixed +/-4 Angstrom
+                   box regardless of what config.line_window really was.
+    config       : optional PipelineConfig; only consulted to resolve `bounds`
+                   when bounds=None (see above). Not required -- if omitted,
+                   the stacks dict's own provenance is used instead.
     xlim         : x-axis range shown in each panel. ALWAYS given in
                    Angstroms regardless of xunit (same for bounds/cont_bounds/
                    lya_center) -- these stay the physical, science-facing
@@ -710,7 +722,13 @@ def plot_line_panels(
     fid    = np.asarray(stacks["stacks"][stack_method]["flux"])   # (nrad, nwave)
     edges  = np.round(np.asarray(stacks["r_edges"]), 3)
     nrad   = fid.shape[0]
-    bounds = bounds if bounds is not None else (lya_center - 4, lya_center + 4)
+    if bounds is not None:
+        bounds = tuple(bounds)
+    elif config is not None:
+        bounds = tuple(config.line_window)
+    else:
+        prov_window = stacks.get("provenance", {}).get("line_window")
+        bounds = tuple(prov_window) if prov_window is not None else (lya_center - 4, lya_center + 4)
     bm     = stacks.get("bin_mode", "")
     stack_label_final = stack_label if stack_label is not None else f"{stack_method} stack"
 

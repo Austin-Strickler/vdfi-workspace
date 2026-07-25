@@ -2291,3 +2291,182 @@ def plot_fiber_mask_appendix(
     return fig, audit
 
 
+def list_exposures(vdfi, exposures=None, catalog=None, ra_col="RA", dec_col="DEC",
+                   match_radius_arcsec=None, verbose=True):
+    """
+    Summarize each exposure ("slice") in a loaded VDFI field: fiber count and
+    sky footprint. The "what have I got" table to look at BEFORE picking which
+    exposures to hand to plot_field_coverage -- for AEGIS a full-field view
+    typically needs both IFU dither pointings (left/right of the field), for
+    COSMOS the same idea repeated ~4x over the larger footprint. Rather than
+    guessing exposure IDs and hoping they line up, use this to see where each
+    one actually sits, or just pass exposures=None to plot_field_coverage and
+    use everything.
+
+    Parameters
+    ----------
+    vdfi        : loaded field dict (extract.load_field / load_vdfi_field).
+    exposures   : iterable of exposure indices to summarize; None -> all.
+    catalog     : optional astropy Table (e.g. run_table); if given together
+                  with match_radius_arcsec, adds a column counting how many
+                  catalog rows fall within that radius of each exposure's
+                  mean center (a rough guide to which slices matter for your
+                  sample).
+    match_radius_arcsec : radius (arcsec) for the optional catalog column
+                  above. Ignored if catalog is None.
+
+    Returns an astropy Table, one row per exposure (index, n_fibers, mean RA/
+    DEC, and the RA/DEC extent), printed if verbose.
+    """
+    from astropy.table import Table
+
+    RA, DEC = vdfi["RA"], vdfi["DEC"]
+    nexp = vdfi.get("nexp", RA.shape[0])
+    idx = np.arange(nexp) if exposures is None else np.atleast_1d(exposures).astype(int)
+
+    rows = []
+    for i in idx:
+        ra_i, dec_i = RA[i], DEC[i]
+        good = np.isfinite(ra_i) & np.isfinite(dec_i)
+        if not good.any():
+            rows.append((int(i), 0, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan))
+            continue
+        ra_g, dec_g = ra_i[good], dec_i[good]
+        rows.append((int(i), int(good.sum()),
+                     float(np.mean(ra_g)), float(np.mean(dec_g)),
+                     float(ra_g.min()), float(ra_g.max()),
+                     float(dec_g.min()), float(dec_g.max())))
+
+    t = Table(rows=rows, names=["exposure", "n_fibers", "ra_mean", "dec_mean",
+                                "ra_min", "ra_max", "dec_min", "dec_max"])
+
+    if catalog is not None and match_radius_arcsec is not None:
+        cra = np.asarray(catalog[ra_col], dtype=float)
+        cdec = np.asarray(catalog[dec_col], dtype=float)
+        n_near = np.zeros(len(t), dtype=int)
+        for k in range(len(t)):
+            if not np.isfinite(t["ra_mean"][k]):
+                continue
+            dra = (cra - t["ra_mean"][k]) * np.cos(np.deg2rad(t["dec_mean"][k])) * 3600.
+            ddec = (cdec - t["dec_mean"][k]) * 3600.
+            n_near[k] = int((np.hypot(dra, ddec) <= match_radius_arcsec).sum())
+        t[f"n_catalog_within_{match_radius_arcsec:g}asec"] = n_near
+
+    if verbose:
+        print(f"{vdfi.get('field', '?')}: {len(t)} exposure(s) of {nexp} total")
+        t.pprint(max_lines=-1, max_width=-1)
+    return t
+
+
+def plot_field_coverage(vdfi, catalog=None, *, exposures=None, xc=None, yc=None,
+                        radii_arcsec=(100.0, 200.0, 300.0),
+                        radius_colors=("limegreen", "gold", "crimson"),
+                        ra_col="RA", dec_col="DEC",
+                        fiber_size=3.0, fiber_alpha=0.15, background_alpha=0.015,
+                        catalog_kwargs=None, ax=None, title=None):
+    """
+    Plot the sky footprint of one or more VDFI exposures ("slices"), with
+    concentric radius bands drawn around a center -- green inside
+    radii_arcsec[0], yellow/gold out to radii_arcsec[1], red out to
+    radii_arcsec[2] -- and (optionally) a catalog such as your MOSDEF
+    run_table overplotted on top of everything.
+
+    exposures=None (default) plots every exposure in the field, which is the
+    simplest way to guarantee full coverage without hand-picking IDs and
+    hoping they happen to fill the mosaic (for AEGIS that's normally the two
+    IFU dither pointings either side of the field; for COSMOS, ~4x that over
+    the bigger footprint). Call list_exposures(vdfi) first if you want to
+    cherry-pick a subset instead -- it reports each exposure's mean position
+    and RA/DEC extent to plan from.
+
+    Parameters
+    ----------
+    vdfi          : loaded field dict (extract.load_field / load_vdfi_field).
+    catalog       : optional astropy Table (e.g. run_table from
+                    extract.build_run_table), scattered on top of everything.
+    exposures     : iterable of exposure indices to include; None -> all.
+    xc, yc        : center of the radius bands, in degrees. None (default)
+                    uses the mean fiber position across the selected
+                    exposures (i.e. the field/mosaic center).
+    radii_arcsec  : the three (inner, middle, outer) radii in arcsec.
+    radius_colors : colors for (inner, middle, outer) bands, inside-out.
+    fiber_size / fiber_alpha : styling for fibers inside the outer radius.
+    background_alpha : styling for fibers beyond the outer radius -- kept
+                    very faint so the rest of the field mosaic is still
+                    visible for context without drowning out the bands.
+    catalog_kwargs : dict of scatter() kwargs overriding the catalog's default
+                    marker style (black star, on top of everything).
+
+    Returns the Axes. (RA axis increases leftward, the usual sky convention,
+    matching selection.plot_sky.)
+    """
+    RA, DEC = vdfi["RA"], vdfi["DEC"]
+    nexp = vdfi.get("nexp", RA.shape[0])
+    idx = np.arange(nexp) if exposures is None else np.atleast_1d(exposures).astype(int)
+
+    ra_all = np.concatenate([np.asarray(RA[i], dtype=float) for i in idx])
+    dec_all = np.concatenate([np.asarray(DEC[i], dtype=float) for i in idx])
+    good = np.isfinite(ra_all) & np.isfinite(dec_all)
+    ra_all, dec_all = ra_all[good], dec_all[good]
+
+    if xc is None:
+        xc = float(np.mean(ra_all))
+    if yc is None:
+        yc = float(np.mean(dec_all))
+    cosd = np.cos(np.deg2rad(yc))
+
+    dra = (ra_all - xc) * cosd * 3600.
+    ddec = (dec_all - yc) * 3600.
+    dist = np.hypot(dra, ddec)
+
+    r1, r2, r3 = sorted(radii_arcsec)
+    c1, c2, c3 = radius_colors
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7.5, 7.0))
+
+    # context: every fiber beyond the outer radius, kept very faint
+    outside = dist > r3
+    ax.scatter(ra_all[outside], dec_all[outside], s=fiber_size, c="0.5",
+              alpha=background_alpha, lw=0, zorder=1,
+              label=f"all fibers ({idx.size} exposure(s))")
+
+    # radius bands, drawn outer-to-inner so the innermost sits on top
+    band3 = (dist > r2) & (dist <= r3)
+    band2 = (dist > r1) & (dist <= r2)
+    band1 = dist <= r1
+    ax.scatter(ra_all[band3], dec_all[band3], s=fiber_size * 2, c=c3,
+              alpha=fiber_alpha, lw=0, zorder=2, label=f"<= {r3:g}\"")
+    ax.scatter(ra_all[band2], dec_all[band2], s=fiber_size * 2, c=c2,
+              alpha=fiber_alpha, lw=0, zorder=3, label=f"<= {r2:g}\"")
+    ax.scatter(ra_all[band1], dec_all[band1], s=fiber_size * 2, c=c1,
+              alpha=fiber_alpha, lw=0, zorder=4, label=f"<= {r1:g}\"")
+
+    # radius rings: constant angular radius, widened in RA by 1/cos(dec)
+    th = np.linspace(0, 2 * np.pi, 300)
+    for r, c in zip((r1, r2, r3), (c1, c2, c3)):
+        rdeg = r / 3600.
+        ax.plot(xc + rdeg * np.cos(th) / cosd, yc + rdeg * np.sin(th),
+               color=c, lw=1.6, ls="--", zorder=5)
+    ax.plot([xc], [yc], "+", color="k", ms=10, mew=1.6, zorder=6)
+
+    if catalog is not None:
+        ckw = dict(s=26, marker="*", c="k", edgecolors="white", linewidths=0.5,
+                  zorder=7, label=f"catalog ({len(catalog)})")
+        if catalog_kwargs:
+            ckw.update(catalog_kwargs)
+        ax.scatter(np.asarray(catalog[ra_col], dtype=float),
+                  np.asarray(catalog[dec_col], dtype=float), **ckw)
+
+    ax.set_xlabel("RA (deg)")
+    ax.set_ylabel("Dec (deg)")
+    if not ax.xaxis_inverted():
+        ax.invert_xaxis()
+    ax.set_aspect(1.0 / cosd)
+    ax.legend(loc="best", fontsize=8, frameon=False, markerscale=2)
+    ax.set_title(title or
+                f"{vdfi.get('field', '?')}: {idx.size} exposure(s), "
+                f"center=({xc:.4f}, {yc:.4f})")
+    return ax
+
+

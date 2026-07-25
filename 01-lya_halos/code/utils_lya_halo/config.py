@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import json
 import os
 from dataclasses import dataclass, field as _field, asdict
 from typing import ClassVar, Optional, Sequence
@@ -176,7 +177,20 @@ class PipelineConfig:
     nwave: int = 1036
 
     # --- run control -----------------------------------------------------
-    num_gal: Optional[int] = None        # None -> all galaxies in the run table
+    num_gal: Optional[int] = None        # None -> all galaxies in the run table.
+                                         #   With gal_offset, this is the COUNT of the
+                                         #   window, not "the first N".
+    gal_offset: int = 0                  # where this run's window STARTS in the run
+                                         #   table. 0 (default) reproduces the old
+                                         #   prefix behavior exactly. Set >0 only to
+                                         #   split one extraction across Slurm array
+                                         #   tasks; each task fills its own slice of
+                                         #   the SHARED cache/<sig>/ directory.
+                                         #   DELIBERATELY NOT in the extraction
+                                         #   signature -- it selects WHICH galaxies to
+                                         #   compute, not HOW, so every task must hash
+                                         #   to the same cache directory or the slices
+                                         #   would never meet.
     output_dir: str = "./outputs"
     cache_dir: Optional[str] = None      # per-galaxy Stage 1 cache (resumability).
                                          #   None -> <output_dir>/cache (kept inside
@@ -187,6 +201,35 @@ class PipelineConfig:
                                          #   combine. Smaller => lower peak RAM on huge
                                          #   outer bins, slightly more loop overhead.
                                          #   None -> single-shot (old behavior).
+
+    # --- Stage 1 combine performance (see specs/extraction-speedup.md 9) ---
+    # combine_threads is a PERFORMANCE KNOB ONLY and is deliberately EXCLUDED
+    # from the cache signature, exactly like combine_wave_block: wavelength
+    # blocks are independent, so threading them is bit-identical by
+    # construction and a cache built at 1 thread MUST stay valid at 8.
+    combine_threads: int = 1             # 1 -> serial reference path. 8 measured
+                                         #   best on the 12-vCPU JupyterHub VM
+                                         #   (4.63x); 12 is SLOWER than 8
+                                         #   (memory bandwidth, not cores).
+                                         #   Re-measure elsewhere with
+                                         #   combine_fast.benchmark_threads().
+    combine_min_fibers: int = 50_000     # pools smaller than this combine serially;
+                                         #   thread dispatch costs more than it saves
+                                         #   on the inner bins (<5 s/galaxy total).
+
+    # The fused estimator DOES perturb Err (~1e-7 relative), so unlike the two
+    # knobs above these three ARE part of the cache signature -- a cache must
+    # record which estimator produced it. Biweight only; ignored otherwise.
+    combine_fused: bool = False          # 1.27x. Flux stays EXACTLY bit-identical;
+                                         #   Err moves ~1.5e-7 relative (astropy
+                                         #   itself holds two precisions of the same
+                                         #   MAD -- see extract.biweight_fused).
+    combine_fused_strict: bool = False   # reproduce Err bit-for-bit too, at ~1.02x
+                                         #   (the extra pass eats the gain -- only
+                                         #   worthwhile combined with transpose).
+    combine_fused_transpose: bool = False  # +1.3x more: reduce over contiguous
+                                         #   (wave, fiber) blocks. Reassociates the
+                                         #   nansum, so flux moves ~1e-15 relative.
 
     # --- Stage 3 line measurement ---------------------------------------
     # Continuum, centroid, and measure-stack choices live HERE (config is the
@@ -342,6 +385,28 @@ class PipelineConfig:
         """Background combine method, falling back to the fiber method if None."""
         return self.bg_combine_method or self.fiber_combine_method
 
+    def galaxy_window(self, n_total: int) -> tuple:
+        """
+        (start, stop) row range of the run table this run should process --
+        `run_table[start:stop]`. The single place `gal_offset` + `num_gal` are
+        turned into indices, so extract.py and core.py cannot disagree.
+
+        Defaults (`gal_offset=0`) give `[0, num_gal)`, i.e. exactly the old
+        prefix behavior. `start` is what makes a Slurm array safe: cache entries
+        are named by `start + loop_index`, the galaxy's GLOBAL row, so the task
+        handling galaxies 70-139 writes gal_00070.npz instead of restarting its
+        own count at gal_00000.npz and colliding with task 0.
+
+        An offset past the end yields an empty window rather than an error, so
+        an over-provisioned array (say 8 tasks for 278 galaxies at 40 each) has
+        harmless no-op tasks at the tail instead of failures.
+        """
+        start = max(int(self.gal_offset), 0)
+        if start >= n_total:
+            return (n_total, n_total)
+        stop = n_total if self.num_gal is None else min(start + int(self.num_gal), n_total)
+        return (start, stop)
+
     def resolved_cache_dir(self) -> str:
         """
         Per-galaxy Stage 1 cache directory. Explicit cache_dir wins; otherwise
@@ -352,6 +417,80 @@ class PipelineConfig:
         if self.cache_dir is not None:
             return self.cache_dir
         return os.path.join(self.output_dir, "cache")
+
+    # -- extraction signature ------------------------------------------------
+    # Lives here, not in extract.py, because it now names TWO things: the
+    # per-galaxy cache directory AND the galaxy FITS (descriptive_filename).
+    # Keeping one definition is the whole point -- the historical bug was that
+    # the cache hashed ~30 knobs while the FITS name hand-listed 8, so ~22
+    # settings recomputed correctly yet wrote to a byte-identical filename and
+    # silently overwrote the previous extraction. Config is pure stdlib and
+    # imported everywhere, so it can host this without an import cycle;
+    # extract._extract_signature is now a thin delegating wrapper.
+    _SIGNATURE_KEYS: ClassVar[tuple] = (
+        "field", "catalog", "catalog_path", "bins", "bin_mode", "mask_method",
+        "mask_percentile_image", "mask_percentile_spec_high",
+        "mask_percentile_spec_low", "mask_protect_radius_arcsec",
+        "spec_mask_step", "bg_inner_arcsec",
+        "bg_outer_arcsec", "min_bg_fibers", "smooth_bg", "bg_smooth_method",
+        "bg_smooth_sigma_A", "line_mask_halfwidth_A", "smoothing_values",
+        "bg_combine_method", "fiber_combine_method", "mass_col", "z_col",
+        "wave_min", "wave_max", "nwave",
+    )
+
+    def extract_signature_dict(self) -> dict:
+        """
+        The exact knob->value mapping that `extract_signature` hashes. Written
+        verbatim to each cache directory as `_manifest.json` so a 10-hex folder
+        name is decodable months later ('which run was 4f9e21a0bc?') without
+        re-deriving it by hand.
+        """
+        d = {k: getattr(self, k) for k in self._SIGNATURE_KEYS}
+        d["field"] = self.normalized_field()
+        d["bg_combine_method"] = self.resolved_bg_combine_method()  # hash resolved value
+        # sigma_clip knobs (optional on config): included so changing them busts
+        # the cache, but read defensively so older configs without the fields
+        # still hash.
+        d["sigma_clip_sigma"] = getattr(self, "sigma_clip_sigma", 3.0)
+        d["sigma_clip_maxiters"] = getattr(self, "sigma_clip_maxiters", 5)
+        # Fused-combine knobs: these DO change Err (~1e-7) and, with transpose,
+        # the flux (~1e-15), so a cache must record which estimator wrote it.
+        # Read defensively and OMIT when off, so existing caches from before
+        # this flag existed still hash to the same signature and stay valid.
+        if getattr(self, "combine_fused", False):
+            d["combine_fused"] = True
+            d["combine_fused_strict"] = getattr(self, "combine_fused_strict", False)
+            d["combine_fused_transpose"] = getattr(self, "combine_fused_transpose", False)
+        # NOT hashed, deliberately: combine_wave_block, combine_threads,
+        # combine_min_fibers -- all provably no-effect on the result, so a cache
+        # built at 1 thread stays valid at 8.
+        # Baked segmentation mask identity: CONTENT hash, so retweaking the mask
+        # FITS in place busts the cache (path/name alone would not change).
+        d["seg_mask_hash"] = self.seg_mask_hash()
+        return d
+
+    def extract_signature(self) -> str:
+        """
+        10-hex hash of every Stage-1 knob that can change the extracted numbers.
+        Names the cache directory (`cache/<sig>/`) and closes the galaxy FITS
+        (`descriptive_filename`), so any change that triggers a recompute also
+        changes the output filename -- overwriting a previous extraction becomes
+        impossible by construction rather than by remembering to update a list.
+        """
+        blob = json.dumps(self.extract_signature_dict(), sort_keys=True, default=str)
+        return hashlib.md5(blob.encode()).hexdigest()[:10]
+
+    def resolved_run_cache_dir(self) -> str:
+        """
+        Per-RUN cache directory: `<resolved_cache_dir>/<extract_signature>`.
+
+        The old layout wrote every galaxy of every config ever run flat into one
+        folder as `gal_<sig>_<i>.npz`, which grew until listing it took minutes.
+        One subdirectory per signature keeps a listing scoped to a single config
+        and makes retiring a dead config `rm -rf cache/<sig>/` instead of a glob
+        over tens of thousands of files.
+        """
+        return os.path.join(self.resolved_cache_dir(), self.extract_signature())
 
     def config_hash(self) -> str:
         """Short, stable hash of the full config (every field), so any result
@@ -490,21 +629,46 @@ class PipelineConfig:
         return f"b{nrad}_{h}"
 
     def descriptive_filename(self, catalog_tag: bool = True,
-                             bins_tag: bool = True) -> str:
+                             bins_tag: bool = True,
+                             scheme: str = "sig") -> str:
         """
-        Self-documenting galaxy-FITS name encoding the defining knobs, so
-        different runs don't collide in outputs/. Layout:
-          galaxy_{cattag}_{binstag}_{FIELD}_{CATALOG}_{binmode}_{fiber}_{mask}_bg{in}-{out}.fits
+        Galaxy-FITS name. The CURRENT scheme ('sig', the default and the name
+        Stage 2 writes and looks for first) is:
 
-        Both tags default to True (the canonical WRITE name and the name Stage 2
-        looks for first). Turning a tag off reproduces an older naming scheme that
-        the Stage-2 reader falls back to (guarded by a header-BINS check) so files
-        made before that tag existed still load without re-extraction:
-          catalog_tag=True,  bins_tag=True   galaxy_cat1a2b3c_b6_4f9e21_AEGIS_MOSDEF_virial_biweight_image_bg57-63.fits  (current)
-          catalog_tag=True,  bins_tag=False  galaxy_cat1a2b3c_AEGIS_MOSDEF_virial_biweight_image_bg57-63.fits            (pre-bins-tag)
-          catalog_tag=False, bins_tag=False  galaxy_AEGIS_MOSDEF_virial_biweight_image_bg57-63.fits                      (legacy)
+          galaxy_{FIELD}_{CATALOG}_b{nrad}_{extract_signature}.fits
+          e.g.  galaxy_AEGIS_MOSDEF_b12_a1b2c3d4e5.fits
+
+        Field, catalog and bin count stay readable because those are what you
+        scan a directory for; EVERYTHING else -- bin mode, combine method, mask
+        method, background radii, the catalog tag -- moves into the 10-hex
+        signature. That is the point of the change, not a cosmetic trim.
+
+        WHY: the old scheme hand-listed 8 knobs while the per-galaxy cache hashed
+        ~30. Change one of the other ~22 and the cache correctly recomputed while
+        the FITS name came out character-for-character identical -- so the new
+        extraction silently overwrote the old one. Deriving the name from the
+        same signature the cache uses makes that impossible by construction: if
+        it changed the data, it changed the filename.
+
+        `scheme` selects an OLDER spelling, which is how files written before
+        this change keep loading (see io._resolve_galaxy_fits_path, which walks
+        these newest-first under a header-BINS guard) -- no re-extraction:
+          'sig'     galaxy_AEGIS_MOSDEF_b12_a1b2c3d4e5.fits                                            (current)
+          'tagged'  galaxy_cat1a2b3c_b6_4f9e21_AEGIS_MOSDEF_virial_biweight_image_bg57-63.fits         (pre-signature)
+          'tagged', bins_tag=False    galaxy_cat1a2b3c_AEGIS_MOSDEF_virial_biweight_image_bg57-63.fits (pre-bins-tag)
+          'tagged', catalog_tag=False, bins_tag=False
+                                      galaxy_AEGIS_MOSDEF_virial_biweight_image_bg57-63.fits           (legacy)
+        `catalog_tag` / `bins_tag` apply only to 'tagged' and are ignored by
+        'sig', where both are subsumed by the signature.
         """
         nf = self.normalized_field()
+        if scheme == "sig":
+            nrad = max(len(self.bins) - 1, 0)
+            return (f"galaxy_{nf}_{self.catalog}_b{nrad}_"
+                    f"{self.extract_signature()}.fits")
+        if scheme != "tagged":
+            raise ValueError(f"unknown naming scheme {scheme!r}; "
+                             "expected 'sig' (current) or 'tagged' (pre-signature)")
         cat = f"{self.catalog_tag()}_" if catalog_tag else ""
         binp = f"{self.bins_tag()}_" if bins_tag else ""
         return (f"galaxy_{cat}{binp}{nf}_{self.catalog}_{self.bin_mode}_"

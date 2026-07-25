@@ -53,10 +53,11 @@ from .io import GalaxyProduct
 from .stack import build_stacks, coadd_galaxies
 from .extract import combine_fibers
 from .measure import (
-    flux_weighted_centroid, measure_centroid, bootstrap_measurements,
+    flux_weighted_centroid, measure_centroid, gaussian_centroid, bootstrap_measurements,
     bootstrap_stack_error, bootstrap_all, stack_galaxies, get_continuum_model,
     integrated_line_flux, CENTROID_METHOD_SPECS, CENTROID_METHOD_LABELS,
-    DEFAULT_CONT_BOUNDS, LYA_REST, run_header,
+    DEFAULT_CONT_BOUNDS, DEFAULT_CONT_METHOD, DEFAULT_CONT_ORDER,
+    DEFAULT_CENTROID_METHOD, LYA_REST, run_header,
 )
 from .config import stamp_provenance
 # reuse the EXACT radius axis + figure engines the headline figures use
@@ -104,6 +105,18 @@ __all__ = [
     "plot_windowed_scan",
     "combined_bin_significance",
     "pool_bins_and_bootstrap",
+    # --- bin-by-bin correlation diagnostics ---
+    "compute_bin_correlation",
+    "plot_bin_correlation",
+    "compare_bin_correlation_resolution",
+    # --- flux-window sensitivity (§1.2: flux window decoupled from centroid) ---
+    "bootstrap_flux_profile",
+    "sweep_flux_window",
+    "gaussian_sigma_per_bin",
+    "gaussian_flux_window",
+    "h1_vs_flux_window",
+    "plot_h1_vs_flux_window",
+    "plot_flux_window_diagnostic",
 ]
 
 
@@ -2504,6 +2517,494 @@ def pool_bins_and_bootstrap(
     return boot
 
 
+# =====================================================================
+# 5b. BIN-BY-BIN CORRELATION DIAGNOSTICS
+# =====================================================================
+# Three separate correlation matrices answering two separate questions --
+# see specs/bin-correlation-diagnostics.md for the full design rationale.
+#
+#   Matrix 1 (bootstrap)      : how much do bins' MEASURED CENTROIDS co-vary
+#                                across galaxy-resampling bootstrap draws.
+#                                Exactly combined_bin_significance's existing
+#                                Corr block, generalized to every bin instead
+#                                of a caller-selected subset.
+#   Matrix 2 (Lya complex)    : do bins' continuum-subtracted residual
+#                                SPECTRA look alike, pixel-for-pixel, in the
+#                                window the real centroid measurement uses
+#                                (blue sideband through the line through red
+#                                sideband). Pure Pearson correlation on the
+#                                FIDUCIAL stack, no bootstrap involved.
+#   Matrix 3 (outside Lya)    : same, restricted to the rest of the spectrum.
+#                                Not science-critical on its own -- a
+#                                broadband-systematic fingerprint check.
+#
+# Matrices 2/3 are single point estimates off the fiducial stack, so they are
+# sensitive to pixel-to-pixel autocorrelation (adjacent rest-frame pixels are
+# NOT independent samples -- config.py's own rest_delta comment documents the
+# native sampling as ~0.6 A, three times coarser than the production 0.2 A
+# grid). Feed compute_bin_correlation a `stacks_spec` built at rest_delta=0.6
+# for Matrices 2/3 to decorrelate this properly; Matrix 1 should stay on the
+# normal rest_delta=0.2 `real_boot`, since finer sampling is what is actually
+# optimal for centroiding. compare_bin_correlation_resolution (below) is the
+# dedicated tool for checking how much the 0.2-vs-0.6 choice actually matters.
+
+def _pairwise_corr_nan(X, min_pixels=8):
+    """
+    (n, npix) -> (n, n) Pearson correlation matrix, pairwise-complete over
+    NaNs -- each pair (i, j) uses only the pixels finite in BOTH rows, rather
+    than dropping a whole row for one bad pixel. A pair with fewer than
+    `min_pixels` jointly-finite pixels is left NaN rather than reporting an
+    unstable correlation off a handful of points. Diagonal is 1 wherever a
+    row has enough finite pixels to be compared with itself.
+    """
+    X = np.asarray(X, dtype=float)
+    n = X.shape[0]
+    C = np.full((n, n), np.nan)
+    finite = np.isfinite(X)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        for i in range(n):
+            for j in range(i, n):
+                m = finite[i] & finite[j]
+                if m.sum() < min_pixels:
+                    continue
+                xi, xj = X[i, m], X[j, m]
+                si, sj = np.std(xi), np.std(xj)
+                if si == 0 or sj == 0:
+                    r = 1.0 if i == j else np.nan
+                else:
+                    r = float(np.corrcoef(xi, xj)[0, 1])
+                C[i, j] = C[j, i] = r
+    return C
+
+
+def _spectral_correlation_matrices(
+    stacks, cont_bounds, cont_method, cont_order,
+    outer_mode="exclusive", stack_method=None,
+):
+    """
+    Shared engine behind compute_bin_correlation's Matrices 2/3 and
+    compare_bin_correlation_resolution: continuum-subtract every bin's
+    FIDUCIAL stacked spectrum (get_continuum_model, same recipe as
+    plot_continuum_check/error_cross_check use elsewhere in this module),
+    then pairwise-Pearson-correlate the residuals across bins, split into the
+    Lya-complex window (cont_bounds span) and everything else. No bootstrap
+    -- this is a pure function of `stacks`'s fiducial arrays.
+
+    outer_mode : 'exclusive' (default) -- outer mask is the complement of the
+                 Lya window, so Matrix 3 adds independent information over
+                 Matrix 2 rather than diluting it with the same pixels.
+                 'full' -- outer mask is the whole grid (Lya window included).
+
+    Returns (lya_corr, outer_corr, wave, resid, lya_mask, outer_mask, stack_method).
+    """
+    sm = stack_method or "biweight"
+    if sm not in stacks["stacks"]:
+        raise KeyError(f"method {sm!r} not in stacks (have {list(stacks['stacks'])}).")
+    flux = np.asarray(stacks["stacks"][sm]["flux"], dtype=float)   # (nrad, nwave)
+    wave = np.asarray(stacks["rest_wave"], dtype=float)
+    nrad = flux.shape[0]
+
+    resid = np.full_like(flux, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        for r in range(nrad):
+            cont = get_continuum_model(wave, flux[r], cont_bounds=cont_bounds,
+                                       cont_method=cont_method, cont_order=cont_order)
+            resid[r] = flux[r] - cont
+
+    lya_lo, lya_hi = cont_bounds[0][0], cont_bounds[1][1]
+    lya_mask = (wave >= lya_lo) & (wave <= lya_hi)
+    outer_mask = (~lya_mask if outer_mode == "exclusive"
+                 else np.ones_like(wave, dtype=bool))
+
+    lya_corr = _pairwise_corr_nan(resid[:, lya_mask])
+    outer_corr = _pairwise_corr_nan(resid[:, outer_mask])
+    return lya_corr, outer_corr, wave, resid, lya_mask, outer_mask, sm
+
+
+def compute_bin_correlation(
+    real_boot: dict,
+    stacks_spec: dict,
+    r_min: float | None = None,
+    r_max: float | None = None,
+    bins=None,
+    outer_mode: str = "exclusive",
+    stack_method: str | None = None,
+    verbose: bool = True,
+) -> dict:
+    """
+    Three bin-by-bin correlation matrices, always computed over EVERY bin (no
+    bootstrap re-run): how much bins' bootstrap centroids co-vary (Matrix 1),
+    and how much bins' continuum-subtracted spectra look alike inside the Lya
+    complex (Matrix 2) and outside it (Matrix 3). See the module notes above
+    and specs/bin-correlation-diagnostics.md for the full design rationale --
+    in short, Matrix 1 is a statistic-level covariance driven by shared
+    galaxies across the bootstrap's resamples, while Matrices 2/3 are
+    spectral-SHAPE correlations off the fiducial stack, a systematics
+    fingerprint check independent of the bootstrap machinery entirely. The
+    inner-bin block of all three is the PSF-cross-talk readout; the outer-bin
+    block is the large-scale measurement-systematic-floor readout.
+
+    Parameters
+    ----------
+    real_boot   : production bootstrap output (bootstrap_measurements /
+                  bootstrap_all / measure_all_bins), normally at the
+                  pipeline's default rest_delta=0.2. Supplies centroid_v_all,
+                  r_edges (Matrix 1), and the continuum/window settings
+                  (meta['cont_bounds']/['cont_method']/['cont_order']) used
+                  for Matrices 2/3, so they match production exactly.
+    stacks_spec : a build_stacks() output supplying the FIDUCIAL per-bin flux
+                  + rest_wave for Matrices 2/3. Any rest_delta works; pass a
+                  rest_delta=0.6 build (matching config.py's documented
+                  native sampling) to decorrelate adjacent-pixel noise in the
+                  spectral matrices, or a rest_delta=0.2 build to see the
+                  raw/undecorrelated version (compare via
+                  compare_bin_correlation_resolution). Must share real_boot's
+                  r_edges (same radial bins; only the wavelength grid should
+                  differ).
+    r_min, r_max, bins : select which bins are shown in the printed summary
+                  and the default plot_bin_correlation view. The matrices
+                  themselves are ALWAYS computed over every bin regardless.
+    outer_mode  : 'exclusive' (default, recommended) or 'full' -- see
+                  _spectral_correlation_matrices.
+    stack_method: which galaxy-combine method's stack to read from
+                  stacks_spec['stacks']. None -> real_boot's own
+                  meta['stack_method'] (matches production).
+
+    Returns
+    -------
+    dict with bin geometry ('r_edges', 'centers', 'view_bins'), the three
+    matrices ('boot_correlation', 'lya_correlation', 'outer_correlation'),
+    Matrix 1's covariance ('boot_covariance') and bootstrap-draw count
+    ('n_valid_draws', 'n_boot'), and the window/method metadata actually used
+    ('lya_window', 'outer_mode', 'stack_method', 'cont_method', 'cont_order',
+    'cont_bounds', 'rest_delta' -- the median wavelength spacing of
+    stacks_spec's grid, so you can confirm which resolution you actually got).
+    """
+    if outer_mode not in ("exclusive", "full"):
+        raise ValueError("outer_mode must be 'exclusive' or 'full'")
+
+    r_edges, centers = _bin_centers_edges(real_boot["r_edges"])
+    r_edges_spec, _ = _bin_centers_edges(stacks_spec["r_edges"])
+    if r_edges.shape != r_edges_spec.shape or not np.allclose(r_edges, r_edges_spec):
+        raise ValueError(
+            "real_boot and stacks_spec have different radial binning -- "
+            f"r_edges {r_edges.tolist()} vs {r_edges_spec.tolist()}. They "
+            "must come from the same radial bin scheme (only the wavelength "
+            "grid is expected to differ).")
+    nrad = centers.size
+
+    # ---------------- Matrix 1: bootstrap centroid correlation ----------------
+    v_all = np.asarray(real_boot["centroid_v_all"], dtype=float)
+    good = np.all(np.isfinite(v_all), axis=1)
+    n_valid = int(good.sum())
+    if n_valid < 20 * nrad:
+        warnings.warn(
+            f"only {n_valid} finite bootstrap draws for {nrad} bins -- the "
+            "bootstrap correlation matrix may be noisy; consider more nboot.")
+    Sigma1 = np.atleast_2d(np.cov(v_all[good], rowvar=False))
+    d1 = np.sqrt(np.diag(Sigma1))
+    boot_corr = Sigma1 / np.outer(d1, d1)
+
+    # ---------------- Matrices 2/3: spectral Pearson correlation ----------------
+    meta = real_boot.get("meta", {})
+    sm = stack_method or meta.get("stack_method", "biweight")
+    cont_bounds = meta.get("cont_bounds", DEFAULT_CONT_BOUNDS)
+    cont_method = meta.get("cont_method", DEFAULT_CONT_METHOD)
+    cont_order = meta.get("cont_order", DEFAULT_CONT_ORDER)
+
+    lya_corr, outer_corr, wave, _, lya_mask, outer_mask, sm = \
+        _spectral_correlation_matrices(stacks_spec, cont_bounds, cont_method,
+                                       cont_order, outer_mode=outer_mode,
+                                       stack_method=sm)
+    lya_lo, lya_hi = cont_bounds[0][0], cont_bounds[1][1]
+    rest_delta = float(np.median(np.diff(wave)))
+
+    # ---------------- view selection (display only; matrices stay full) --------
+    if bins is not None:
+        view_idx = np.asarray(list(bins), dtype=int)
+    else:
+        lo = -np.inf if r_min is None else r_min
+        hi = np.inf if r_max is None else r_max
+        view_idx = np.where((centers >= lo) & (centers <= hi))[0]
+    if view_idx.size < 1:
+        raise ValueError(
+            "no bins selected for the view -- check r_min/r_max/bins against "
+            f"bin centers {np.round(centers, 1).tolist()}")
+
+    if verbose:
+        print(f"\nbin correlation -- {nrad} bins total "
+              f"({n_valid}/{v_all.shape[0]} bootstrap draws finite in all bins)")
+        print(f"  spectral: method={sm}, cont={cont_method}(order={cont_order}), "
+              f"rest_delta~{rest_delta:.3g} A, Lya window=[{lya_lo:g},{lya_hi:g}] A "
+              f"({int(lya_mask.sum())} px), outer={outer_mode} "
+              f"({int(outer_mask.sum())} px)")
+        print(f"  view: {view_idx.size} bin(s) centered "
+              f"{np.round(centers[view_idx], 1).tolist()} kpc")
+        vi = np.ix_(view_idx, view_idx)
+        print("\nbootstrap centroid correlation (view):")
+        print(np.array2string(boot_corr[vi], precision=2, suppress_small=True))
+        print("\nLya-complex spectral correlation (view):")
+        print(np.array2string(lya_corr[vi], precision=2, suppress_small=True))
+        print(f"\noutside-Lya spectral correlation (view, {outer_mode}):")
+        print(np.array2string(outer_corr[vi], precision=2, suppress_small=True))
+
+    return {
+        "r_edges": r_edges, "centers": centers, "view_bins": view_idx,
+        "boot_correlation": boot_corr, "boot_covariance": Sigma1,
+        "n_valid_draws": n_valid, "n_boot": v_all.shape[0],
+        "lya_correlation": lya_corr, "outer_correlation": outer_corr,
+        "lya_window": (lya_lo, lya_hi), "outer_mode": outer_mode,
+        "stack_method": sm, "cont_method": cont_method, "cont_order": cont_order,
+        "cont_bounds": cont_bounds, "rest_delta": rest_delta,
+    }
+
+
+def plot_bin_correlation(
+    result: dict,
+    r_min: float | None = None,
+    r_max: float | None = None,
+    bins=None,
+    annotate: bool | None = None,
+    figsize=(13.0, 4.4),
+    title=None,
+    save_fig=False,
+    savename="Figure_bin_correlation.png",
+):
+    """
+    1x3 lower-triangle heatmap of compute_bin_correlation's three matrices --
+    bootstrap (centroid), Lya complex (spectral), outside Lya (spectral) --
+    sharing one radius-bin axis and one diverging colorbar (all three are
+    bounded [-1, 1]). Only the lower triangle is drawn (diagonal is trivially
+    1, matrix is symmetric).
+
+    r_min, r_max, bins : re-slice the view independently of whatever
+        compute_bin_correlation's own 'view_bins' was -- the matrices in
+        `result` are always the full set, so this is free.
+    annotate : print each cell's value as text. None (default) -> on if the
+        view has <=12 bins, off above that to avoid clutter.
+    """
+    centers = np.asarray(result["centers"])
+    if bins is not None:
+        idx = np.asarray(list(bins), dtype=int)
+    elif r_min is not None or r_max is not None:
+        lo = -np.inf if r_min is None else r_min
+        hi = np.inf if r_max is None else r_max
+        idx = np.where((centers >= lo) & (centers <= hi))[0]
+    else:
+        idx = np.asarray(result.get("view_bins", np.arange(centers.size)))
+    if idx.size < 1:
+        raise ValueError("no bins selected to plot.")
+
+    labels = [f"{c:.0f}" for c in centers[idx]]
+    if annotate is None:
+        annotate = idx.size <= 12
+
+    panels = [
+        (result["boot_correlation"], "bootstrap (centroid)"),
+        (result["lya_correlation"], r"Ly$\alpha$ complex (spectral)"),
+        (result["outer_correlation"],
+         f"outside Ly$\\alpha$ (spectral, {result.get('outer_mode', 'exclusive')})"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    cmap = plt.get_cmap("RdBu_r").copy()
+    cmap.set_bad("white")
+    im = None
+    for ax, (mat, lab) in zip(axes, panels):
+        sub = np.asarray(mat)[np.ix_(idx, idx)]
+        tri = np.where(np.tril(np.ones_like(sub, dtype=bool)), sub, np.nan)
+        im = ax.imshow(tri, vmin=-1, vmax=1, cmap=cmap)
+        ax.set_xticks(range(idx.size)); ax.set_xticklabels(labels, rotation=90, fontsize=7)
+        ax.set_yticks(range(idx.size)); ax.set_yticklabels(labels, fontsize=7)
+        ax.set_title(lab, fontsize=10)
+        if annotate:
+            for i in range(idx.size):
+                for j in range(i + 1):
+                    v = tri[i, j]
+                    if np.isfinite(v):
+                        ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                               fontsize=6, color="white" if abs(v) > 0.6 else "black")
+    axes[0].set_ylabel("bin center [kpc]", fontsize=9)
+    fig.supxlabel("bin center [kpc]", fontsize=9)
+    fig.colorbar(im, ax=axes, shrink=0.85, label="correlation")
+    fig.suptitle(title or "Bin-to-bin correlation diagnostics", fontsize=12, y=1.04)
+    if save_fig:
+        plt.savefig(savename, dpi=300, bbox_inches="tight")
+    plt.show()
+    return fig, axes
+
+
+def compare_bin_correlation_resolution(
+    stacks_02: dict,
+    stacks_06: dict,
+    boot_02: dict | None = None,
+    boot_06: dict | None = None,
+    r_min: float | None = None,
+    r_max: float | None = None,
+    bins=None,
+    outer_mode: str = "exclusive",
+    stack_method: str | None = None,
+    check_success_frac: bool = False,
+    verbose: bool = True,
+) -> dict:
+    """
+    Does the rest_delta choice actually matter? Compares
+    compute_bin_correlation's Matrices 2/3 (Lya-complex and outside-Lya
+    spectral correlation) built at two different rest-frame grid spacings --
+    e.g. production 0.2 A vs. the decorrelated 0.6 A default -- and, if
+    bootstrap products are available, whether the CENTROID measurement
+    itself (value and precision) shifts too. Deliberately standalone from
+    compute_bin_correlation, not a mode of it: a one-off curiosity/sanity
+    check, not part of the standard diagnostic pipeline.
+
+    The core correlation-pattern comparison needs NOTHING beyond the two
+    `stacks_*` inputs -- Matrices 2/3 are pure functions of the fiducial
+    stack, no bootstrap dependency at all (see _spectral_correlation_matrices).
+    The centroid comparison is the piece that benefits from bootstrap
+    products, since it is really asking "does going coarser change my
+    measurement precision," not just the correlation diagnostic.
+
+    Parameters
+    ----------
+    stacks_02, stacks_06 : build_stacks() outputs at the two rest_delta
+        values being compared (names are illustrative -- any two resolutions
+        work). Must share r_edges.
+    boot_02, boot_06     : optional matching bootstrap products
+        (bootstrap_all / measure_all_bins) at each resolution. If given,
+        their centroid_v_fid + 16/84 width are used directly (no
+        recomputation) and their meta supplies the continuum/window settings
+        (matching whichever one is provided; boot_02 preferred if both are).
+        If missing at one or both resolutions, falls back to a single
+        measure_centroid point estimate on that resolution's fiducial stack
+        (no error bar for that side).
+    outer_mode, stack_method : forwarded to the internal spectral-correlation
+        calls, same meaning as in compute_bin_correlation.
+    check_success_frac   : also diff success_frac per bin between boot_02 and
+        boot_06 (only computed if both are given).
+
+    Returns
+    -------
+    dict with bin geometry, the four spectral matrices
+    ('lya_correlation_02/06', 'outer_correlation_02/06') and their
+    differences ('lya_diff', 'outer_diff' = 06 - 02), one pattern-agreement
+    number per matrix ('lya_pattern_r', 'outer_pattern_r' -- flatten each
+    matrix's upper triangle and correlate the two resolutions' values against
+    each other), the centroid comparison ('centroid_02/06' + '_err' where a
+    bootstrap was available, 'centroid_diff' = 06 - 02), and
+    'success_frac_diff' if requested and available.
+    """
+    if outer_mode not in ("exclusive", "full"):
+        raise ValueError("outer_mode must be 'exclusive' or 'full'")
+
+    r_edges, centers = _bin_centers_edges(stacks_02["r_edges"])
+    r_edges_06, _ = _bin_centers_edges(stacks_06["r_edges"])
+    if r_edges.shape != r_edges_06.shape or not np.allclose(r_edges, r_edges_06):
+        raise ValueError(
+            "stacks_02 and stacks_06 have different radial binning -- "
+            f"r_edges {r_edges.tolist()} vs {r_edges_06.tolist()}.")
+    nrad = centers.size
+
+    # continuum/window settings: prefer whichever bootstrap's own meta is
+    # available (matches production exactly), else the module defaults.
+    src_meta = (boot_02 or boot_06 or {}).get("meta", {})
+    sm = stack_method or src_meta.get("stack_method", "biweight")
+    cont_bounds = src_meta.get("cont_bounds", DEFAULT_CONT_BOUNDS)
+    cont_method = src_meta.get("cont_method", DEFAULT_CONT_METHOD)
+    cont_order = src_meta.get("cont_order", DEFAULT_CONT_ORDER)
+    bounds = src_meta.get("bounds", (LYA_REST - 4, LYA_REST + 4))
+    centroid_method = src_meta.get("centroid_method", DEFAULT_CENTROID_METHOD)
+
+    lya_02, outer_02, wave_02, _, _, _, sm = _spectral_correlation_matrices(
+        stacks_02, cont_bounds, cont_method, cont_order, outer_mode, sm)
+    lya_06, outer_06, wave_06, _, _, _, sm = _spectral_correlation_matrices(
+        stacks_06, cont_bounds, cont_method, cont_order, outer_mode, sm)
+    rest_delta_02 = float(np.median(np.diff(wave_02)))
+    rest_delta_06 = float(np.median(np.diff(wave_06)))
+
+    lya_diff = lya_06 - lya_02
+    outer_diff = outer_06 - outer_02
+
+    def _pattern_r(A, B):
+        iu = np.triu_indices_from(A, k=1)
+        a, b = A[iu], B[iu]
+        m = np.isfinite(a) & np.isfinite(b)
+        if m.sum() < 3:
+            return np.nan
+        return float(np.corrcoef(a[m], b[m])[0, 1])
+
+    lya_pattern_r = _pattern_r(lya_02, lya_06)
+    outer_pattern_r = _pattern_r(outer_02, outer_06)
+
+    # ---------------- centroid comparison ----------------
+    def _centroid_pair(stacks, boot):
+        if boot is not None and "centroid_v_fid" in boot:
+            v = np.asarray(boot["centroid_v_fid"], dtype=float)
+            lo = np.asarray(boot["centroid_v_lo"], dtype=float)
+            hi = np.asarray(boot["centroid_v_hi"], dtype=float)
+            return v, 0.5 * (hi - lo)
+        flux = np.asarray(stacks["stacks"][sm]["flux"], dtype=float)
+        wave = np.asarray(stacks["rest_wave"], dtype=float)
+        v = np.full(nrad, np.nan)
+        for r in range(nrad):
+            res = measure_centroid(wave, flux[r], method=centroid_method,
+                                   bounds=bounds, cont_bounds=cont_bounds,
+                                   lya_center=LYA_REST, cont_method=cont_method,
+                                   cont_order=cont_order)
+            v[r] = res["centroid_vel_kms"]
+        return v, None
+
+    v02, e02 = _centroid_pair(stacks_02, boot_02)
+    v06, e06 = _centroid_pair(stacks_06, boot_06)
+    centroid_diff = v06 - v02
+
+    success_frac_diff = None
+    if check_success_frac and boot_02 is not None and boot_06 is not None:
+        sf02 = np.asarray(boot_02.get("success_frac", np.full(nrad, np.nan)))
+        sf06 = np.asarray(boot_06.get("success_frac", np.full(nrad, np.nan)))
+        success_frac_diff = sf06 - sf02
+
+    # ---------------- view selection (display only) ----------------
+    if bins is not None:
+        view_idx = np.asarray(list(bins), dtype=int)
+    else:
+        lo = -np.inf if r_min is None else r_min
+        hi = np.inf if r_max is None else r_max
+        view_idx = np.where((centers >= lo) & (centers <= hi))[0]
+    if view_idx.size < 1:
+        raise ValueError(
+            "no bins selected for the view -- check r_min/r_max/bins against "
+            f"bin centers {np.round(centers, 1).tolist()}")
+
+    if verbose:
+        print(f"\nresolution comparison -- rest_delta {rest_delta_02:.3g} A vs "
+              f"{rest_delta_06:.3g} A, {nrad} bins total, view = {view_idx.size} "
+              f"bin(s) centered {np.round(centers[view_idx], 1).tolist()} kpc")
+        print(f"  pattern agreement (flattened upper triangle): "
+              f"Lya r={lya_pattern_r:.2f}, outer r={outer_pattern_r:.2f}")
+        print(f"\n{'bin center':>12}  {'v(0.2)':>10}  {'v(0.6)':>10}  {'diff':>8}")
+        for j in view_idx:
+            s02 = f"{v02[j]:7.1f}" + (f"+/-{e02[j]:.0f}" if e02 is not None else "")
+            s06 = f"{v06[j]:7.1f}" + (f"+/-{e06[j]:.0f}" if e06 is not None else "")
+            print(f"{centers[j]:12.1f}  {s02:>10}  {s06:>10}  {centroid_diff[j]:8.1f}")
+
+    return {
+        "r_edges": r_edges, "centers": centers, "view_bins": view_idx,
+        "lya_correlation_02": lya_02, "lya_correlation_06": lya_06, "lya_diff": lya_diff,
+        "outer_correlation_02": outer_02, "outer_correlation_06": outer_06,
+        "outer_diff": outer_diff,
+        "lya_pattern_r": lya_pattern_r, "outer_pattern_r": outer_pattern_r,
+        "centroid_02": v02, "centroid_02_err": e02,
+        "centroid_06": v06, "centroid_06_err": e06,
+        "centroid_diff": centroid_diff,
+        "success_frac_diff": success_frac_diff,
+        "outer_mode": outer_mode, "stack_method": sm,
+        "cont_method": cont_method, "cont_order": cont_order, "cont_bounds": cont_bounds,
+        "rest_delta_02": rest_delta_02, "rest_delta_06": rest_delta_06,
+    }
+
+
 def summarize_validation(
     real_boot: dict | None = None,
     sn: dict | None = None,
@@ -3556,6 +4057,561 @@ def plot_windowed_scan(
 
     fig.suptitle(title or "Signed windowed-flux scan (lines NOT avoided)", fontsize=13)
     fig.supxlabel(r"Window-center rest wavelength [$\AA$]", fontsize=11)
+    if save_fig:
+        plt.savefig(savename, dpi=300, bbox_inches="tight")
+    plt.show()
+    return fig, axes
+
+
+# import fitting.py + analysis.py for the flux-window sensitivity tools below
+# (h1_vs_flux_window needs fitting's fit_psf_aware_expcore/fit_naive_expcore
+# and analysis's plot_flux_profile_fit/bootstrap_fit_profile). No import
+# cycle: neither fitting.py nor analysis.py imports validation.py.
+from . import fitting                                        # noqa: E402
+from . import analysis                                        # noqa: E402
+
+
+# =====================================================================
+# 2c. FLUX-WINDOW SENSITIVITY -- decoupled from the centroid window
+#
+#   systematics-and-extraction.md §1.2: the centroid genuinely needs a fixed
+#   window (a radius-varying window makes v(r) inconsistent bin to bin), but
+#   the flux profile has no such requirement. bootstrap_all/sweep_line_window
+#   tie both to one `bounds` value per call; the tools below measure ONLY the
+#   integrated flux, so the window can move (fixed-but-wider, or a per-bin
+#   Gaussian-sigma-scaled window) with the centroid never touched.
+#
+#   Workflow (see also §8 "Now -- free" item 3):
+#       sweep = sweep_flux_window(cfg, stacks)                # ±3/5/6/8/10 A
+#       gauss = gaussian_flux_window(cfg, stacks)              # k*sigma, per bin
+#       h1s = h1_vs_flux_window(cfg, stacks, {**{f"±{hw}Å": sweep[hw]
+#                                                for hw in sweep["_meta"]["half_windows"]},
+#                                             "gaussian k·σ": gauss})
+#       plot_h1_vs_flux_window(h1s)
+# =====================================================================
+
+def bootstrap_flux_profile(
+    flux_rf, err_rf, wave, bin_bounds,
+    cont_bounds=DEFAULT_CONT_BOUNDS,
+    lya_center=LYA_REST,
+    cont_method=DEFAULT_CONT_METHOD, cont_order=DEFAULT_CONT_ORDER,
+    clip_negative=False,
+    stack_method="biweight", weights=None,
+    sigma_clip_sigma=3.0, sigma_clip_maxiters=5,
+    nboot=300, seed=1, label=None, verbose=True,
+):
+    """
+    Galaxy-resampling bootstrap of the INTEGRATED FLUX ONLY, per radial bin,
+    with the integration window allowed to differ bin by bin. No centroid is
+    computed here -- this is the flux half of measure.bootstrap_all with the
+    centroid entanglement removed, because §1.2 needs the flux window to move
+    independently of the (fixed, ±3 Å) centroid window, and bootstrap_all
+    ties both measurements to one shared `bounds` value per call.
+
+    bin_bounds : either a single (lo, hi) tuple (same window every bin -- the
+        fixed-width sweep case, see sweep_flux_window) or an (nrad, 2) array
+        of per-bin (lo, hi) tuples (a different window per bin -- the
+        Gaussian-sigma case, see gaussian_flux_window). Every draw uses
+        measure.integrated_line_flux's flux_sum per bin -- the SAME canonical
+        integrator windowed_flux_scan and sweep_line_window route through, so
+        this is directly comparable to the existing sweeps' flux numbers.
+
+    Returns dict: total_flux_fid, total_flux_med/_lo/_hi (nrad,),
+        total_flux_all (nboot, nrad), bin_bounds (nrad, 2), meta
+        (nboot, seed, stack_method). Deliberately the same shape as
+        bootstrap_all's flux-half output so it drops straight into
+        analysis.plot_flux_profile_fit / analysis.bootstrap_fit_profile.
+    """
+    from tqdm.auto import tqdm
+
+    flux_rf = np.asarray(flux_rf, dtype=float)
+    err_rf = np.asarray(err_rf, dtype=float) if err_rf is not None else None
+    wave = np.asarray(wave, dtype=float)
+    ngal, nrad, nwave_full = flux_rf.shape
+
+    bb = np.asarray(bin_bounds, dtype=float)
+    if bb.ndim == 1:
+        bb = np.tile(bb[None, :], (nrad, 1))
+    if bb.shape != (nrad, 2):
+        raise ValueError(f"bin_bounds must broadcast to ({nrad}, 2); got {bb.shape}")
+
+    # slice the cube to the union of every bin's window + both continuum
+    # sidebands (pure speedup, mirrors measure._measurement_window).
+    (cb_lo, _), (_, cb_hi) = cont_bounds
+    w_lo = min(cb_lo, float(np.nanmin(bb[:, 0]))) - 2.0
+    w_hi = max(cb_hi, float(np.nanmax(bb[:, 1]))) + 2.0
+    sel = (wave >= w_lo) & (wave <= w_hi)
+    wv = wave[sel]
+    fcube = flux_rf[:, :, sel]
+    ecube = err_rf[:, :, sel] if err_rf is not None else None
+
+    def _flux_per_bin(stack):
+        out = np.full(nrad, np.nan)
+        for rb in range(nrad):
+            res = integrated_line_flux(
+                wv, stack[rb], bounds=tuple(bb[rb]), cont_bounds=cont_bounds,
+                lya_center=lya_center, cont_method=cont_method,
+                cont_order=cont_order, clip_negative=clip_negative)
+            out[rb] = res["flux_sum"]
+        return out
+
+    fid_stack, _ = stack_galaxies(fcube, ecube, method=stack_method, weights=weights,
+                                  sigma=sigma_clip_sigma, maxiters=sigma_clip_maxiters)
+    fid_flux = _flux_per_bin(fid_stack)
+
+    desc = run_header(
+        label or "bootstrap flux profile", verbose=verbose, announce=True,
+        nboot=nboot, stack=stack_method, seed=seed,
+        window=(tuple(bb[0]) if np.all(bb == bb[0]) else "per-bin"))
+    rng = np.random.default_rng(seed)
+    tot = np.full((nboot, nrad), np.nan)
+    w_all = None if weights is None else np.asarray(weights, dtype=float)
+    for b in tqdm(range(nboot), disable=not verbose, desc=desc):
+        idx = rng.integers(0, ngal, ngal)
+        flux_bs = fcube[idx]
+        err_bs = ecube[idx] if ecube is not None else None
+        w_bs = w_all[idx] if w_all is not None else None
+        stack_bs, _ = stack_galaxies(flux_bs, err_bs, method=stack_method, weights=w_bs,
+                                     sigma=sigma_clip_sigma, maxiters=sigma_clip_maxiters)
+        tot[b] = _flux_per_bin(stack_bs)
+
+    return {
+        "total_flux_fid": fid_flux,
+        "total_flux_med": np.nanmedian(tot, axis=0),
+        "total_flux_lo": np.nanpercentile(tot, 16, axis=0),
+        "total_flux_hi": np.nanpercentile(tot, 84, axis=0),
+        "total_flux_all": tot,
+        "bin_bounds": bb,
+        "meta": {"nboot": nboot, "seed": seed, "stack_method": stack_method},
+    }
+
+
+def sweep_flux_window(
+    config: "PipelineConfig", stacks: dict,
+    half_windows=(3, 5, 6, 8, 10),
+    nboot: int = 300, method: str | None = None, seed: int = 1,
+    verbose: bool = True,
+) -> dict:
+    """
+    §1.2, the fixed-window half: re-measure ONLY the integrated flux (never
+    the centroid) at several symmetric windows ±half_window Å about Lyα, each
+    with its own galaxy bootstrap, on the SAME Stage-2 cube. Built on
+    bootstrap_flux_profile so the centroid is never touched -- unlike
+    sweep_line_window, which reuses one `bounds` for both centroid and flux.
+
+    Needs stacks built with keep_cube=True (run_stack default).
+
+    Returns {half_window: bootstrap_flux_profile output, ..., '_meta': {...}}
+    -- same shape as sweep_line_window's return, so plot_window_sweep(sweep,
+    statistic='flux') still works, and each half_window's dict plugs directly
+    into analysis.plot_flux_profile_fit / feeds h1_vs_flux_window.
+    """
+    if "cube_flux" not in stacks or "cube_err" not in stacks:
+        raise KeyError("sweep_flux_window needs the per-galaxy cube: "
+                       "run_stack(config, ..., keep_cube=True).")
+    flux = np.asarray(stacks["cube_flux"], dtype=float)
+    err = np.asarray(stacks["cube_err"], dtype=float)
+    wave = np.asarray(stacks["rest_wave"], dtype=float)
+    lya = float(config.LYA_REST)
+    cont_kw = _continuum_kwargs(config)
+    sm = method or getattr(config, "measure_stack_method", "biweight")
+
+    run_header("sweep_flux_window", verbose=verbose, nboot=nboot, stack=sm,
+               half_windows=tuple(half_windows), seed=seed)
+    out: dict = {}
+    for hw in half_windows:
+        bounds = (lya - hw, lya + hw)
+        out[hw] = bootstrap_flux_profile(
+            flux, err, wave, bounds, nboot=nboot, lya_center=lya,
+            stack_method=sm, seed=seed, label=f"flux window ±{hw:g} Å",
+            verbose=verbose, **cont_kw,
+        )
+    out["_meta"] = {
+        "half_windows": list(half_windows),
+        "nboot": nboot,
+        "stack_method": sm,
+        "r_edges": np.asarray(stacks["r_edges"]),
+        "bin_mode": stacks.get("bin_mode"),
+        "VR_biweight_v": stacks.get("VR_biweight_v"),
+    }
+    return stamp_provenance(out, config, "sweep_flux_window")
+
+
+def gaussian_sigma_per_bin(
+    config: "PipelineConfig", stacks: dict, method: str | None = None,
+    gauss_halfwidth: float = 10.0, min_pixels: int = 8, verbose: bool = True,
+) -> dict:
+    """
+    Fit a single Gaussian to the FIDUCIAL stack's continuum-subtracted Lyα
+    line in each radial bin, inside a window wide enough that the fit is not
+    truncated by the window edge (default ±10 Å -- config.line_window is only
+    ±3 Å, too narrow for a free sigma to converge honestly). Returns the
+    fitted sigma_A per bin, the input to gaussian_flux_window's per-bin
+    variable window. The centroid measured elsewhere in the pipeline is
+    untouched by this -- it stays at the fixed ±3 Å window; only the flux
+    window this feeds moves.
+
+    A bin's fit is flagged unreliable (reliable=False, in addition to the raw
+    success flag) when curve_fit failed, OR when sigma pins at >=95% of
+    gauss_halfwidth -- a saturated sigma means the window itself, not the
+    line, set the answer, which is exactly the low-S/N failure mode
+    §1.2's "obviously requires decent signal to noise" flags. Callers should
+    fall back to the fiducial ±3 Å window on those bins (gaussian_flux_window
+    does this automatically).
+
+    Returns dict: sigma_A, amp, mu_A, success, reliable (each (nrad,)),
+        gauss_halfwidth, r_edges, bin_mode.
+    """
+    sm = method or getattr(config, "measure_stack_method", "biweight")
+    lya = float(config.LYA_REST)
+    rest_wave = np.asarray(stacks["rest_wave"], dtype=float)
+    if sm not in stacks["stacks"]:
+        raise KeyError(f"method {sm!r} not in stacks (have {list(stacks['stacks'])}).")
+    flux = np.asarray(stacks["stacks"][sm]["flux"], dtype=float)
+    nrad = flux.shape[0]
+    cont_kw = _continuum_kwargs(config)
+    bounds = (lya - gauss_halfwidth, lya + gauss_halfwidth)
+
+    sigma_A = np.full(nrad, np.nan)
+    amp = np.full(nrad, np.nan)
+    mu_A = np.full(nrad, np.nan)
+    success = np.zeros(nrad, dtype=bool)
+    reliable = np.zeros(nrad, dtype=bool)
+    for r in range(nrad):
+        res = gaussian_centroid(rest_wave, flux[r], bounds=bounds,
+                                lya_center=lya, min_pixels=min_pixels,
+                                max_sigma_A=gauss_halfwidth, **cont_kw)
+        success[r] = res["success"]
+        sigma_A[r] = res["sigma_A"]
+        amp[r] = res["amp"]
+        mu_A[r] = res["centroid_A"]
+        reliable[r] = bool(res["success"]) and np.isfinite(res["sigma_A"]) and (
+            res["sigma_A"] < 0.95 * gauss_halfwidth)
+
+    if verbose:
+        n_ok = int(success.sum())
+        n_rel = int(reliable.sum())
+        print(f"gaussian_sigma_per_bin: {n_ok}/{nrad} bins fit, "
+              f"{n_rel}/{nrad} reliable (sigma < 95% of ±{gauss_halfwidth:g} Å "
+              f"window, method={sm})")
+
+    return {"sigma_A": sigma_A, "amp": amp, "mu_A": mu_A,
+            "success": success, "reliable": reliable,
+            "gauss_halfwidth": gauss_halfwidth,
+            "r_edges": np.asarray(stacks["r_edges"]),
+            "bin_mode": stacks.get("bin_mode")}
+
+
+def gaussian_flux_window(
+    config: "PipelineConfig", stacks: dict,
+    k_sigma: float = 2.5, gauss_halfwidth: float = 10.0,
+    fallback_half_width: float | None = None,
+    sigma_result: dict | None = None,
+    nboot: int = 300, method: str | None = None, seed: int = 1,
+    verbose: bool = True,
+) -> dict:
+    """
+    §1.2, the variable-window half: set the flux-integration window per
+    radial bin to ±k_sigma * (that bin's fitted Gaussian sigma), instead of
+    a single fixed half-width for every bin. Bins where gaussian_sigma_per_bin
+    flags the fit unreliable (failed, or sigma pinned at the fit window edge
+    -- low S/N) fall back to the fiducial ±3 Å (config.line_window) half-width
+    rather than an ungrounded guess.
+
+    k_sigma      : window half-width in units of the fitted sigma. 2.5-3.0
+                   captures ~99% of a Gaussian's flux; the default (2.5) is
+                   the more conservative (narrower) choice.
+    fallback_half_width : half-width used for unreliable bins. None (default)
+                   -> 0.5*(config.line_window[1]-config.line_window[0]), i.e.
+                   the same ±3 Å the centroid always uses.
+    sigma_result : reuse an existing gaussian_sigma_per_bin(...) output
+                   instead of recomputing it (e.g. to try several k_sigma
+                   values without refitting the Gaussian each time).
+
+    Returns bootstrap_flux_profile's dict (total_flux_fid/_med/_lo/_hi/_all,
+    bin_bounds, meta), PLUS sigma_A, reliable, fallback_bins (bin indices that
+    used the fallback width), k_sigma, gauss_halfwidth, r_edges, bin_mode --
+    stamped with provenance.
+    """
+    if "cube_flux" not in stacks or "cube_err" not in stacks:
+        raise KeyError("gaussian_flux_window needs the per-galaxy cube: "
+                       "run_stack(config, ..., keep_cube=True).")
+    lya = float(config.LYA_REST)
+    sm = method or getattr(config, "measure_stack_method", "biweight")
+    fb_hw = (fallback_half_width if fallback_half_width is not None
+             else 0.5 * (config.line_window[1] - config.line_window[0]))
+
+    sig = sigma_result if sigma_result is not None else gaussian_sigma_per_bin(
+        config, stacks, method=sm, gauss_halfwidth=gauss_halfwidth, verbose=verbose)
+    sigma_A = np.asarray(sig["sigma_A"], dtype=float)
+    reliable = np.asarray(sig["reliable"], dtype=bool)
+    nrad = sigma_A.size
+
+    half_width = np.where(reliable, k_sigma * sigma_A, fb_hw)
+    fallback_bins = np.flatnonzero(~reliable).tolist()
+    bin_bounds = np.stack([lya - half_width, lya + half_width], axis=1)
+
+    if verbose:
+        print(f"gaussian_flux_window: k_sigma={k_sigma:g}, "
+              f"{len(fallback_bins)}/{nrad} bins on the ±{fb_hw:g} Å fallback "
+              f"{fallback_bins if fallback_bins else ''}")
+
+    flux = np.asarray(stacks["cube_flux"], dtype=float)
+    err = np.asarray(stacks["cube_err"], dtype=float)
+    wave = np.asarray(stacks["rest_wave"], dtype=float)
+    cont_kw = _continuum_kwargs(config)
+
+    out = bootstrap_flux_profile(
+        flux, err, wave, bin_bounds, nboot=nboot, lya_center=lya,
+        stack_method=sm, seed=seed, label=f"gaussian flux window k={k_sigma:g}",
+        verbose=verbose, **cont_kw,
+    )
+    out.update({
+        "sigma_A": sigma_A, "reliable": reliable, "fallback_bins": fallback_bins,
+        "k_sigma": k_sigma, "gauss_halfwidth": gauss_halfwidth,
+        "fallback_half_width": fb_hw,
+        "r_edges": np.asarray(stacks["r_edges"]),
+        "bin_mode": stacks.get("bin_mode"),
+    })
+    return stamp_provenance(out, config, "gaussian_flux_window")
+
+
+def h1_vs_flux_window(
+    config: "PipelineConfig", stacks: dict, entries: dict,
+    r_edges=None, model: str = "expcore", method: str = "psf",
+    fit_skip_inner: int = 1, gamma_fixed: float | None = 0.8,
+    r_c_fixed: float | None = 400.0,
+    psf_r=None, psf_vals=None, psf_fwhm_arcsec: float = 1.3, psf_beta: float = 3.0,
+    z_median: float | None = None, p0=None, r_fine=None,
+    nboot_refit: int = 200, seed: int = 1,
+    show_plots: bool = False, verbose: bool = True,
+) -> dict:
+    """
+    §1.2's decision step: refit h1 on EACH entry's flux profile (one per flux
+    window -- fixed widths from sweep_flux_window, and/or the Gaussian window
+    from gaussian_flux_window) and collect them side by side. If h1 is stable
+    across entries, the fixed ±3 Å window is window-insensitive and gets to
+    stay (with a defensible sentence to that effect); if it moves, the
+    magnitude and direction are now measured, not argued.
+
+    entries : {label: boot_dict}, where each boot_dict has total_flux_fid/
+        _lo/_hi/_all (e.g. sweep_flux_window(...)[hw] for each hw, and/or
+        gaussian_flux_window(...)). Build this from sweep_flux_window's output
+        with: {f"±{hw}Å": sweep[hw] for hw in sweep["_meta"]["half_windows"]}.
+
+    Point estimate: analysis.plot_flux_profile_fit (so the fit machinery --
+    PSF ring-convolution, expcore/twoexp dispatch, seeding -- is identical to
+    the headline analysis, not reimplemented here). Error bars are NOT read
+    off that fit's covariance matrix -- per §1.3, "no err_sum/pcov-derived
+    number should reach a table" -- they come from
+    analysis.bootstrap_fit_profile's refit-per-draw 16/84 spread instead.
+    The PSF/geometry (R, r_fine, r_edges) is built ONCE by the first entry's
+    fit and reused for every subsequent entry, since it depends only on the
+    bin geometry and PSF, not on any one entry's flux.
+
+    show_plots : False (default) -- suppress the per-entry fit figure
+        plot_flux_profile_fit draws (closed immediately after fitting); set
+        True to see each window's fit overlaid on its own flux profile.
+
+    Returns dict: labels (list, in entries' order), h1_fid/h1_med/h1_lo/h1_hi
+        (dict keyed by label), success (dict, bool), r_edges, model, method,
+        gamma_fixed, r_c_fixed. Feed to plot_h1_vs_flux_window.
+    """
+    labels = list(entries.keys())
+    if not labels:
+        raise ValueError("entries is empty -- nothing to fit.")
+
+    R = None
+    r_fine_shared = r_fine
+    r_edges_shared = np.asarray(r_edges if r_edges is not None
+                                else stacks["r_edges"], dtype=float)
+
+    h1_fid, h1_med, h1_lo, h1_hi, ok = {}, {}, {}, {}, {}
+    for i, lab in enumerate(labels):
+        boot = entries[lab]
+        run_header(f"h1_vs_flux_window [{lab}]", verbose=verbose, announce=verbose)
+        fig, ax, fit_result = analysis.plot_flux_profile_fit(
+            boot, stacks=stacks, r_edges=r_edges_shared, model=model, method=method,
+            fit_skip_inner=fit_skip_inner, gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed,
+            psf_r=psf_r, psf_vals=psf_vals, psf_fwhm_arcsec=psf_fwhm_arcsec,
+            psf_beta=psf_beta, z_median=z_median, p0=p0, r_fine=r_fine_shared,
+            title=f"{lab} — {model}/{method}", verbose=verbose,
+        )
+        if not show_plots:
+            plt.close(fig)
+
+        ok[lab] = bool(fit_result.get("success"))
+        h1_fid[lab] = fit_result.get("h1", np.nan)
+
+        # reuse the PSF/geometry built by the first successful entry
+        if method == "psf" and R is None and fit_result.get("R") is not None:
+            R = fit_result["R"]
+        if r_fine_shared is None:
+            r_fine_shared = fit_result.get("r_fine")
+
+        if not ok[lab]:
+            h1_med[lab] = h1_lo[lab] = h1_hi[lab] = np.nan
+            if verbose:
+                print(f"  [{lab}] fit did not converge -- skipping refit-per-draw error.")
+            continue
+
+        refit = analysis.bootstrap_fit_profile(
+            boot, r_edges=fit_result["r_edges"], r_fine=fit_result["r_fine"],
+            model=model, method=method, R=(R if method == "psf" else None),
+            gamma_fixed=gamma_fixed, r_c_fixed=r_c_fixed,
+            fit_skip_inner=fit_skip_inner, p0=p0,
+            nboot=nboot_refit, seed=seed, verbose=False,
+        )
+        h1_med[lab] = refit.get("h1_med", np.nan)
+        h1_lo[lab] = refit.get("h1_lo", np.nan)
+        h1_hi[lab] = refit.get("h1_hi", np.nan)
+        if verbose:
+            print(f"  [{lab}] h1_fid={h1_fid[lab]:.2f}  "
+                  f"h1_refit={h1_med[lab]:.2f} "
+                  f"(+{h1_hi[lab]-h1_med[lab]:.2f} / -{h1_med[lab]-h1_lo[lab]:.2f}) kpc")
+
+    return stamp_provenance({
+        "labels": labels, "h1_fid": h1_fid, "h1_med": h1_med,
+        "h1_lo": h1_lo, "h1_hi": h1_hi, "success": ok,
+        "r_edges": r_edges_shared, "model": model, "method": method,
+        "gamma_fixed": gamma_fixed, "r_c_fixed": r_c_fixed,
+    }, config, "h1_vs_flux_window")
+
+
+def plot_h1_vs_flux_window(
+    summary: dict, figsize=(7.2, 4.6), title: str | None = None,
+    save_fig: bool = False, savename: str = "Figure_h1_vs_flux_window.png",
+):
+    """
+    h1 (refit-per-draw median, 16/84 error bars) vs. flux-window label, from
+    h1_vs_flux_window's output. Flat within errors -> §1.2's "keep the single
+    ±3 Å window" outcome; a trend -> the window is biasing h1 and the
+    direction/magnitude are read straight off this plot.
+    """
+    labels = summary["labels"]
+    x = np.arange(len(labels))
+    med = np.array([summary["h1_med"][lab] for lab in labels], dtype=float)
+    lo = np.array([summary["h1_lo"][lab] for lab in labels], dtype=float)
+    hi = np.array([summary["h1_hi"][lab] for lab in labels], dtype=float)
+    fid = np.array([summary["h1_fid"][lab] for lab in labels], dtype=float)
+    yerr = np.vstack([med - lo, hi - med])
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.errorbar(x, med, yerr=yerr, fmt="o", color="tab:blue", capsize=4,
+               label="refit-per-draw (16/84)", zorder=3)
+    ax.scatter(x, fid, marker="_", s=200, color="0.3", label="point-estimate fit", zorder=2)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_ylabel(r"$h_1$ [kpc]")
+    ax.set_title(title or f"h1 vs. flux window ({summary.get('model')}/{summary.get('method')})")
+    ax.grid(alpha=0.2, axis="y")
+    ax.legend(frameon=False, fontsize=9)
+    if save_fig:
+        plt.savefig(savename, dpi=300, bbox_inches="tight")
+    plt.show()
+    return fig, ax
+
+
+def plot_flux_window_diagnostic(
+    config: "PipelineConfig", stacks: dict, gauss_result: dict | None = None,
+    method: str | None = None, bins="all", gauss_halfwidth: float = 10.0,
+    fixed_half_widths=(3.0,), xlim=None, ncols: int = 2, figsize=None,
+    title: str | None = None, save_fig: bool = False,
+    savename: str = "Figure_flux_window_diagnostic.png",
+):
+    """
+    Per radial bin: the continuum-subtracted Lyα line, the SAME Gaussian fit
+    gaussian_sigma_per_bin/gaussian_flux_window used (refit here fresh, so
+    this is always exactly what produced the numbers you're inspecting), a
+    shaded band for the fixed ±3 Å (or whatever fixed_half_widths lists)
+    window, and -- if you pass a gaussian_flux_window(...) result -- vertical
+    lines at the actual per-bin k·σ window that bin used (dotted if that bin
+    fell back to the fixed width instead).
+
+    This is the visual half of §1.2: before trusting h1_vs_flux_window's
+    numbers, look at whether the Gaussian curve actually tracks the real line
+    shape bin by bin. A poor fit (skewed line, two-halo excess in the wings,
+    a saturated/near-±10Å sigma) is exactly the situation where a k·σ window
+    stops meaning the same enclosed-flux fraction from bin to bin -- which
+    would explain a smooth h1 trend across k_sigma that isn't a real
+    core/halo effect, just an inconsistently-defined window.
+
+    bins : "all" or an explicit list of bin indices (e.g. [0, 1, 2] for the
+        inner bins where S/N is highest and the fit is most trustworthy).
+    gauss_result : optional gaussian_flux_window(...) output -- overlays that
+        run's actual bin_bounds/fallback_bins. None -> only the fitted
+        Gaussian curve + fixed window are shown, no k·σ lines.
+    """
+    sm = method or getattr(config, "measure_stack_method", "biweight")
+    lya = float(config.LYA_REST)
+    rest_wave = np.asarray(stacks["rest_wave"], dtype=float)
+    if sm not in stacks["stacks"]:
+        raise KeyError(f"method {sm!r} not in stacks (have {list(stacks['stacks'])}).")
+    flux = np.asarray(stacks["stacks"][sm]["flux"], dtype=float)
+    nrad = flux.shape[0]
+    r_edges = np.asarray(stacks["r_edges"])
+    cont_kw = _continuum_kwargs(config)
+
+    bin_list = list(range(nrad)) if bins == "all" else list(bins)
+    nb = len(bin_list)
+    ncols = max(1, min(ncols, nb))
+    nrows = int(np.ceil(nb / ncols))
+    figsize = figsize or (5.2 * ncols, 3.1 * nrows)
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    axes_flat = axes.ravel()
+
+    bounds_fit = (lya - gauss_halfwidth, lya + gauss_halfwidth)
+    xlim = xlim or (lya - gauss_halfwidth - 3, lya + gauss_halfwidth + 3)
+
+    for ax_i, r in enumerate(bin_list):
+        ax = axes_flat[ax_i]
+        res = gaussian_centroid(rest_wave, flux[r], bounds=bounds_fit,
+                                lya_center=lya, max_sigma_A=gauss_halfwidth, **cont_kw)
+        y = res["flux_contsub"]
+        m = (rest_wave >= xlim[0]) & (rest_wave <= xlim[1])
+        ax.plot(rest_wave[m], y[m], "-", color="0.25", lw=1.1, zorder=2,
+               label="cont-sub flux")
+        ax.axhline(0, color="0.7", lw=0.8, zorder=1)
+
+        if res["success"]:
+            amp, mu, sig = res["amp"], res["centroid_A"], res["sigma_A"]
+            near_edge = sig >= 0.95 * gauss_halfwidth
+            xx = np.linspace(xlim[0], xlim[1], 300)
+            ax.plot(xx, amp * np.exp(-0.5 * ((xx - mu) / sig) ** 2),
+                    "--", color="tab:red", lw=1.4, zorder=3,
+                    label=(f"Gaussian fit (σ={sig:.2f}Å"
+                           f"{', PINNED' if near_edge else ''})"))
+        else:
+            ax.text(0.03, 0.92, "Gaussian fit FAILED", transform=ax.transAxes,
+                   color="tab:red", fontsize=8, va="top")
+
+        for hw in fixed_half_widths:
+            ax.axvspan(lya - hw, lya + hw, color="tab:blue", alpha=0.12, zorder=0,
+                      label=(f"fixed ±{hw:g}Å" if ax_i == 0 else None))
+
+        if gauss_result is not None:
+            lo, hi = gauss_result["bin_bounds"][r]
+            is_fallback = r in set(gauss_result.get("fallback_bins", []))
+            ls = ":" if is_fallback else "-"
+            ax.axvline(lo, color="tab:green", ls=ls, lw=1.6, zorder=4)
+            ax.axvline(hi, color="tab:green", ls=ls, lw=1.6, zorder=4,
+                      label=(f"k·σ={gauss_result.get('k_sigma', '?')} window"
+                             f"{' (fallback)' if is_fallback else ''}"
+                             if ax_i == 0 else None))
+
+        ax.axvline(lya, color="0.5", lw=0.8)
+        ax.set_xlim(xlim)
+        ax.set_title(f"bin {r}: {r_edges[r]:g}–{r_edges[r+1]:g}", fontsize=10)
+        ax.grid(alpha=0.15, lw=0.6)
+        if ax_i == 0:
+            ax.legend(frameon=False, fontsize=7.5, loc="upper right")
+
+    for j in range(nb, len(axes_flat)):
+        axes_flat[j].set_visible(False)
+
+    fig.suptitle(title or f"Flux-window diagnostic ({sm})", fontsize=13)
+    fig.supxlabel(r"Rest wavelength [$\AA$]", fontsize=11)
+    fig.tight_layout()
     if save_fig:
         plt.savefig(savename, dpi=300, bbox_inches="tight")
     plt.show()

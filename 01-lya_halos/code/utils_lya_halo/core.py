@@ -1583,8 +1583,9 @@ def extract_core_spectra(config: "PipelineConfig", run_table=None,
     bad_fiber = (bad_fiber_mask if bad_fiber_mask is not None
                  else build_bad_fiber_mask(config, vdfi, run_table=catalog))
 
-    ngal = len(catalog) if config.num_gal is None else min(config.num_gal, len(catalog))
-    catalog = catalog[:ngal]
+    _start, _stop = config.galaxy_window(len(catalog))   # honors gal_offset too
+    ngal = _stop - _start
+    catalog = catalog[_start:_stop]
 
     bg_method    = config.resolved_bg_combine_method().lower()
     bg_needs_err = bg_method in ("mean", "inv_var")

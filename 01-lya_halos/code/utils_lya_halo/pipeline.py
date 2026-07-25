@@ -24,12 +24,20 @@ from .io import write_galaxy_fits, read_galaxy_fits, load_for_stack, apply_finit
 
 
 def run_extract(config: PipelineConfig, table=None, use_cache: bool = True,
-                descriptive_name: bool = True) -> str:
+                descriptive_name: bool = True, write: bool = True):
     """
     Stage 1 -- EXTRACT. Returns the path to the written galaxy FITS.
 
     `table` optionally passes an already-cut catalog (e.g. your z<2.75 cut)
     straight through to build_run_table for manual/stage-by-stage runs.
+
+    `write=False` extracts and fills the per-galaxy cache but writes NO FITS,
+    returning None. That is the mode a Slurm array task runs in: each task
+    computes its `config.gal_offset` slice into the shared cache/<sig>/ and
+    stops, because a quarter of the galaxies is not a product anyone wants on
+    disk. Assembly is then just a normal `write=True` run over the full range --
+    every galaxy is a cache hit, so it reads the .npz files and writes one
+    complete FITS in seconds without touching the flux file.
     """
     if config.normalized_field() == "BOTH":
         raise ValueError(
@@ -46,9 +54,14 @@ def run_extract(config: PipelineConfig, table=None, use_cache: bool = True,
         config, vdfi_data, run_table, bad_fiber_mask, use_cache=use_cache
     )
 
-    # extract_fibers honors config.num_gal; align the catalog to the galaxy axis.
+    if not write:
+        return None
+
+    # extract_fibers honors the gal_offset/num_gal window; align the catalog to
+    # the galaxy axis using the SAME window so row i of CATALOG is galaxy i.
+    gal_start, _ = config.galaxy_window(len(run_table))
     ngal = spec.shape[0]
-    catalog = run_table[:ngal]
+    catalog = run_table[gal_start:gal_start + ngal]
 
     # VR_EDGES stores the bin DEFINITION in bin_mode units (uniform across
     # galaxies). For virial mode the per-galaxy kpc edges differ and are

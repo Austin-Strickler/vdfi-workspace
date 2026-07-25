@@ -24,6 +24,8 @@ import gc
 import json
 import hashlib
 import warnings
+import datetime as _dt
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -462,32 +464,270 @@ def combine_fibers_chunked(spec, err=None, method="biweight", sigma=3.0,
 
 
 # ---------------------------------------------------------------------
+# 1.4b  Fast paths for the per-bin combine.  PERFORMANCE ONLY.
+#
+# combine_fibers / combine_fibers_chunked above remain the REFERENCE
+# implementation and are never modified. Everything here is opt-in via
+# PipelineConfig and falls back to the reference for anything it does not
+# handle. See specs/extraction-speedup.md 1e-ter and 9 for the measurements.
+#
+# Two independent accelerations, deliberately separable:
+#
+#   THREADING (combine_fibers_threaded, config.combine_threads)
+#       Wavelength blocks are independent -- each reads spec[:, j0:j1] and
+#       writes out[j0:j1], with no shared state and no cross-block
+#       accumulation -- so evaluating them concurrently is bit-identical BY
+#       CONSTRUCTION, not merely to tolerance. numpy releases the GIL inside
+#       partition/sort/ufuncs, so the nan-medians really do run in parallel.
+#       Measured 4.63x on 8 threads; 12 threads is SLOWER than 8 (memory
+#       bandwidth). Works for every method.
+#
+#   FUSION (biweight_fused, config.combine_fused)  -- biweight only
+#       astropy takes FIVE nan-median passes to produce two numbers:
+#       biweight_location computes the median, then calls
+#       median_absolute_deviation which recomputes that same median and then
+#       the MAD; mad_std then repeats both. Fusing computes each once.
+#       Fusing itself is exact (see combine_fast.validate with strict=True,
+#       which reproduces both outputs bit-for-bit). The default's ~1e-7 shift
+#       in Err comes from astropy alone: biweight_location upcasts to float64
+#       and mad_std does not, so astropy holds TWO values of the same MAD and
+#       one shared value cannot equal both.
+# ---------------------------------------------------------------------
+
+# astropy's MAD -> sigma factor. mad_std MULTIPLIES by this literal; dividing
+# by 0.6744897501960817 instead rounds differently and breaks bit-identity by
+# ~6e-8 in float32. Do not "simplify" this.
+_MAD_TO_STD = 1.482602218505602
+
+
+def biweight_fused(data, axis=0, c=6.0, strict=False):
+    """
+    (biweight_location, mad_std) from ONE nan-median and ONE nan-MAD.
+
+    The location is bit-identical to
+        astropy.stats.biweight_location(data, c=c, axis=axis, ignore_nan=True)
+    -- every step mirrors astropy's, including the float64 upcast and the
+    "MAD == 0 -> return the median" fallback.
+
+    The scatter matches astropy.stats.mad_std(data, axis=axis, ignore_nan=True)
+    to ~1e-7 relative by default; strict=True reproduces it exactly at the cost
+    of one extra MAD pass in the input dtype.
+    """
+    a = np.asanyarray(data)
+    with warnings.catch_warnings(), np.errstate(divide="ignore", invalid="ignore",
+                                                over="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+
+        if strict:                      # mad_std's MAD, in the INPUT dtype
+            M32 = np.nanmedian(a, axis=axis, keepdims=True)
+            mad32 = np.nanmedian(np.abs(a - M32), axis=axis, keepdims=True)
+            scatter = np.squeeze(mad32, axis=axis) * _MAD_TO_STD
+            del M32, mad32
+
+        d64 = a.astype(np.float64)      # astropy biweight_location, verbatim
+        M = np.nanmedian(d64, axis=axis, keepdims=True)
+        d = d64 - M
+        mad = np.nanmedian(np.abs(d), axis=axis, keepdims=True)
+
+        if not strict:
+            scatter = np.squeeze(mad, axis=axis) * _MAD_TO_STD
+
+        u = d / (c * mad)
+        mask = np.abs(u) >= 1
+        u = (1 - u ** 2) ** 2
+        u[mask] = 0
+        M_flat = np.squeeze(M, axis=axis)
+        value = M_flat + (np.nansum(d * u, axis=axis) / np.nansum(u, axis=axis))
+        loc = np.where(np.squeeze(mad, axis=axis) == 0, M_flat, value)
+
+    return loc, scatter
+
+
+def combine_fibers_fused(spec, axis=0, strict=False):
+    """combine_fibers(spec, None, method='biweight') via the fused estimator."""
+    spec = np.asarray(spec)
+    n_eff = np.sum(np.isfinite(spec), axis=axis).astype(float)
+    with warnings.catch_warnings(), np.errstate(divide="ignore", invalid="ignore",
+                                                over="ignore"):
+        warnings.simplefilter("ignore", RuntimeWarning)
+        out, scatter = biweight_fused(spec, axis=axis, strict=strict)
+        out_err = scatter / np.sqrt(np.maximum(n_eff, 1))
+    bad = n_eff == 0
+    out = np.asarray(out, dtype=float).copy()
+    out_err = np.asarray(out_err, dtype=float).copy()
+    out[bad] = np.nan
+    out_err[bad] = np.nan
+    return out, out_err
+
+
+def _combine_one_block(spec, err, j0, j1, method, sigma, maxiters, weights,
+                       fused, fused_strict, fused_transpose):
+    """One wavelength block. Shared by the serial and threaded paths so both
+    execute identical code -- the only difference is who calls it."""
+    if fused and method == "biweight":
+        if fused_transpose:
+            blk = np.ascontiguousarray(spec[:, j0:j1].T)      # (w, nfib)
+            return combine_fibers_fused(blk, axis=1, strict=fused_strict)
+        blk = np.ascontiguousarray(spec[:, j0:j1])            # (nfib, w)
+        return combine_fibers_fused(blk, axis=0, strict=fused_strict)
+    e_slice = err[:, j0:j1] if err is not None else None
+    return combine_fibers(spec[:, j0:j1], e_slice, method=method,
+                          sigma=sigma, maxiters=maxiters, weights=weights)
+
+
+_EXECUTOR_CACHE: dict = {}
+
+
+def get_combine_executor(n_threads):
+    """
+    Process-wide ThreadPoolExecutor for the per-bin combine, one per thread
+    count, created on first use.
+
+    Deliberately a long-lived singleton rather than a per-call `with` block.
+    278 galaxies x 12 bins is 3,336 pool creations, and in a notebook a
+    per-call pool would also be destroyed and rebuilt on every interrupt. Idle
+    threads cost a few MB of stack and no CPU, so caching is the cheaper
+    trade. Call shutdown_combine_threads() to release them explicitly.
+    """
+    if n_threads is None or int(n_threads) <= 1:
+        return None
+    n = int(n_threads)
+    ex = _EXECUTOR_CACHE.get(n)
+    if ex is None:
+        ex = ThreadPoolExecutor(max_workers=n, thread_name_prefix="vdfi_combine")
+        _EXECUTOR_CACHE[n] = ex
+    return ex
+
+
+def shutdown_combine_threads():
+    """Release every pooled combine executor. Safe to call at any time; the
+    next extract_fibers run simply creates a fresh pool."""
+    for ex in _EXECUTOR_CACHE.values():
+        ex.shutdown(wait=False)
+    _EXECUTOR_CACHE.clear()
+
+
+def combine_fibers_threaded(spec, err=None, method="biweight", sigma=3.0,
+                            maxiters=5, wave_block=16, weights=None,
+                            n_threads=8, fused=False, fused_strict=False,
+                            fused_transpose=False, min_fibers=50_000,
+                            executor=None):
+    """
+    combine_fibers_chunked with the wavelength blocks evaluated concurrently.
+
+    n_threads       : 8 measured best on the 12-vCPU JupyterHub VM (4.63x);
+                      12 is SLOWER than 8. Re-measure on a new machine with
+                      combine_fast.benchmark_threads.
+    fused           : use biweight_fused instead of astropy (biweight only;
+                      silently ignored for other methods).
+    min_fibers      : below this pool size, run serially -- dispatching 65
+                      thread tasks for a 12-fiber inner bin costs more than it
+                      saves. Bins 0-8 are <5 s/galaxy combined.
+    executor        : reuse a caller-owned ThreadPoolExecutor instead of
+                      creating one per call (extract_fibers does this: 278
+                      galaxies x 12 bins would otherwise be 3,336 pools).
+
+    MEMORY: each thread holds its own float64 temporaries for one block,
+    ~n_fib * wave_block * 8 B * ~5 arrays. For a 480k-fiber bin at
+    wave_block=16 that is ~307 MB/thread, ~2.5 GB across 8 -- on top of the
+    1.85 GB pool. Raising wave_block scales this linearly; don't.
+    """
+    spec = np.asarray(spec)
+    n_r, nwave = spec.shape
+
+    serial = (wave_block is None or wave_block >= nwave
+              or n_threads is None or n_threads <= 1 or n_r < min_fibers)
+
+    blocks = [(j0, min(j0 + wave_block, nwave))
+              for j0 in range(0, nwave, wave_block)] if not serial else None
+
+    if serial:
+        if not (fused and method == "biweight"):
+            return combine_fibers_chunked(spec, err, method=method, sigma=sigma,
+                                          maxiters=maxiters, wave_block=wave_block,
+                                          weights=weights)
+        if wave_block is None or wave_block >= nwave:
+            blocks = [(0, nwave)]
+        else:
+            blocks = [(j0, min(j0 + wave_block, nwave))
+                      for j0 in range(0, nwave, wave_block)]
+
+    out = np.full(nwave, np.nan)
+    out_err = np.full(nwave, np.nan)
+
+    def _work(jj):
+        j0, j1 = jj
+        o, oe = _combine_one_block(spec, err, j0, j1, method, sigma, maxiters,
+                                   weights, fused, fused_strict, fused_transpose)
+        out[j0:j1] = o          # disjoint slice per block -> no race
+        out_err[j0:j1] = oe
+
+    if serial:
+        for jj in blocks:
+            _work(jj)
+    elif executor is not None:
+        list(executor.map(_work, blocks))
+    else:
+        with ThreadPoolExecutor(max_workers=int(n_threads)) as ex:
+            list(ex.map(_work, blocks))
+    return out, out_err
+
+
+# ---------------------------------------------------------------------
 # Per-galaxy cache (resumability). The signature hash invalidates stale
 # caches automatically whenever any extraction parameter changes -- the
 # per-galaxy analogue of the FITS SRCFILE staleness check.
 # ---------------------------------------------------------------------
 def _extract_signature(config: "PipelineConfig") -> str:
-    keys = ("field", "catalog", "catalog_path", "bins", "bin_mode", "mask_method",
-            "mask_percentile_image", "mask_percentile_spec_high",
-            "mask_percentile_spec_low", "mask_protect_radius_arcsec",
-            "spec_mask_step", "bg_inner_arcsec",
-            "bg_outer_arcsec", "min_bg_fibers", "smooth_bg", "bg_smooth_method",
-            "bg_smooth_sigma_A", "line_mask_halfwidth_A", "smoothing_values",
-            "bg_combine_method", "fiber_combine_method", "mass_col", "z_col",
-            "wave_min", "wave_max", "nwave")
-    d = {k: getattr(config, k) for k in keys}
-    d["field"] = config.normalized_field()
-    d["bg_combine_method"] = config.resolved_bg_combine_method()  # hash resolved value
-    # sigma_clip knobs (optional on config): included so changing them busts the
-    # cache, but read defensively so older configs without the fields still hash.
-    d["sigma_clip_sigma"] = getattr(config, "sigma_clip_sigma", 3.0)
-    d["sigma_clip_maxiters"] = getattr(config, "sigma_clip_maxiters", 5)
-    # Baked segmentation mask identity: CONTENT hash, so retweaking the mask
-    # FITS in place busts the cache (path/name alone would not change). Cheap
-    # 'noseg' for non-segmap runs since resolve_seg_mask_path() returns None.
-    d["seg_mask_hash"] = config.seg_mask_hash()
-    blob = json.dumps(d, sort_keys=True, default=str)
-    return hashlib.md5(blob.encode()).hexdigest()[:10]
+    """
+    Thin wrapper -- the definition now lives on the config as
+    `PipelineConfig.extract_signature`, because the same hash names BOTH the
+    cache directory and the galaxy FITS (`descriptive_filename`). Two copies
+    would reintroduce exactly the drift the change exists to remove. Kept as a
+    module-level name so `combine_fast.py`, the tests and older notebooks that
+    import it keep working.
+    """
+    return config.extract_signature()
+
+
+def _write_cache_manifest(run_cache_dir: str, config: "PipelineConfig") -> None:
+    """
+    Drop `_manifest.json` beside a run's cached galaxies, recording the knob
+    values behind the directory's 10-hex name. Written once (skipped if present)
+    and never read by the pipeline -- it exists purely so a human can answer
+    'which run was 4f9e21a0bc?' without re-deriving the hash. Failures are
+    swallowed: a missing manifest must never break an extraction.
+    """
+    path = os.path.join(run_cache_dir, "_manifest.json")
+    if os.path.exists(path):
+        return
+    try:
+        payload = {
+            "signature": config.extract_signature(),
+            "galaxy_fits": config.descriptive_filename(),
+            "written": _dt.datetime.now().isoformat(timespec="seconds"),
+            "knobs": config.extract_signature_dict(),
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True, default=str)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _save_cache_atomic(cache_path: str, **arrays) -> None:
+    """
+    Write a per-galaxy cache entry so it can never be observed half-written:
+    save to `<name>.tmp.npz`, then `os.replace` onto the final name, which is
+    atomic on POSIX. Matters as soon as more than one process writes into a
+    shared `cache/<sig>/` -- a Slurm task killed at walltime mid-`savez` would
+    otherwise leave a truncated .npz that the next run finds, treats as a valid
+    cache hit, and either crashes on or silently loads short.
+    """
+    tmp = cache_path + ".tmp.npz"          # savez appends .npz if absent
+    np.savez(tmp, **arrays)
+    os.replace(tmp, cache_path)
 
 
 def extract_fibers(
@@ -514,7 +754,7 @@ def extract_fibers(
     (per galaxy). kpc/arcsec conversion uses the SAME cosmology as the virial
     edges (imported `cosmo`), so binning is internally consistent.
 
-    Per-galaxy results cache to config.cache_dir as gal_<sig>_<i>.npz; with
+    Per-galaxy results cache to <cache_dir>/<sig>/gal_<i>.npz; with
     use_cache, cached galaxies are reloaded instead of recomputed.
 
     Returns (Spec, Err, NFIB, Background, vr_edges_used):
@@ -533,8 +773,12 @@ def extract_fibers(
     nfib_total = RA.shape[1]
     nwave = spectra.shape[-1]
 
-    ngal = len(run_table) if config.num_gal is None else min(config.num_gal, len(run_table))
-    run_table_use = run_table[:ngal]
+    # Window, not prefix: (0, num_gal) by default, but a Slurm array task gets
+    # its own [start, stop). `gal_start` is what makes the cache key GLOBAL --
+    # see the cache_path below and config.galaxy_window.
+    gal_start, gal_stop = config.galaxy_window(len(run_table))
+    ngal = gal_stop - gal_start
+    run_table_use = run_table[gal_start:gal_stop]
 
     fiber_method = config.fiber_combine_method.lower()
     bg_method = config.resolved_bg_combine_method().lower()
@@ -558,16 +802,40 @@ def extract_fibers(
     # is deliberately NOT part of the cache signature. None -> single-shot.
     wave_block = getattr(config, "combine_wave_block", 64)
 
+    # Combine acceleration (specs/extraction-speedup.md 9). All optional and
+    # all defaulting to the current behaviour, so an unchanged config runs the
+    # unchanged serial reference path.
+    n_threads = int(getattr(config, "combine_threads", 1) or 1)
+    min_fibers = int(getattr(config, "combine_min_fibers", 50_000))
+    fused = bool(getattr(config, "combine_fused", False))
+    fused_strict = bool(getattr(config, "combine_fused_strict", False))
+    fused_transpose = bool(getattr(config, "combine_fused_transpose", False))
+    if fused and fiber_method != "biweight":
+        warnings.warn(
+            f"combine_fused=True is implemented for 'biweight' only; "
+            f"fiber_combine_method is '{fiber_method}'. Falling back to the "
+            f"reference combine (threading, if enabled, still applies).",
+            RuntimeWarning, stacklevel=2)
+        fused = False
+    use_fast = (n_threads > 1) or fused
+    _executor = get_combine_executor(n_threads)
+
     Spec = np.full((ngal, nrad, nwave), np.nan)
     Err = np.full((ngal, nrad, nwave), np.nan)
     NFIB = np.zeros((ngal, nrad), dtype=np.int32)
     Background = np.full((ngal, nwave), np.nan)
     VR = np.full((ngal, nrad + 1), np.nan)
 
+    # One directory per signature: cache/<sig>/gal_<i>.npz. The old layout put
+    # every galaxy of every config ever run flat into cache/ as
+    # gal_<sig>_<i>.npz, which grew until listing it took minutes; scoping a
+    # listing to one config also makes retiring a dead config an `rm -rf` of one
+    # directory. Indices are zero-padded so `ls` sorts them numerically.
     sig = _extract_signature(config)
-    cache_dir = config.resolved_cache_dir()
+    cache_dir = config.resolved_run_cache_dir()
     if use_cache:
         os.makedirs(cache_dir, exist_ok=True)
+        _write_cache_manifest(cache_dir, config)
 
     def _maybe_smooth(spec_1d, z):
         if not config.smooth_bg:
@@ -591,7 +859,11 @@ def extract_fibers(
         m = float(run_table_use[config.mass_col][cnt])
 
         # ---- per-galaxy cache check ----
-        cache_path = os.path.join(cache_dir, f"gal_{sig}_{cnt}.npz")
+        # Keyed on the GLOBAL run-table row (gal_start + cnt), never the loop
+        # counter, so the same galaxy maps to the same file regardless of which
+        # array task computed it -- and so array tasks sharing cache/<sig>/
+        # cannot overwrite each other.
+        cache_path = os.path.join(cache_dir, f"gal_{gal_start + cnt:05d}.npz")
         if use_cache and os.path.exists(cache_path):
             g = np.load(cache_path)
             Spec[cnt], Err[cnt], NFIB[cnt] = g["spec"], g["err"], g["nfib"]
@@ -704,17 +976,26 @@ def extract_fibers(
                     )
                 off += k
 
-            Spec[cnt, r], Err[cnt, r] = combine_fibers_chunked(
-                pool_spec, pool_err, method=fiber_method,
-                sigma=sc_sigma, maxiters=sc_maxiters, wave_block=wave_block,
-            )
+            if use_fast:
+                Spec[cnt, r], Err[cnt, r] = combine_fibers_threaded(
+                    pool_spec, pool_err, method=fiber_method,
+                    sigma=sc_sigma, maxiters=sc_maxiters, wave_block=wave_block,
+                    n_threads=n_threads, fused=fused, fused_strict=fused_strict,
+                    fused_transpose=fused_transpose, min_fibers=min_fibers,
+                    executor=_executor,
+                )
+            else:
+                Spec[cnt, r], Err[cnt, r] = combine_fibers_chunked(
+                    pool_spec, pool_err, method=fiber_method,
+                    sigma=sc_sigma, maxiters=sc_maxiters, wave_block=wave_block,
+                )
             del pool_spec, pool_err   # release this bin before gathering the next
 
         del bin_idx_all
         gc.collect()                  # keep peak flat across the long per-galaxy run
 
         if use_cache:
-            np.savez(cache_path, spec=Spec[cnt], err=Err[cnt], nfib=NFIB[cnt],
-                     bg=Background[cnt], vr=VR[cnt])
+            _save_cache_atomic(cache_path, spec=Spec[cnt], err=Err[cnt],
+                               nfib=NFIB[cnt], bg=Background[cnt], vr=VR[cnt])
 
     return Spec, Err, NFIB, Background, VR

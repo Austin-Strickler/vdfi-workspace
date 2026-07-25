@@ -544,6 +544,17 @@ _ENTRIES = [
        "its own center. The before/after tool for confirming the mask stops "
        "clipping galaxy cores.",
        "fig, audit = plot_fiber_mask_appendix(vdfi, run_table, bad, cfg.resolve_cont_image_path())"),
+    _e("list_exposures", "plotting", "plotting", "Fiber & mask visuals",
+       "Per-exposure summary table for a loaded VDFI field: fiber count, mean "
+       "RA/DEC, and RA/DEC extent. The 'what have I got' step before choosing "
+       "which exposures fill the field, instead of guessing exposure IDs.",
+       "list_exposures(vdfi)"),
+    _e("plot_field_coverage", "plotting", "plotting", "Fiber & mask visuals",
+       "Sky footprint of one or more VDFI exposures, with green/yellow/red "
+       "radius bands around a center and a catalog (e.g. MOSDEF run_table) "
+       "overplotted on top. exposures=None plots everything, guaranteeing "
+       "full field coverage.",
+       "plot_field_coverage(vdfi, run_table, radii_arcsec=(100, 200, 300))"),
 
     # ===================== VALIDATION =====================
     _e("redshift_scramble_null", "validation", "validation", "Nulls",
@@ -578,6 +589,53 @@ _ENTRIES = [
        "sidebands), each bootstrapped. Isolates how much the continuum choice "
        "moves the answer.",
        "cs = sweep_continuum_method(cfg, stacks)"),
+    _e("bootstrap_flux_profile", "validation", "validation", "Robustness sweeps",
+       "Galaxy-bootstrap the integrated flux ONLY (no centroid), per radial "
+       "bin, with a window that may differ bin by bin. The flux half of "
+       "bootstrap_all with the centroid coupling removed -- the building "
+       "block sweep_flux_window and gaussian_flux_window are built on.",
+       "bp = bootstrap_flux_profile(stacks['cube_flux'], stacks['cube_err'], "
+       "stacks['rest_wave'], bin_bounds=(1212.67, 1218.67))"),
+    _e("sweep_flux_window", "validation", "validation", "Robustness sweeps",
+       "systematics-and-extraction.md §1.2's fixed-width half: re-measure "
+       "ONLY the integrated flux (never the centroid) at several ±half-width "
+       "windows, each bootstrapped. Unlike sweep_line_window this never "
+       "touches the centroid, so a wider flux window can be tested without "
+       "implying a wider centroid window too.",
+       "sw = sweep_flux_window(cfg, stacks, half_windows=(3,5,6,8,10))"),
+    _e("gaussian_sigma_per_bin", "validation", "validation", "Robustness sweeps",
+       "Fit a single Gaussian to the fiducial stack's line in each radial "
+       "bin (wide ±10A window so the fit isn't truncated) and return its "
+       "sigma. Flags bins where the fit failed or saturated the window (low "
+       "S/N) as unreliable. Feeds gaussian_flux_window.",
+       "sig = gaussian_sigma_per_bin(cfg, stacks)"),
+    _e("gaussian_flux_window", "validation", "validation", "Robustness sweeps",
+       "§1.2's variable-width half: set each bin's flux window to "
+       "k_sigma*(that bin's fitted Gaussian sigma) instead of one fixed "
+       "half-width, falling back to the fiducial ±3A on unreliable bins. "
+       "Bootstrapped the same way as sweep_flux_window.",
+       "gw = gaussian_flux_window(cfg, stacks, k_sigma=2.5)"),
+    _e("h1_vs_flux_window", "validation", "validation", "Robustness sweeps",
+       "§1.2's decision step: refit h1 on each flux-window entry (fixed "
+       "widths from sweep_flux_window and/or gaussian_flux_window) via "
+       "analysis.plot_flux_profile_fit, with refit-per-draw h1 errors from "
+       "analysis.bootstrap_fit_profile (no pcov-derived errors, per §1.3). "
+       "Stable h1 across entries -> keep the single ±3A window.",
+       "h1s = h1_vs_flux_window(cfg, stacks, "
+       "{**{f'pm{hw}A': sw[hw] for hw in sw['_meta']['half_windows']}, "
+       "'gaussian': gw})"),
+    _e("plot_h1_vs_flux_window", "validation", "validation", "Robustness sweeps",
+       "h1 (point estimate + refit-per-draw 16/84 bars) vs. flux-window "
+       "label, from h1_vs_flux_window's output. Flat = window-insensitive; "
+       "a trend reads off the bias direction and size directly.",
+       "plot_h1_vs_flux_window(h1s)"),
+    _e("plot_flux_window_diagnostic", "validation", "validation", "Robustness sweeps",
+       "Visual half of §1.2: per radial bin, the continuum-subtracted line, "
+       "the Gaussian fit gaussian_sigma_per_bin/gaussian_flux_window actually "
+       "used, the fixed ±3A band, and (if given a gaussian_flux_window "
+       "result) that bin's real k*sigma window -- dotted where a bin fell "
+       "back. Check this before trusting h1_vs_flux_window's numbers.",
+       "plot_flux_window_diagnostic(cfg, stacks, gauss_result=gw, bins=[0,1,2,3])"),
     _e("plot_continuum_sweep", "validation", "validation", "Robustness sweeps",
        "Overlay the chosen statistic vs radius across continuum settings. "
        "Divergence flags a continuum-sensitive bin.",
@@ -609,6 +667,25 @@ _ENTRIES = [
        "fresh. Independent cross-check on combined_bin_significance (~1.5 "
        "sigma flux-pooled).",
        "pool_bins_and_bootstrap(stacks, r_min=1.0)"),
+    _e("compute_bin_correlation", "validation", "validation", "Bin correlation",
+       "THREE bin-by-bin correlation matrices, always over every bin: how much "
+       "bins' bootstrap centroids co-vary (statistic-level, PSF-cross-talk "
+       "readout on the inner block), and how much bins' continuum-subtracted "
+       "spectra look alike inside vs. outside the Lya complex (spectral-shape, "
+       "large-scale systematic-floor readout on the outer block). Pass a "
+       "rest_delta=0.6 stacks_spec to decorrelate the spectral matrices.",
+       "cbc = compute_bin_correlation(real_boot, stacks_06)"),
+    _e("plot_bin_correlation", "validation", "validation", "Bin correlation",
+       "1x3 lower-triangle heatmap of compute_bin_correlation's three "
+       "matrices, one shared diverging colorbar (all bounded [-1,1]).",
+       "plot_bin_correlation(cbc, r_min=100, r_max=3000)"),
+    _e("compare_bin_correlation_resolution", "validation", "validation", "Bin correlation",
+       "Does rest_delta actually matter? Diffs the Lya-complex/outside-Lya "
+       "spectral correlation matrices built at two resolutions (e.g. 0.2 vs "
+       "0.6 A), plus the centroid value+precision if bootstrap products are "
+       "given. Standalone one-off check, not part of the standard pipeline.",
+       "cmp = compare_bin_correlation_resolution(stacks_02, stacks_06, "
+       "boot_02=real_boot, boot_06=boot06)"),
     _e("injection_recovery", "validation", "validation", "Injection-recovery",
        "Inject a synthetic Lya line of KNOWN velocity into the empty "
        "z-scrambled cube at fixed S/N, then recover it with each estimator. "
@@ -1373,7 +1450,11 @@ _ENTRIES = [
 _BACKEND = {
     "pipeline": set(),
     "extract": {"load_vdfi_field", "combine_fibers", "combine_fibers_chunked",
-                "extract_fibers"},
+                "extract_fibers",
+                # combine acceleration (specs/extraction-speedup.md 9)
+                "biweight_fused", "combine_fibers_fused",
+                "combine_fibers_threaded", "get_combine_executor",
+                "shutdown_combine_threads"},
     "masking": {"flag_fibers_on_mask", "make_circular_structure",
                 "get_pixscale_arcsec", "nan_safe_gaussian_smooth"},
     "io": {"write_galaxy_fits"},
