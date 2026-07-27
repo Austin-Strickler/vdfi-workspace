@@ -80,6 +80,14 @@ SECTIONS = {
                    ["PSF & convolution", "Two-exponential fit (Part 1)",
                     "Expcore fit (Part 2)", "Model comparison & boundary",
                     "UV-continuum fit (Part 3)"]),
+    "background":  ("Offline background testing: swap the annulus, mask width "
+                    "or smoothing AFTER extraction, map how the background "
+                    "changes with annulus radius, and check what that does to "
+                    "the profile and the centroid. Needs a run with "
+                    "store_raw_bg / store_spec_nobg.",
+                    ["Reconstruction", "Inspection", "Background stacks",
+                     "Variant comparison", "Mask & smoothing sweep",
+                     "Spatial variance", "Profile impact", "Drivers"]),
     "uv_continuum": ("Part 3's standalone UV-continuum pipeline (CFHT-LS "
                      "r-band): per-galaxy cutout/photometry through coadd, "
                      "bootstrap, and stellar-PSF measurement. Not yet merged "
@@ -172,6 +180,14 @@ _ENTRIES = [
        "than the adaptive smoother and free of line/pulse artifacts; used "
        "internally by extraction but callable for A/B on a real background.",
        "bg = smooth_interp_then_gauss(prod.background[0], prod.wave, z=2.3)"),
+    _e("smooth_fill_then_gauss", "smoothing", "extraction", "Background smoothing",
+       "DIAGNOSTIC generalization of smooth_interp_then_gauss: same mask and "
+       "same Gaussian, but the gap can be filled by 'linear' (== production), "
+       "'median' (flat, both sidebands pooled) or 'median_interp' (robust "
+       "endpoint per sideband, slope preserved). sigma_A=0 returns the filled- "
+       "but-not-yet-smoothed stage. NOT wired into cfg.bg_smooth_method; it is "
+       "what the fill-method sweep varies.",
+       "bg = smooth_fill_then_gauss(p.bg_variants[i,0], p.wave, z_i, fill_method='median_interp')"),
     _e("smooth_spectrum_nan_safe_adaptive", "smoothing", "extraction", "Background smoothing",
        "The legacy adaptive smoother (ramped edge->interior sigma, NaN-safe). "
        "Kept for comparison; select it with cfg.bg_smooth_method='adaptive'.",
@@ -1316,6 +1332,198 @@ _ENTRIES = [
        "Notebook-testing convenience for halo-flux-fitting.md Part 3's UV "
        "fit -- quick-look plot of a UV coadd + its fitted curve.",
        "plot_uv_fit(r_mid, y_fid, result, r_fine)"),
+
+    # =====================================================================
+    # background.py -- offline background testing (registered 2026-07-26).
+    # Everything here requires a Stage-1 run with store_raw_bg /
+    # store_spec_nobg / store_bg_halves; on a normal product these functions
+    # raise with an explanation rather than degrading, because the arrays they
+    # need do not exist and cannot be reconstructed after the fact.
+    # =====================================================================
+    _e("reconstruct_background", "background", "background", "Reconstruction",
+       "Re-apply the background smoother (mask Lya, interpolate, gaussian) to "
+       "one galaxy's RAW annulus coadd, at any mask half-width or sigma. The "
+       "extraction-time operation lifted out so it can be swept offline.",
+       "bg = reconstruct_background(p.bg_variants[i, 0], p.wave, z_i, cfg, mask_halfwidth_A=20)"),
+    _e("reconstruct_spec", "background", "background", "Reconstruction",
+       "Rebuild the background-subtracted science cube under a different "
+       "annulus, mask width or smoothing: SPEC_NOBG minus the re-smoothed raw "
+       "background. Exact, not approximate -- the biweight is "
+       "translation-equivariant and every exposure shares one background.",
+       "spec2 = reconstruct_spec(p, cfg, variant=1)"),
+    _e("reconstruct_product", "background", "background", "Reconstruction",
+       "reconstruct_spec wrapped back into a GalaxyProduct, so a background "
+       "variant feeds straight into build_stacks. This is what makes 2.2's "
+       "mask-width x sigma sweep a loop instead of a re-extraction.",
+       "stacks = run_stack(cfg, ...) # on reconstruct_product(p, cfg, variant=1)"),
+    _e("verify_reconstruction", "background", "background", "Reconstruction",
+       "Assert SPEC_NOBG - smooth(mask(BG_VARIANTS[0])) == SPEC. RUN THIS "
+       "FIRST: if it fails, the equivariance assumption or the min_bg_fibers "
+       "guard is broken and every variant computed downstream is wrong.",
+       "verify_reconstruction(p, cfg)"),
+    _e("stack_backgrounds", "background", "background", "Background stacks",
+       "Stack the RAW (pre-mask, pre-smooth) backgrounds in the rest frame to "
+       "test whether the annulus carries Lya at all (1.1), with "
+       "z-scrambled and observed-frame control stacks and a galaxy bootstrap.",
+       "st = stack_backgrounds(p, cfg, variant=0, frame='rest')"),
+    _e("measure_line_residual", "background", "background", "Background stacks",
+       "Integrated residual in a window around 1215.67 A of a background "
+       "stack, with its bootstrap error and significance.",
+       "r = measure_line_residual(st, halfwidth_A=3.0)"),
+    _e("adopt_mask_halfwidth", "background", "background", "Background stacks",
+       "The pre-registered criterion of 2.5.1: the smallest mask half-width "
+       "whose interpolation ANCHOR window is clean of line flux. Selected on "
+       "the background annulus, never on the science profile.",
+       "adopt_mask_halfwidth(st, halfwidths_A=(10, 15, 20, 25, 30))"),
+    _e("plot_background_stack", "background", "background", "Background stacks",
+       "Plot a background stack with its bootstrap band, the line marked, and "
+       "optionally the masked region shaded -- so you can see whether a "
+       "feature is contained by the mask or spills into the anchors.",
+       "plot_background_stack(st, show_mask=10.0)"),
+    _e("background_half_difference", "background", "background", "Spatial variance",
+       "N-half minus S-half of the annulus: the background's SPATIAL "
+       "variance, which the pooled per-galaxy background averages away. The "
+       "measurement B10/B11 needs.",
+       "background_half_difference(p, cfg)"),
+    _e("describe_background_test", "background", "background", "Drivers",
+       "One call that runs and prints the whole 1.1 / 2.5 test: rest, "
+       "scrambled and observed stacks per annulus variant, the residual at "
+       "1215.67 A in each, the mask-width criterion, and the half-difference.",
+       "res = describe_background_test(p, cfg)"),
+
+    # --- background-diagnostics.md toolkit (registered 2026-07-26) ---------
+    _e("bg_variant_radii", "background", "background", "Inspection",
+       "The stored annuli in arcsec AND kpc, SORTED BY RADIUS, with the "
+       "science bins each one overlaps. bg_variants need not be monotonic, so "
+       "plotting by variant index can fake a non-monotonic background; every "
+       "'vs radius' report here sorts through this.",
+       "geom = bg_variant_radii(p, cfg, verbose=True)"),
+    _e("plot_background_gallery", "background", "background", "Inspection",
+       "A grid of INDIVIDUAL raw backgrounds with the Lya mask and continuum "
+       "sidebands shaded and nfib/z/field annotated. Look here before "
+       "computing anything -- this is where the galaxy-rejection criterion "
+       "comes from.",
+       "plot_background_gallery(p, cfg, n=12)"),
+    _e("background_levels", "background", "background", "Variant comparison",
+       "Per-galaxy NON-LINE background level for each annulus, from the RAW "
+       "spectra with no continuum subtraction (the continuum IS the quantity) "
+       "in the observed frame, with each galaxy's own Lya masked.",
+       "lev = background_levels(p, cfg)   # (ngal, nvar)"),
+    _e("compare_bg_variants", "background", "background", "Variant comparison",
+       "THE MAIN EVENT: the radial map of the background. Line amplitude vs "
+       "annulus radius (falls = real clustered Lya, flat = instrumental) AND "
+       "non-line level vs radius (flat = one global annulus is defensible). "
+       "Differences are PAIRED, since the same galaxies feed every variant.",
+       "res = compare_bg_variants(p, cfg)"),
+    _e("describe_bg_variants", "background", "background", "Variant comparison",
+       "Print a compare_bg_variants result as two radius-sorted tables plus "
+       "the innermost-vs-outermost comparison and the per-field split.",
+       "describe_bg_variants(res)"),
+    _e("plot_bg_variant_comparison", "background", "background", "Variant comparison",
+       "The main figure of a variant run: every annulus's stack overlaid, then "
+       "line amplitude and non-line level against PHYSICAL radius.",
+       "plot_bg_variant_comparison(res)"),
+    _e("mask_width_scan", "background", "background", "Mask & smoothing sweep",
+       "2D scan of the residual Lya left in the PROCESSED background over "
+       "(mask half-width, smoothing sigma) -- they are one joint knob, so a 1D "
+       "scan finds a false plateau. Bootstraps once per sigma at the widest "
+       "mask; adopt from the plateau, never the edge.",
+       "scan = mask_width_scan(p, cfg, sigmas=(10, 20, 30, 40))"),
+    _e("plot_mask_width_scan", "background", "background", "Mask & smoothing sweep",
+       "Heatmap of residual/err over the (mask width, sigma) grid, symmetric "
+       "about zero, with the production setting starred and the adopted "
+       "plateau outlined.",
+       "plot_mask_width_scan(scan)"),
+    _e("background_variance_profile", "background", "background", "Spatial variance",
+       "How much the background varies and how much of it is SPATIAL: scatter "
+       "vs wavelength split by field and by fiber-count quartile, plus the "
+       "azimuthal-halves term that removes the galaxy-to-galaxy variance and "
+       "isolates B10/B11.",
+       "var = background_variance_profile(p, cfg)"),
+    _e("plot_background_variance", "background", "background", "Spatial variance",
+       "Scatter vs observed wavelength (total, per field, spatial) plus a "
+       "scatter-vs-fiber-count panel against a pure shot-noise reference.",
+       "plot_background_variance(var)"),
+    _e("profile_impact", "background", "background", "Profile impact",
+       "THE DELIVERABLE: rebuild the science cube under each background choice "
+       "and report how far the binned FLUX profile and the CENTROID profile "
+       "move, in units of the reference's own error bar. Deliberately reports "
+       "no change in h1 -- bins and plots, not fitted parameters.",
+       "imp = profile_impact(p, cfg, n_boot=200)"),
+    _e("describe_profile_impact", "background", "background", "Profile impact",
+       "Print a profile_impact result: per-bin flux and centroid shifts in "
+       "sigma, the reference values for scale, and a verdict.",
+       "describe_profile_impact(imp)"),
+    _e("plot_profile_impact", "background", "background", "Profile impact",
+       "Flux profile and centroid profile with every background choice "
+       "overplotted and the reference's 1-sigma band shaded -- the figure the "
+       "Methods sentence is read off.",
+       "plot_profile_impact(imp)"),
+
+    # --- 2.5  the mask/fill/smooth chain itself (registered 2026-07-27) ---
+    _e("compare_fill_methods", "background", "background", "Fill methods",
+       "THE FIGURE for optimizing the fill step: raw / filled / filled+smoothed "
+       "stack of the RAW annulus coadds, one figure per candidate fill method, "
+       "each curve with its own galaxy bootstrap. No continuum model anywhere. "
+       "Run it PER FIELD -- a pooled COSMOS+EGS sample is bimodal and the "
+       "biweight then re-weights the fields as the noise level changes.",
+       "res = compare_fill_methods(p_cosmos, cfg, annulus=(80,90))"),
+    _e("plot_fill_method_gallery", "background", "background", "Fill methods",
+       "Per-galaxy version of compare_fill_methods: one panel per galaxy, raw "
+       "plus each fill method's smoothed result, y-axis set from the zoom "
+       "window only so edge spikes cannot flatten the line region.",
+       "fig, ax = plot_fill_method_gallery(p_cosmos, cfg, n=12)"),
+
+    # --- 2.6  what the subtraction does to the SCIENCE (registered 2026-07-27) ---
+    _e("default_impact_choices", "background", "background", "Background impact",
+       "The 5-row default sweep for compare_background_impact: fiducial, "
+       "fill=median, fill=median_interp, no-background bracket, outermost "
+       "annulus. One knob at a time off the fiducial, never a grid.",
+       "choices = default_impact_choices(p, cfg)"),
+    _e("compare_background_impact", "background", "background", "Background impact",
+       "THE 2.6 DELIVERABLE: rebuild the science cube under each background "
+       "choice and report per-bin LINE FLUX, CENTROID and OFF-LINE PEDESTAL "
+       "shifts in units of the reference's own error. Carries a 'no background "
+       "at all' row that brackets the whole effect, so the fill-method spread "
+       "can be read as a fraction of it. Runs verify_reconstruction first and "
+       "raises if it fails.",
+       "imp = compare_background_impact(p, cfg, n_boot=200)"),
+    _e("describe_background_impact", "background", "background", "Background impact",
+       "Print a compare_background_impact result: flux, centroid and pedestal "
+       "tables, the Q1-vs-Q2 split (fill-method spread as a percentage of the "
+       "no-background bracket), and a verdict on the clean-bin pedestals.",
+       "describe_background_impact(imp)"),
+    _e("plot_background_impact", "background", "background", "Background impact",
+       "Three panels vs radius: d(flux)/sigma, d(centroid)/sigma, and the "
+       "off-line pedestal, with the annulus's inner edge SHADED AS A BAND "
+       "(it maps to a z-dependent kpc range, not one radius).",
+       "fig, ax = plot_background_impact(imp)"),
+    _e("plot_background_impact_bins", "background", "background", "Background impact",
+       "Per-bin detail: stacked spectrum under every choice on top, "
+       "(choice - reference) with the reference's 1-sigma band below. A flat "
+       "offset in the lower panel means only the zero point moved; a "
+       "Lya-shaped one means the choice is eating signal.",
+       "fig, ax = plot_background_impact_bins(imp)"),
+
+    # --- 2.7  is the annulus dependence a continuum-window artifact? ---
+    _e("continuum_window_scan", "background", "background", "Continuum windows",
+       "Re-runs the annulus comparison under several cont_bounds settings and "
+       "reports whether the annulus spread COLLAPSES once the windows clear "
+       "the background smoothing kernel. sigma=30 A observed is 9.1 A REST at "
+       "z~2.3 while the production windows start 9-11 A from Lya -- about ONE "
+       "kernel sigma -- so the smoothed background's residual bump lands on "
+       "the very pixels that define the continuum.",
+       "scan = continuum_window_scan(p, cfg, n_boot=200)"),
+    _e("describe_continuum_window_scan", "background", "background", "Continuum windows",
+       "Print the scan as spread vs window distance in kernel sigmas, with an "
+       "explicit verdict: window artifact, partial, or a real annulus "
+       "dependence that belongs in the error budget.",
+       "describe_continuum_window_scan(scan)"),
+    _e("plot_continuum_window_scan", "background", "background", "Continuum windows",
+       "Annulus spread vs how far the continuum windows sit from Lya. A curve "
+       "that falls and flattens is a window-driven artifact; a flat curve "
+       "means the annulus dependence is real.",
+       "fig, ax = plot_continuum_window_scan(scan)"),
 
     # =====================================================================
     # uv_profile.py -- Part 3's standalone UV-continuum pipeline (registered

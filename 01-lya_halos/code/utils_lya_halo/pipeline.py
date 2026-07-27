@@ -50,8 +50,12 @@ def run_extract(config: PipelineConfig, table=None, use_cache: bool = True,
     run_table = extract.build_run_table(config, table=table)
     bad_fiber_mask = extract.build_bad_fiber_mask(config, vdfi_data, run_table=run_table)
 
-    spec, err, nfib, background, vr = extract.extract_fibers(
-        config, vdfi_data, run_table, bad_fiber_mask, use_cache=use_cache
+    # return_extras=True always: the dict is empty unless this config asked for
+    # background-variant products, so there is nothing to gate on and one code
+    # path is better than two.
+    spec, err, nfib, background, vr, extras = extract.extract_fibers(
+        config, vdfi_data, run_table, bad_fiber_mask, use_cache=use_cache,
+        return_extras=True,
     )
 
     if not write:
@@ -80,7 +84,7 @@ def run_extract(config: PipelineConfig, table=None, use_cache: bool = True,
     return write_galaxy_fits(
         path, spec=spec, err=err, nfib=nfib, wave=vdfi_data["wave"],
         r_edges=r_edges, catalog=catalog, config=config,
-        source_id=source_id, background=background, overwrite=True,
+        source_id=source_id, background=background, extras=extras, overwrite=True,
     )
 
 

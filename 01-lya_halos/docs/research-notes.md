@@ -55,6 +55,7 @@ Everything here is a robustness/null check that would not get its own paragraph 
 - Line spread function (LSF) check — the ±4 Å measurement window isn't dominated by instrumental LSF width.
 - Star PSF comparison — confirms the halo is genuinely more extended than the instrumental PSF.
 - Background noise structure — outer-bin noise is correlated, not random; actively being investigated (see Background subtraction section above), not yet a closed item.
+- Flux-integration window (fixed vs. variable) — **resolved 2026-07-25, see dated entry below.** Keep the fixed ±3 Å window; a Gaussian-sigma-scaled variable window was tested and rejected.
 
 **In `validation.py`, verdict TBD (fill in one-liner as each is actually run/checked):**
 - `redshift_scramble_null` / `plot_scramble_null` — permute redshift, re-stack; the line should wash out if it's real. Verdict: *(TBD)*
@@ -69,8 +70,15 @@ Everything here is a robustness/null check that would not get its own paragraph 
 
 `summarize_validation` / `print_validation_summary` / `centroid_dossier` in `validation.py` already exist to roll a run of these up into one summary — worth checking whether that dossier output can just be pasted/linked here directly instead of hand-copying verdicts.
 
-### YYYY-MM-DD
-- *(add findings here)*
+- `sweep_flux_window` / `gaussian_sigma_per_bin` / `gaussian_flux_window` / `h1_vs_flux_window` / `plot_flux_window_diagnostic` — flux-integration window, fixed-width vs. Gaussian-sigma-scaled, decoupled from the (always-fixed) centroid window. Verdict: **keep the fixed ±3 Å window**, see below.
+
+### 2026-07-25
+`specs/systematics-and-extraction.md` §1.2, closed. Ran the fixed-width sweep (±3/5/6/8/10 Å) and a Gaussian-sigma-scaled variable window (`k_sigma` from 0.6 to 2.7), refitting `h1` (PSF-aware expcore, refit-per-draw errors) on each.
+
+- Fixed-width sweep: `h1` consistent within errors across ±3–±10 Å. Widening the window mainly grows the error bars (more continuum/sky noise enters the sum); it does not move the central value outside its own uncertainty. Window-insensitive by the original success criterion.
+- Gaussian-sigma sweep: `h1` drifted smoothly and monotonically across the *entire* `k_sigma` range with no plateau at either end — the signature of a window that isn't holding the same enclosed-flux fraction bin to bin, not a real core/halo effect.
+- Visual inspection (`plot_flux_window_diagnostic`) explains why: the inner (highest-signal) bins have the fewest fibers, so the per-pixel S/N is too poor to constrain the Gaussian sigma fit reliably there — the fit is least trustworthy exactly where it matters most. Separately, Lyα-forest absorption blueward of line center is commonly present in these spectra and is real, not noise; any window wider than ±3 Å increasingly integrates over that absorption trough, which removes flux rather than capturing more of it, and this effect is worst in the same low-fiber inner bins.
+- **Verdict:** the small integrated flux the ±3 Å window reports in the inner two bins is not an under-measurement artifact — it is the more trustworthy number. Keep the fixed ±3 Å window for flux (as already used for the centroid). No extraction change follows (this was Stage-2/free throughout).
 
 ---
 

@@ -18,6 +18,13 @@ config.bg_smooth_method:
   'adaptive' (LEGACY)      -> smooth_spectrum_nan_safe_adaptive
        NaN-safe gaussian with a position-dependent kernel that ramps from a
        small edge sigma to a large interior sigma. Kept for A/B comparison.
+
+  smooth_fill_then_gauss  -- DIAGNOSTIC / Stage-2 ONLY, not in the
+       config.bg_smooth_method dispatch above. Generalizes smooth_interp_then_
+       gauss's fill step to three candidate methods ('linear' == the
+       production behavior, 'median', 'median_interp') so they can be A/B'd
+       against each other before any of them becomes a production default.
+       Driven by background.compare_fill_methods / plot_fill_method_gallery.
 """
 
 from __future__ import annotations
@@ -112,3 +119,109 @@ def smooth_spectrum_nan_safe_adaptive(flux, wave, sigma_A=200, edge_sigma_A=20,
             smooth_flux[i] = (np.nansum(flux[lo:hi][valid] * weights[valid]) /
                               np.nansum(weights[valid]))
     return smooth_flux
+
+
+def _patch_other_gaps(out, wave, protect):
+    """
+    In-place: linearly interpolate any NaNs OUTSIDE `protect` (the line mask)
+    so a downstream gaussian smooth has no gaps left to propagate through.
+    Used by the median-based fill methods below, which only ever set values
+    INSIDE the line mask and would otherwise leave unrelated bad pixels (e.g.
+    a dead fiber contribution) as NaN straight through to the gaussian.
+    """
+    good = np.isfinite(out)
+    gap = ~good & ~protect
+    if gap.any() and good.sum() >= 2:
+        out[gap] = np.interp(wave[gap], wave[good], out[good])
+
+
+def smooth_fill_then_gauss(flux, wave, z, lya_rest=1215.67, sigma_A=30.0,
+                           mask_halfwidth_A=10.0, fill_method="linear",
+                           fill_sideband_width_A=30.0, mode="reflect"):
+    """
+    DIAGNOSTIC / Stage-2 ONLY -- see the module docstring. Mask the Lya line,
+    FILL the gap with one of three methods, then run the same single uniform
+    Gaussian smooth production uses (skipped entirely if sigma_A <= 0, which
+    is how the comparison tools get the "filled, not yet smoothed" stage).
+
+      fill_method = "linear"        : np.interp between the two pixels
+                                       immediately at the mask edges. Identical
+                                       to smooth_interp_then_gauss's fill step
+                                       (this IS that function, generalized).
+                                       Sensitive to those two individual,
+                                       possibly-noisy pixels, and assumes
+                                       whatever local slope they happen to
+                                       imply.
+                   = "median"       : the ENTIRE gap filled with ONE flat
+                                       value -- the median of BOTH flanking
+                                       sidebands pooled together. Most robust
+                                       to noise, but flattens any real slope
+                                       across the gap.
+                   = "median_interp": median of EACH sideband taken
+                                       SEPARATELY, then np.interp between
+                                       those two medians, anchored at the mask
+                                       edges -- same span as "linear", so it
+                                       keeps "linear"'s ability to track a
+                                       real slope across the gap, but each
+                                       endpoint is a robust
+                                       ~fill_sideband_width_A-wide median
+                                       instead of one noisy pixel. If only one
+                                       side has enough points it falls back to
+                                       a flat fill from that side.
+
+    fill_sideband_width_A : width (observed A) of each flanking sideband used
+        by "median" and "median_interp", starting right at the mask edge.
+        mask_halfwidth_A=10 (production default), fill_sideband_width_A=30
+        -> sidebands at [-40,-10] and [10,40] A from line center.
+
+    NO CONTINUUM MODEL anywhere in this function. These are flat/linear local
+    levels for filling a masked gap in the BACKGROUND itself, not a fit for
+    line-flux measurement -- that machinery (measure.get_continuum_model,
+    cont_method / cont_order) is a separate, science-measurement-only tool
+    with no business here.
+
+      flux, wave : (nwave,) background for one galaxy (wave may carry astropy
+                   units; .value is used)
+      z          : that galaxy's systemic redshift; the line is masked at the
+                   OBSERVED Lya, lya_rest*(1+z). Non-finite z -> no line mask,
+                   just the gaussian (if sigma_A > 0) or a no-op.
+    Returns the processed background, same shape.
+    """
+    flux = np.asarray(flux, dtype=float).copy()
+    wave = np.asarray(getattr(wave, "value", wave), dtype=float)
+    dw = np.nanmedian(np.diff(wave))
+
+    if not np.isfinite(z):
+        return flux if sigma_A <= 0 else gaussian_filter1d(flux, sigma_A / dw, mode=mode)
+
+    lam = lya_rest * (1 + z)
+    d = wave - lam
+    line = np.abs(d) <= mask_halfwidth_A
+    good = np.isfinite(flux)
+    out = flux.copy()
+
+    left_side = good & (d < -mask_halfwidth_A) & (d >= -(mask_halfwidth_A + fill_sideband_width_A))
+    right_side = good & (d > mask_halfwidth_A) & (d <= (mask_halfwidth_A + fill_sideband_width_A))
+
+    if fill_method == "linear":
+        fill = good & ~line
+        if fill.sum() >= 2:
+            out[~fill] = np.interp(wave[~fill], wave[fill], flux[fill])
+    elif fill_method == "median":
+        sideband = left_side | right_side
+        if sideband.sum() >= 3:
+            out[line] = np.nanmedian(flux[sideband])
+        _patch_other_gaps(out, wave, line)
+    elif fill_method == "median_interp":
+        if left_side.sum() >= 2 and right_side.sum() >= 2:
+            y_lo, y_hi = np.nanmedian(flux[left_side]), np.nanmedian(flux[right_side])
+            x_lo, x_hi = lam - mask_halfwidth_A, lam + mask_halfwidth_A
+            out[line] = y_lo + (y_hi - y_lo) * (wave[line] - x_lo) / (x_hi - x_lo)
+        elif left_side.sum() >= 2 or right_side.sum() >= 2:
+            side = left_side if left_side.sum() >= 2 else right_side
+            out[line] = np.nanmedian(flux[side])   # only one side available -- flat fallback
+        _patch_other_gaps(out, wave, line)
+    else:
+        raise ValueError("fill_method must be 'linear', 'median', or 'median_interp'")
+
+    return out if sigma_A <= 0 else gaussian_filter1d(out, sigma_A / dw, mode=mode)

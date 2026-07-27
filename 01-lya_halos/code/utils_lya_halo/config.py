@@ -128,6 +128,44 @@ class PipelineConfig:
         default_factory=lambda: [200, 20, 300]  # (sigma_A, edge_sigma_A, edge_width_A)
     )
 
+    # --- background-variant products (specs/systematics-and-extraction.md 2.5) --
+    # The extraction destroys the fiber dimension, so the pipeline can never
+    # re-derive a background from a different annulus, re-mask, or re-smooth
+    # after the fact. These four knobs are what let ONE run answer every
+    # background question offline, forever:
+    #
+    #   store_raw_bg     -> the annulus coadd BEFORE the Lya mask + interpolate
+    #                       + gaussian smooth. This is the single non-negotiable
+    #                       product: 1.1's rest-frame stack test at 1215.67 A
+    #                       cannot exist without it, because the stored
+    #                       BACKGROUND HDU is post-mask/post-smooth (B9) and has
+    #                       the feature interpolated away by construction.
+    #   bg_variants      -> extra annuli, MEASURED AND STORED ONLY. Variant 0 is
+    #                       always the fiducial (bg_inner_arcsec, bg_outer_arcsec)
+    #                       and is the only one ever subtracted from science
+    #                       fibers, so adding variants cannot move a science
+    #                       number. Whether a Lya feature's amplitude falls with
+    #                       annulus radius is what distinguishes a real two-halo
+    #                       component from an instrumental artifact.
+    #   store_spec_nobg  -> the science coadd with NO background subtracted, so
+    #                       any variant can be re-subtracted in Stage 2 (see
+    #                       resolved_bg_variants / background.reconstruct_spec
+    #                       for why this is exact rather than approximate).
+    #   store_bg_halves  -> each annulus split by azimuth; the two halves differ
+    #                       by the background's SPATIAL variance (B10/B11).
+    #
+    # All default off/None, so an unchanged config hashes to an unchanged
+    # extraction signature and existing caches stay valid (extract_signature_dict
+    # omits them at their defaults).
+    bg_variants: Optional[Sequence] = None   # None -> ((bg_inner_arcsec, bg_outer_arcsec),)
+                                          #   else a sequence of (inner, outer) arcsec
+                                          #   pairs whose FIRST entry must equal the
+                                          #   fiducial annulus -- see
+                                          #   resolved_bg_variants().
+    store_raw_bg: bool = False           # write pre-mask, pre-smooth annulus coadds
+    store_spec_nobg: bool = False        # write the un-background-subtracted coadd
+    store_bg_halves: bool = False        # azimuthal split of each annulus
+
     # --- coaddition ------------------------------------------------------
     # TWO concepts (not three), because the background is SUBTRACTED from the
     # science fibers: the background estimator and the fiber estimator must be
@@ -385,6 +423,62 @@ class PipelineConfig:
         """Background combine method, falling back to the fiber method if None."""
         return self.bg_combine_method or self.fiber_combine_method
 
+    def resolved_bg_variants(self) -> tuple:
+        """
+        The background annuli this run measures, as a tuple of (inner, outer)
+        arcsec pairs. `bg_variants=None` (the default) gives exactly one entry,
+        the fiducial `(bg_inner_arcsec, bg_outer_arcsec)` -- i.e. the old
+        single-annulus behavior, expressed in the new vocabulary.
+
+        VARIANT 0 IS THE FIDUCIAL, ALWAYS. It is the only annulus ever
+        subtracted from science fibers; variants 1+ are measured and stored and
+        never touch `Spec`. Validating that here rather than in extract.py is
+        deliberate: it makes "adding a variant cannot change a science number"
+        a property of the config object, so no caller can accidentally reorder
+        the list and silently re-define what the fiducial background is.
+
+        Raises ValueError on a malformed list or a first entry that disagrees
+        with (bg_inner_arcsec, bg_outer_arcsec) -- fail at construction, not
+        two hours into an extraction.
+        """
+        fiducial = (float(self.bg_inner_arcsec), float(self.bg_outer_arcsec))
+        if self.bg_variants is None:
+            return (fiducial,)
+
+        out = []
+        for i, pair in enumerate(self.bg_variants):
+            try:
+                lo, hi = (float(pair[0]), float(pair[1]))
+            except (TypeError, IndexError, ValueError):
+                raise ValueError(
+                    f"bg_variants[{i}] = {pair!r} is not an (inner, outer) pair."
+                ) from None
+            if not (0.0 <= lo < hi):
+                raise ValueError(
+                    f"bg_variants[{i}] = ({lo}, {hi}) must satisfy 0 <= inner < outer."
+                )
+            out.append((lo, hi))
+
+        if not out:
+            raise ValueError("bg_variants is empty; use None for the fiducial annulus only.")
+        if out[0] != fiducial:
+            raise ValueError(
+                f"bg_variants[0] = {out[0]} must equal the fiducial annulus "
+                f"(bg_inner_arcsec, bg_outer_arcsec) = {fiducial}. Variant 0 is "
+                "the annulus actually subtracted from the science fibers, so a "
+                "mismatch would silently change what the extraction means."
+            )
+        return tuple(out)
+
+    def stores_bg_products(self) -> bool:
+        """
+        True if this run writes any of the 2.5 background-variant products.
+        The single predicate extract.py, io.py and extract_signature_dict all
+        consult, so "is this a background-variant run?" has one definition.
+        """
+        return bool(self.store_raw_bg or self.store_spec_nobg
+                    or self.store_bg_halves or self.bg_variants is not None)
+
     def galaxy_window(self, n_total: int) -> tuple:
         """
         (start, stop) row range of the run table this run should process --
@@ -461,6 +555,22 @@ class PipelineConfig:
             d["combine_fused"] = True
             d["combine_fused_strict"] = getattr(self, "combine_fused_strict", False)
             d["combine_fused_transpose"] = getattr(self, "combine_fused_transpose", False)
+        # Background-variant products (2.5). OMITTED ENTIRELY at their defaults,
+        # which is the whole point: adding these fields must leave every existing
+        # signature bit-identical, or it orphans caches mid-flight (the fine-grid
+        # extraction was running when this went in). test_framework asserts that.
+        #
+        # When they ARE set, they DO enter the hash -- not because they change
+        # SPEC/ERROR/NFIB/BACKGROUND (they cannot; variant 0 is the fiducial and
+        # variants 1+ are never subtracted) but because they change what a cache
+        # ENTRY CONTAINS. A variant run therefore gets its own cache/<sig>/ and
+        # its own FITS name, and can never collide with, or half-fill, a plain
+        # run's cache. That isolation is worth recomputing SPEC for.
+        if self.stores_bg_products():
+            d["bg_variants"] = list(self.resolved_bg_variants())
+            d["store_raw_bg"] = bool(self.store_raw_bg)
+            d["store_spec_nobg"] = bool(self.store_spec_nobg)
+            d["store_bg_halves"] = bool(self.store_bg_halves)
         # NOT hashed, deliberately: combine_wave_block, combine_threads,
         # combine_min_fibers -- all provably no-effect on the result, so a cache
         # built at 1 thread stays valid at 8.
@@ -548,6 +658,7 @@ class PipelineConfig:
         recorded on the Stage 2 product instead.
         """
         bins_str = ",".join(str(b) for b in self.bins)
+        variants = self.resolved_bg_variants()
         is_segmap = self.mask_has_segmap()      # True for 'segmap' AND 'segmap+spec_*'
         has_spec = self.mask_has_spec()
         has_image = "image" in self.mask_components()
@@ -584,6 +695,17 @@ class PipelineConfig:
             "SMTHSIG":  self.bg_smooth_sigma_A,      # interp_gauss uniform sigma (A)
             "SMTHMHW":  self.line_mask_halfwidth_A,  # interp_gauss line-mask half-width (A)
             "SMOOTHV":  ",".join(str(v) for v in self.smoothing_values),  # adaptive params
+            # --- background-variant products (2.5) ---------------------------
+            # SPECBGSU is the keyword that stops anything downstream from having
+            # to GUESS whether the SPEC HDU it is holding is background-
+            # subtracted. It names the variant index that was subtracted (always
+            # 0, the fiducial) so SPEC and SPEC_NOBG can never be confused.
+            "SPECBGSU": 0,
+            "BGVARN":   len(variants),
+            "BGRAW":    bool(self.store_raw_bg),
+            "NOBG":     bool(self.store_spec_nobg),
+            "BGHALVES": bool(self.store_bg_halves),
+            **{f"BGVAR{i}": f"{lo:g},{hi:g}" for i, (lo, hi) in enumerate(variants)},
             "MASSCOL":  self.mass_col,
             "ZCOL":     self.z_col,
             "WAVEMIN":  self.wave_min,

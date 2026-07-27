@@ -1212,13 +1212,23 @@ def bootstrap_stack_error(
 def _measurement_window(bounds, cont_bounds, pad=2.0):
     """
     Minimal wavelength span any Stage-3 functional touches: the union of the
-    line window and both continuum sidebands, padded by `pad` A. Slicing the
+    line window and EVERY continuum sideband, padded by `pad` A. Slicing the
     cube to this before the bootstrap loop is a pure speedup -- centroids and
     the per-pixel error are unchanged because nothing reads outside it.
+
+    Takes ANY number of sidebands. This used to hard-unpack exactly two
+    (`(cb_lo, _), (_, cb_hi) = cont_bounds`), which silently made a one-sided
+    or three-window continuum a crash rather than a configuration -- even
+    though `get_continuum_model` and `fit_local_poly_continuum` both loop over
+    `cont_bounds` and have always supported any number. A red-only continuum
+    is a legitimate choice on Lya (the blue side carries forest attenuation
+    that the red side does not), so the restriction was in the wrong place.
     """
-    (cb_lo, _), (_, cb_hi) = cont_bounds
-    lo = min(cb_lo, bounds[0]) - pad
-    hi = max(cb_hi, bounds[1]) + pad
+    cb = [tuple(b) for b in cont_bounds]
+    if not cb:
+        raise ValueError("cont_bounds is empty -- at least one sideband is required")
+    lo = min([b[0] for b in cb] + [bounds[0]]) - pad
+    hi = max([b[1] for b in cb] + [bounds[1]]) + pad
     return lo, hi
 
 

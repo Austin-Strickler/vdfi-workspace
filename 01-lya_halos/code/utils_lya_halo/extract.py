@@ -706,6 +706,20 @@ def _write_cache_manifest(run_cache_dir: str, config: "PipelineConfig") -> None:
             "signature": config.extract_signature(),
             "galaxy_fits": config.descriptive_filename(),
             "written": _dt.datetime.now().isoformat(timespec="seconds"),
+            # Which arrays a gal_*.npz in this directory carries. Redundant with
+            # `knobs` (the background-variant flags are hashed when set, so a
+            # variant run already lands in its own directory) but written
+            # explicitly because "what is IN this cache" is the question someone
+            # resuming a half-finished run actually needs answered, and reading
+            # it off a 10-hex hash is not answering it.
+            "products": (["spec", "err", "nfib", "bg", "vr"]
+                         + (["bg_raw"] if config.store_raw_bg else [])
+                         + (["bg_nfib"] if (config.store_raw_bg
+                                            or config.store_bg_halves) else [])
+                         + (["bg_halves", "bg_half_nfib"]
+                            if config.store_bg_halves else [])
+                         + (["spec_nobg"] if config.store_spec_nobg else [])),
+            "bg_variants": [list(p) for p in config.resolved_bg_variants()],
             "knobs": config.extract_signature_dict(),
         }
         tmp = path + ".tmp"
@@ -736,6 +750,7 @@ def extract_fibers(
     run_table: "Table",
     bad_fiber_mask: np.ndarray,
     use_cache: bool = True,
+    return_extras: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Stage 1 core loop. For each galaxy:
@@ -762,6 +777,20 @@ def extract_fibers(
       NFIB       : (ngal, nrad)   fibers pooled per bin   <- contract HDU
       Background : (ngal, nwave)  galaxy-level background (diagnostic)
       vr_edges   : (ngal, nrad+1) per-galaxy edges actually used
+
+    With `return_extras=True` a SIXTH element is appended: a dict of the
+    background-variant products (2.5), holding only the keys this config asked
+    for -- 'bg_raw', 'bg_nfib', 'spec_nobg', 'bg_halves', 'bg_half_nfib'. The
+    5-tuple is the default so every existing caller (pipeline.run_extract,
+    starpsf.extract_star_profiles) keeps working untouched; the extras are an
+    opt-in addition, never a change to the contract.
+
+    BACKGROUND VARIANTS, in one paragraph, because the property everything else
+    rests on is easy to lose: variant 0 is the fiducial annulus and the ONLY one
+    subtracted from science fibers. Variants 1+ are measured, stored, and never
+    used. So `bg_variants` can be lengthened freely and Spec/Err/NFIB/Background
+    are byte-identical to a run without it -- there is no version of this flag
+    that quietly re-defines a science number.
     """
     wave = vdfi_data["wave"]
     RA = vdfi_data["RA"]
@@ -826,6 +855,58 @@ def extract_fibers(
     Background = np.full((ngal, nwave), np.nan)
     VR = np.full((ngal, nrad + 1), np.nan)
 
+    # ---- background-variant products (specs/systematics-and-extraction.md 2.5) --
+    # Variant 0 is the fiducial annulus and the only one ever subtracted; see the
+    # docstring. Everything here is off by default and allocates nothing.
+    bg_variants = config.resolved_bg_variants()
+    nvar = len(bg_variants)
+    store_raw_bg = bool(getattr(config, "store_raw_bg", False))
+    store_spec_nobg = bool(getattr(config, "store_spec_nobg", False))
+    store_bg_halves = bool(getattr(config, "store_bg_halves", False))
+
+    # THE GUARD THAT MAKES SPEC_NOBG MEANINGFUL. Reconstructing an unsubtracted
+    # coadd as `Spec + bg` is exact ONLY because the biweight is
+    # translation-equivariant AND every exposure shares one background. The
+    # second half holds only while the per-exposure branch below never fires,
+    # i.e. min_bg_fibers exceeds the total fiber count. If min_bg_fibers is ever
+    # lowered, different exposures carry different offsets, those do not commute
+    # with a single post-hoc addition, and SPEC_NOBG becomes SILENTLY wrong --
+    # wrong in a way no plot would show. Hence a hard failure, not a warning.
+    if store_spec_nobg and int(config.min_bg_fibers) <= nfib_total:
+        raise ValueError(
+            f"store_spec_nobg=True requires min_bg_fibers > nfib_total "
+            f"({config.min_bg_fibers} <= {nfib_total}), so that every exposure "
+            "shares one pooled background. With per-exposure backgrounds the "
+            "offsets differ between exposures and cannot be re-added after the "
+            "fiber combine -- SPEC_NOBG would be wrong with no visible symptom."
+        )
+
+    BG_RAW = (np.full((ngal, nvar, nwave), np.nan, dtype=np.float32)
+              if store_raw_bg else None)
+    BG_NFIB = (np.zeros((ngal, nvar), dtype=np.int32)
+               if (store_raw_bg or store_bg_halves) else None)
+    BG_HALVES = (np.full((ngal, nvar, 2, nwave), np.nan, dtype=np.float32)
+                 if store_bg_halves else None)
+    BG_HALF_NFIB = (np.zeros((ngal, nvar, 2), dtype=np.int32)
+                    if store_bg_halves else None)
+    SPEC_NOBG = (np.full((ngal, nrad, nwave), np.nan)
+                 if store_spec_nobg else None)
+
+    # Which arrays a cache entry for THIS config must contain. Checked on every
+    # cache hit: a hit that predates one of these products is recomputed rather
+    # than loaded, so turning a product on can never leave a silent NaN row in
+    # the stack (see the cache-hit branch below).
+    _cache_keys = ["spec", "err", "nfib", "bg", "vr"]
+    if store_raw_bg:
+        _cache_keys += ["bg_raw"]
+    if store_raw_bg or store_bg_halves:
+        _cache_keys += ["bg_nfib"]
+    if store_bg_halves:
+        _cache_keys += ["bg_halves", "bg_half_nfib"]
+    if store_spec_nobg:
+        _cache_keys += ["spec_nobg"]
+    _stale_cache_warned = False
+
     # One directory per signature: cache/<sig>/gal_<i>.npz. The old layout put
     # every galaxy of every config ever run flat into cache/ as
     # gal_<sig>_<i>.npz, which grew until listing it took minutes; scoping a
@@ -866,9 +947,34 @@ def extract_fibers(
         cache_path = os.path.join(cache_dir, f"gal_{gal_start + cnt:05d}.npz")
         if use_cache and os.path.exists(cache_path):
             g = np.load(cache_path)
-            Spec[cnt], Err[cnt], NFIB[cnt] = g["spec"], g["err"], g["nfib"]
-            Background[cnt], VR[cnt] = g["bg"], g["vr"]
-            continue
+            # A cache entry written before this config's background products
+            # existed is INCOMPLETE, not merely old. Loading it would put NaN
+            # rows into BG_RAW / SPEC_NOBG for that galaxy and quietly drop it
+            # from every downstream stack -- the failure mode 2.5 Change 4 warns
+            # about, and the one that surfaces on the first RESUME rather than
+            # on the first run. Recompute instead: costs one galaxy, and is
+            # strictly safer than trusting a partial entry.
+            if all(k in g.files for k in _cache_keys):
+                Spec[cnt], Err[cnt], NFIB[cnt] = g["spec"], g["err"], g["nfib"]
+                Background[cnt], VR[cnt] = g["bg"], g["vr"]
+                if BG_RAW is not None:
+                    BG_RAW[cnt] = g["bg_raw"]
+                if BG_NFIB is not None:
+                    BG_NFIB[cnt] = g["bg_nfib"]
+                if BG_HALVES is not None:
+                    BG_HALVES[cnt] = g["bg_halves"]
+                    BG_HALF_NFIB[cnt] = g["bg_half_nfib"]
+                if SPEC_NOBG is not None:
+                    SPEC_NOBG[cnt] = g["spec_nobg"]
+                continue
+            if not _stale_cache_warned:
+                missing = [k for k in _cache_keys if k not in g.files]
+                warnings.warn(
+                    f"cache entries in {cache_dir} predate the background-variant "
+                    f"products (missing {missing}); recomputing those galaxies "
+                    "instead of loading them short.",
+                    RuntimeWarning, stacklevel=2)
+                _stale_cache_warned = True
 
         kpc_per_arcsec = cosmo.angular_diameter_distance(z).to(u.kpc).value / 206265
         radial_bins = radial_bin_edges(config, m, z)
@@ -877,11 +983,19 @@ def extract_fibers(
         # ---- precompute distances + good-fiber masks ----
         dist_arcsec_all = np.full((nexp, nfib_total), np.nan)
         good_base_all = np.zeros((nexp, nfib_total), dtype=bool)
+        # North/south half-plane flag, built only when the azimuthal split is
+        # requested. A FIXED split line (the E-W axis through the galaxy), not a
+        # per-galaxy or random one: the two halves must mean the same thing for
+        # every galaxy or their difference measures the split, not the sky.
+        north_all = (np.zeros((nexp, nfib_total), dtype=bool)
+                     if store_bg_halves else None)
         for e in range(nexp):
             dra = (RA[e] - ra) * np.cos(np.deg2rad((DEC[e] + dec) / 2)) * 3600.
             ddec = (DEC[e] - dec) * 3600.
             dist_arcsec_all[e] = np.sqrt(dra ** 2 + ddec ** 2)
             good_base_all[e] = (~bad_fiber_mask[e]) & np.isfinite(RA[e]) & np.isfinite(DEC[e])
+            if north_all is not None:
+                north_all[e] = ddec >= 0.0
 
         # ---- 1. per-exposure backgrounds + galaxy fallback ----
         # float32 backgrounds: the science subtraction below is float32 - bg, so
@@ -891,35 +1005,82 @@ def extract_fibers(
         has_own_bg = np.zeros(nexp, dtype=bool)
         all_bg_fibers, all_bg_errs = [], []
 
-        for e in range(nexp):
-            bg_sel = ((dist_arcsec_all[e] >= config.bg_inner_arcsec) &
-                      (dist_arcsec_all[e] < config.bg_outer_arcsec) &
-                      good_base_all[e])
-            n_bg = int(np.sum(bg_sel))
-            if n_bg == 0:
-                continue
-            sp_bg = spectra[e, bg_sel]
-            all_bg_fibers.append(sp_bg)
-            if bg_needs_err:
-                all_bg_errs.append(error[e, bg_sel])
-            if n_bg >= config.min_bg_fibers:
-                er_bg = error[e, bg_sel] if bg_needs_err else None
-                bg_e, bg_ee = combine_fibers(sp_bg, er_bg, method=bg_method,
-                                             sigma=sc_sigma, maxiters=sc_maxiters)
-                bg_per_exp[e] = _maybe_smooth(bg_e, z)
-                bg_err_per_exp[e] = bg_ee
-                has_own_bg[e] = True
+        # One pass per annulus variant. VARIANT 0 IS THE FIDUCIAL and the only
+        # one that reaches `bg_per_exp` / the science subtraction below; its path
+        # through this block is byte-for-byte what it was before variants
+        # existed. Variants 1+ skip the per-exposure branch entirely (they are
+        # never subtracted, so a per-exposure version of them would mean
+        # nothing) and exist only to be stored.
+        for v, (bg_lo, bg_hi) in enumerate(bg_variants):
+            all_bg_fibers, all_bg_errs, all_bg_north = [], [], []
 
-        if all_bg_fibers:
-            sp_all = np.concatenate(all_bg_fibers, axis=0)
-            er_all = np.concatenate(all_bg_errs, axis=0) if bg_needs_err else None
-            bg_gal_raw, bg_gal_err = combine_fibers(sp_all, er_all, method=bg_method,
+            for e in range(nexp):
+                bg_sel = ((dist_arcsec_all[e] >= bg_lo) &
+                          (dist_arcsec_all[e] < bg_hi) &
+                          good_base_all[e])
+                n_bg = int(np.sum(bg_sel))
+                if n_bg == 0:
+                    continue
+                sp_bg = spectra[e, bg_sel]
+                all_bg_fibers.append(sp_bg)
+                if bg_needs_err:
+                    all_bg_errs.append(error[e, bg_sel])
+                if north_all is not None:
+                    all_bg_north.append(north_all[e][bg_sel])
+                if v == 0 and n_bg >= config.min_bg_fibers:
+                    er_bg = error[e, bg_sel] if bg_needs_err else None
+                    bg_e, bg_ee = combine_fibers(sp_bg, er_bg, method=bg_method,
+                                                 sigma=sc_sigma, maxiters=sc_maxiters)
+                    bg_per_exp[e] = _maybe_smooth(bg_e, z)
+                    bg_err_per_exp[e] = bg_ee
+                    has_own_bg[e] = True
+
+            if all_bg_fibers:
+                sp_all = np.concatenate(all_bg_fibers, axis=0)
+                er_all = np.concatenate(all_bg_errs, axis=0) if bg_needs_err else None
+                bg_raw_v, bg_err_v = combine_fibers(sp_all, er_all, method=bg_method,
                                                     sigma=sc_sigma, maxiters=sc_maxiters)
-            bg_gal = _maybe_smooth(bg_gal_raw, z)
-        else:
-            bg_gal = np.full(nwave, np.nan)
-            bg_gal_err = np.full(nwave, np.nan)
-        Background[cnt] = bg_gal
+            else:
+                sp_all = er_all = None
+                bg_raw_v = np.full(nwave, np.nan)
+                bg_err_v = np.full(nwave, np.nan)
+
+            # THE LINE THIS WHOLE RUN EXISTS FOR. `bg_raw_v` is the annulus
+            # coadd BEFORE _maybe_smooth, i.e. before the Lya mask, the
+            # interpolation across the gap, and the 30 A gaussian. The stored
+            # BACKGROUND HDU is all three of those applied (B9), so any Lya
+            # feature in the annulus has already been interpolated away in it --
+            # which is exactly why 1.1's rest-frame stack test cannot be run on
+            # what is currently on disk. This array is that test's input.
+            if BG_RAW is not None:
+                BG_RAW[cnt, v] = bg_raw_v
+            if BG_NFIB is not None:
+                BG_NFIB[cnt, v] = int(sum(a.shape[0] for a in all_bg_fibers))
+
+            # Azimuthal halves: same annulus, same estimator, disjoint fibers.
+            # Their difference is a direct measurement of how much the
+            # background varies ACROSS the annulus (B10/B11) -- something no
+            # amount of Stage-2 work on the pooled spectrum can recover.
+            if BG_HALVES is not None and sp_all is not None:
+                north = np.concatenate(all_bg_north)
+                for h, sel_h in enumerate((north, ~north)):
+                    n_h = int(np.count_nonzero(sel_h))
+                    BG_HALF_NFIB[cnt, v, h] = n_h
+                    if n_h == 0:
+                        continue
+                    er_h = er_all[sel_h] if er_all is not None else None
+                    bg_h, _ = combine_fibers(sp_all[sel_h], er_h, method=bg_method,
+                                             sigma=sc_sigma, maxiters=sc_maxiters)
+                    BG_HALVES[cnt, v, h] = bg_h
+                del north
+
+            if v == 0:
+                # Fiducial: this is the background the science fibers see.
+                bg_gal_err = bg_err_v
+                bg_gal = _maybe_smooth(bg_raw_v, z) if all_bg_fibers else bg_raw_v
+                Background[cnt] = bg_gal
+
+            del sp_all, er_all, all_bg_fibers, all_bg_errs, all_bg_north
 
         for e in range(nexp):
             if not has_own_bg[e]:
@@ -989,13 +1150,52 @@ def extract_fibers(
                     pool_spec, pool_err, method=fiber_method,
                     sigma=sc_sigma, maxiters=sc_maxiters, wave_block=wave_block,
                 )
+
+            # SPEC_NOBG by addition, NOT by a second unsubtracted combine.
+            # The biweight location estimator is translation-equivariant:
+            # subtracting a per-wavelength scalar from every fiber shifts the
+            # result by exactly that scalar (sigma-clipping likewise works on
+            # deviations from the center, so it is unaffected too). Every
+            # exposure shares one background -- asserted at entry via
+            # min_bg_fibers -- so adding it back after the combine is exact,
+            # and costs one array add instead of doubling the run's dominant
+            # operation. `bg_per_exp[0]` rather than `bg_gal` deliberately: it
+            # is the float32 value actually subtracted, so the round trip is
+            # exact rather than exact-to-a-cast.
+            if SPEC_NOBG is not None:
+                SPEC_NOBG[cnt, r] = Spec[cnt, r] + bg_per_exp[0]
+
             del pool_spec, pool_err   # release this bin before gathering the next
 
         del bin_idx_all
         gc.collect()                  # keep peak flat across the long per-galaxy run
 
         if use_cache:
+            extra_arrays = {}
+            if BG_RAW is not None:
+                extra_arrays["bg_raw"] = BG_RAW[cnt]
+            if BG_NFIB is not None:
+                extra_arrays["bg_nfib"] = BG_NFIB[cnt]
+            if BG_HALVES is not None:
+                extra_arrays["bg_halves"] = BG_HALVES[cnt]
+                extra_arrays["bg_half_nfib"] = BG_HALF_NFIB[cnt]
+            if SPEC_NOBG is not None:
+                extra_arrays["spec_nobg"] = SPEC_NOBG[cnt]
             _save_cache_atomic(cache_path, spec=Spec[cnt], err=Err[cnt],
-                               nfib=NFIB[cnt], bg=Background[cnt], vr=VR[cnt])
+                               nfib=NFIB[cnt], bg=Background[cnt], vr=VR[cnt],
+                               **extra_arrays)
 
-    return Spec, Err, NFIB, Background, VR
+    if not return_extras:
+        return Spec, Err, NFIB, Background, VR
+
+    extras = {}
+    if BG_RAW is not None:
+        extras["bg_raw"] = BG_RAW
+    if BG_NFIB is not None:
+        extras["bg_nfib"] = BG_NFIB
+    if BG_HALVES is not None:
+        extras["bg_halves"] = BG_HALVES
+        extras["bg_half_nfib"] = BG_HALF_NFIB
+    if SPEC_NOBG is not None:
+        extras["spec_nobg"] = SPEC_NOBG
+    return Spec, Err, NFIB, Background, VR, extras

@@ -13,6 +13,23 @@ order; that alignment IS the interface.
     WAVE        (nwave,)              observed wavelength grid
     R_EDGES    (nrad+1,)             radial bin edges actually used (bin_mode units)
     CATALOG     table                 full per-galaxy catalog (supersedes z/mass)
+
+Optional background-variant HDUs (written only when the corresponding
+`store_*` config flag is on; see specs/systematics-and-extraction.md 2.5):
+
+    SPEC_NOBG    (ngal, nrad, nwave)     science coadd with NO background subtracted
+    BG_VARIANTS  (ngal, nvar, nwave)     annulus coadds, RAW: pre-mask, pre-smooth
+    BG_NFIB      (ngal, nvar)            fibers pooled per variant
+    BG_HALVES    (ngal, nvar, 2, nwave)  each annulus split by azimuth (N, S)
+    BG_HALF_NFIB (ngal, nvar, 2)         fibers per half
+
+The distinction that matters: BACKGROUND is post-mask and post-smooth, so any
+Lya feature in the annulus has already been interpolated away in it.
+BG_VARIANTS is the same fibers BEFORE any of that, which is what makes the
+background testable offline. Variant index 0 is always the fiducial annulus and
+the one that was actually subtracted from SPEC -- header keyword SPECBGSU
+records that, so nothing downstream has to guess whether it is holding a
+subtracted or unsubtracted array.
 """
 
 from __future__ import annotations
@@ -45,6 +62,7 @@ def write_galaxy_fits(
     config: "PipelineConfig",
     source_id: str,
     background: np.ndarray | None = None,   # (ngal, nwave); optional diagnostic
+    extras: dict | None = None,             # background-variant products (2.5)
     overwrite: bool = False,
 ) -> str:
     """
@@ -54,8 +72,15 @@ def write_galaxy_fits(
     are assumed to be the same slice. We do not enforce len(catalog) == ngal
     here so that smoke tests (num_gal small) write cleanly. A real misalignment
     surfaces loudly in Stage 2 when redshifts no longer match the spectra.
+
+    `extras` is the dict `extract_fibers(..., return_extras=True)` returns. Only
+    the keys present are written, so a run with `store_raw_bg` but not
+    `store_spec_nobg` produces a file with BG_VARIANTS and no SPEC_NOBG -- and
+    the header flags say which, rather than the reader inferring it from which
+    HDUs happen to exist.
     """
     ngal = spec.shape[0]
+    extras = extras or {}
 
     primary = fits.PrimaryHDU()
     for k, v in config.to_header_dict(ngal, source_id).items():
@@ -72,6 +97,15 @@ def write_galaxy_fits(
     ]
     if background is not None:
         hdus.append(fits.ImageHDU(background.astype(np.float32), name="BACKGROUND"))
+    for key, name, dtype in (
+        ("spec_nobg",    "SPEC_NOBG",    np.float32),
+        ("bg_raw",       "BG_VARIANTS",  np.float32),
+        ("bg_nfib",      "BG_NFIB",      np.int32),
+        ("bg_halves",    "BG_HALVES",    np.float32),
+        ("bg_half_nfib", "BG_HALF_NFIB", np.int32),
+    ):
+        if extras.get(key) is not None:
+            hdus.append(fits.ImageHDU(np.asarray(extras[key]).astype(dtype), name=name))
     hdus += [
         fits.ImageHDU(np.asarray(wave, dtype=np.float32), name="WAVE"),
         fits.ImageHDU(np.asarray(r_edges, dtype=np.float32), name="R_EDGES"),
@@ -101,9 +135,31 @@ class GalaxyProduct:
     header: "fits.Header"
     background: "np.ndarray | None" = None   # present only if the file has it
 
+    # --- background-variant products (2.5); None unless the run stored them ---
+    spec_nobg: "np.ndarray | None" = None      # (ngal, nrad, nwave)
+    bg_variants: "np.ndarray | None" = None    # (ngal, nvar, nwave) RAW annulus coadds
+    bg_nfib: "np.ndarray | None" = None        # (ngal, nvar)
+    bg_halves: "np.ndarray | None" = None      # (ngal, nvar, 2, nwave)
+    bg_half_nfib: "np.ndarray | None" = None   # (ngal, nvar, 2)
+
     @property
     def ngal(self) -> int:
         return self.spec.shape[0]
+
+    @property
+    def bg_annuli(self) -> "list[tuple[float, float]]":
+        """
+        The (inner, outer) arcsec annuli behind the BG_VARIANTS axis, read back
+        from the BGVAR0..BGVARn header keywords. Index 0 is the fiducial -- the
+        annulus that was subtracted from SPEC. Empty list on an older file.
+        """
+        out = []
+        for i in range(int(self.header.get("BGVARN", 0) or 0)):
+            raw = str(self.header.get(f"BGVAR{i}", ""))
+            parts = raw.split(",")
+            if len(parts) == 2:
+                out.append((float(parts[0]), float(parts[1])))
+        return out
 
     @property
     def nrad(self) -> int:
@@ -118,7 +174,7 @@ def read_galaxy_fits(path: str) -> GalaxyProduct:
     """Load the galaxy FITS back into a GalaxyProduct."""
     with fits.open(path) as hdul:
         names = {hdu.name for hdu in hdul}
-        background = hdul["BACKGROUND"].data if "BACKGROUND" in names else None
+        get = lambda n: hdul[n].data if n in names else None   # noqa: E731
         return GalaxyProduct(
             spec=hdul["SPEC"].data,
             err=hdul["ERROR"].data,
@@ -127,7 +183,12 @@ def read_galaxy_fits(path: str) -> GalaxyProduct:
             r_edges=hdul["R_EDGES"].data,
             catalog=Table(hdul["CATALOG"].data),
             header=hdul[0].header,
-            background=background,
+            background=get("BACKGROUND"),
+            spec_nobg=get("SPEC_NOBG"),
+            bg_variants=get("BG_VARIANTS"),
+            bg_nfib=get("BG_NFIB"),
+            bg_halves=get("BG_HALVES"),
+            bg_half_nfib=get("BG_HALF_NFIB"),
         )
 
 
@@ -238,6 +299,18 @@ def _resolve_galaxy_fits_path(config, field: str, verbose: bool = True):
     return None
 
 
+# Galaxy-axis arrays that are OPTIONAL (None unless the run stored them). Both
+# _concat_products and apply_finite_cut must carry every one of these, or the
+# array silently disappears from the product and every background diagnostic
+# that needs it raises "re-extract with store_raw_bg=True" on data that was
+# extracted correctly. That is exactly what happened between 2026-07-26's 2.5
+# implementation and this fix: both helpers predated the new HDUs and dropped
+# them without a word. If a new optional galaxy-axis array is ever added to
+# GalaxyProduct, add it here too.
+_OPTIONAL_GALAXY_ARRAYS = ("background", "spec_nobg", "bg_variants", "bg_nfib",
+                           "bg_halves", "bg_half_nfib")
+
+
 def _concat_products(a: GalaxyProduct, b: GalaxyProduct) -> GalaxyProduct:
     """Concatenate two products along the galaxy axis, checking compatibility."""
     if not np.allclose(a.wave, b.wave, equal_nan=True):
@@ -249,20 +322,46 @@ def _concat_products(a: GalaxyProduct, b: GalaxyProduct) -> GalaxyProduct:
     if not np.allclose(a.r_edges, b.r_edges, equal_nan=True):
         raise ValueError("Cannot combine fields: R_EDGES differ.")
 
+    # The background VARIANTS carry their annuli in the header, and the merged
+    # product keeps only `a`'s header -- so if the two fields were extracted
+    # with different annuli, `bg_annuli` would describe one field while the
+    # array held both. Refuse rather than mislabel: this is not a drift warning,
+    # it makes the concatenated axis meaningless.
+    if a.bg_variants is not None and b.bg_variants is not None:
+        if a.bg_annuli != b.bg_annuli:
+            raise ValueError(
+                f"Cannot combine fields: BG_VARIANTS annuli differ "
+                f"({a.bg_annuli} vs {b.bg_annuli}). Re-extract both fields with "
+                f"the same config.bg_variants."
+            )
+
     # Warn (don't fail) if the two fields were extracted with different settings.
     # R_EDGES already guarantees bins match; this catches mask/combine/bg drift.
     if a.header is not None and b.header is not None:
         for key in ("BINMODE", "MASKMETH", "MASKPCT", "COMBINE", "BGCOMB",
-                    "BGINNER", "BGOUTER", "MINBGFIB", "SMOOTHBG", "SMOOTHV", "CATALOG"):
+                    "BGINNER", "BGOUTER", "MINBGFIB", "SMOOTHBG", "SMOOTHV",
+                    "CATALOG", "BGRAW", "NOBG", "BGVARN"):
             va, vb = a.header.get(key), b.header.get(key)
             if va is not None and vb is not None and va != vb:
                 print(f"WARNING: combining fields with different {key}: "
                       f"{va!r} (first) vs {vb!r} (second).")
 
     from astropy.table import vstack
-    bg = None
-    if a.background is not None and b.background is not None:
-        bg = np.concatenate([a.background, b.background], axis=0)
+    extras = {}
+    for name in _OPTIONAL_GALAXY_ARRAYS:
+        va, vb = getattr(a, name), getattr(b, name)
+        if va is not None and vb is not None:
+            extras[name] = np.concatenate([va, vb], axis=0)
+        elif va is not None or vb is not None:
+            # Half-present is not concatenatable, and silently keeping the one
+            # that exists would misalign it against the merged galaxy axis.
+            print(f"WARNING: '{name}' present in only one field -- dropped from "
+                  f"the combined product. Re-extract the other field with the "
+                  f"matching store_* flag if you need it.")
+            extras[name] = None
+        else:
+            extras[name] = None
+
     return GalaxyProduct(
         spec=np.concatenate([a.spec, b.spec], axis=0),
         err=np.concatenate([a.err, b.err], axis=0),
@@ -271,7 +370,7 @@ def _concat_products(a: GalaxyProduct, b: GalaxyProduct) -> GalaxyProduct:
         r_edges=a.r_edges,
         catalog=vstack([a.catalog, b.catalog]),
         header=a.header,
-        background=bg,
+        **extras,
     )
 
 
@@ -344,7 +443,12 @@ def apply_finite_cut(product: GalaxyProduct, cut_radial_bin: int,
         print(f"Finite-spectrum cut (bin {b}, > {min_good_wave} px): "
               f"kept {int(sel.sum())} / {len(sel)} galaxies")
 
-    bg = product.background[sel] if product.background is not None else None
+    # Every optional galaxy-axis array must be sliced by the SAME mask, or it
+    # silently misaligns against the kept galaxies (or vanishes entirely, which
+    # is what this function used to do to the 2.5 background products).
+    extras = {name: (None if getattr(product, name) is None
+                     else getattr(product, name)[sel])
+              for name in _OPTIONAL_GALAXY_ARRAYS}
     return GalaxyProduct(
         spec=product.spec[sel],
         err=product.err[sel],
@@ -353,5 +457,5 @@ def apply_finite_cut(product: GalaxyProduct, cut_radial_bin: int,
         r_edges=product.r_edges,
         catalog=product.catalog[sel],
         header=product.header,
-        background=bg,
+        **extras,
     )

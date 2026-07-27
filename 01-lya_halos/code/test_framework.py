@@ -275,6 +275,109 @@ def test_galaxy_slicing_split(tmpdir):
           f"bit-identical, {len(got)} cache files")
 
 
+def test_background_variants(tmpdir):
+    """
+    THE 2.5 invariant: measuring extra background annuli, and storing the raw
+    ones, must not move a single science number.
+
+    Four things can break, and every one of them is silent:
+      1. adding the config fields changes extract_signature at their DEFAULTS
+         -> every existing cache is orphaned (this went in while a 8.5 hr
+         fine-grid extraction was running, so it was not hypothetical)
+      2. the variant loop perturbs the fiducial path -> Spec/Background move
+         and nothing says so
+      3. SPEC_NOBG is stored but is not actually re-subtractable -> every
+         background variant computed in Stage 2 is quietly wrong
+      4. a variant run silently shares a cache directory with a plain run
+    """
+    from dataclasses import replace as _replace
+    from utils_lya_halo import extract, background
+
+    rng = np.random.default_rng(11)
+    ngal, nexp, nfib, nwave = 6, 2, 3000, 24
+    vdfi = dict(
+        RA=150.0 + rng.normal(0, 0.03, (nexp, nfib)),
+        DEC=2.0 + rng.normal(0, 0.03, (nexp, nfib)),
+        spectra=(rng.normal(0, 1, (nexp, nfib, nwave)) + 5.0).astype("f4"),
+        error=np.abs(rng.normal(1, 0.1, (nexp, nfib, nwave))).astype("f4"),
+        wave=np.linspace(3470, 5540, nwave),
+    )
+    tbl = Table({"RA": 150.0 + rng.normal(0, 0.02, ngal),
+                 "DEC": 2.0 + rng.normal(0, 0.02, ngal),
+                 "z": rng.uniform(2.0, 2.6, ngal),
+                 "MASS_50": rng.uniform(9.5, 10.5, ngal),
+                 "ID": np.arange(ngal)})
+    bad = np.zeros((nexp, nfib), bool)
+    cfg = PipelineConfig(field="AEGIS", catalog="MOSDEF", output_dir=tmpdir,
+                         bins=[0, 50, 200, 1000], bin_mode="kpc",
+                         mask_method="none", nwave=nwave, wave_min=3470,
+                         wave_max=5540, min_bg_fibers=9999999)
+
+    # (1) DEFAULTS MUST NOT MOVE THE HASH. The reason the fields are omitted
+    # from extract_signature_dict when unset rather than merely defaulted.
+    sig, name = cfg.extract_signature(), cfg.descriptive_filename()
+    for knob in ({"bg_variants": None}, {"store_raw_bg": False},
+                 {"store_spec_nobg": False}, {"store_bg_halves": False}):
+        v = _replace(cfg, **knob)
+        assert v.extract_signature() == sig, f"{knob} moved the signature"
+        assert v.descriptive_filename() == name, f"{knob} moved the FITS name"
+
+    cfg_v = _replace(cfg, bg_variants=((80., 90.), (120., 150.)),
+                     store_raw_bg=True, store_spec_nobg=True, store_bg_halves=True)
+    # (4) ...but a run that DOES store them must be isolated from one that doesn't
+    assert cfg_v.extract_signature() != sig
+    assert cfg_v.resolved_run_cache_dir() != cfg.resolved_run_cache_dir()
+
+    # variant 0 is the fiducial, always -- reordering must be rejected outright
+    try:
+        _replace(cfg, bg_variants=((120., 150.), (80., 90.))).resolved_bg_variants()
+        raise AssertionError("bg_variants[0] != fiducial was not rejected")
+    except ValueError:
+        pass
+    # SPEC_NOBG is only exact while every exposure shares one background
+    try:
+        extract.extract_fibers(_replace(cfg_v, min_bg_fibers=10), vdfi, tbl, bad,
+                               use_cache=False)
+        raise AssertionError("min_bg_fibers guard did not fire")
+    except ValueError:
+        pass
+
+    # (2) BIT-IDENTICAL SCIENCE. Two extra annuli measured, nothing moved.
+    ref = extract.extract_fibers(cfg, vdfi, tbl, bad, use_cache=False)
+    var = extract.extract_fibers(cfg_v, vdfi, tbl, bad, use_cache=False,
+                                 return_extras=True)
+    for nm, a, b in zip(("spec", "err", "nfib", "bg", "vr"), ref, var):
+        assert np.array_equal(a, b, equal_nan=True), f"{nm} moved when variants were added"
+
+    ex = var[5]
+    assert ex["bg_raw"].shape == (ngal, 2, nwave)
+    assert ex["bg_halves"].shape == (ngal, 2, 2, nwave)
+    assert np.array_equal(ex["bg_half_nfib"].sum(axis=2), ex["bg_nfib"])
+    # the raw background must NOT equal the stored (post-mask, post-smooth) one,
+    # or store_raw_bg is writing the wrong array and 1.1's test is impossible
+    assert not np.allclose(ex["bg_raw"][:, 0, :], var[3], equal_nan=True)
+
+    # (3) THE RECONSTRUCTION IDENTITY, through a real FITS round trip.
+    path = os.path.join(tmpdir, "bgvar.fits")
+    write_galaxy_fits(path, spec=var[0], err=var[1], nfib=var[2], wave=vdfi["wave"],
+                      r_edges=np.asarray(cfg_v.bins, float), catalog=tbl,
+                      config=cfg_v, source_id="synthetic", background=var[3],
+                      extras=ex, overwrite=True)
+    p = read_galaxy_fits(path)
+    assert p.bg_annuli == [(80., 90.), (120., 150.)]
+    assert p.header["SPECBGSU"] == 0        # which variant SPEC had subtracted
+    res = background.verify_reconstruction(p, cfg_v, verbose=False)
+    assert res["ok"], (f"SPEC_NOBG - smooth(mask(BG_VARIANTS[0])) != SPEC: "
+                       f"max|diff| {res['max_abs_diff']:.3e} > tol {res['tol']:.3e}")
+    # and a different annulus must actually give a different answer
+    assert not np.allclose(background.reconstruct_spec(p, cfg_v, variant=1),
+                           p.spec, equal_nan=True, rtol=1e-6)
+
+    print(f"[5] background variants OK: defaults leave signature {sig} intact, "
+          f"2 annuli measured with science bit-identical, "
+          f"reconstruction exact to {res['max_abs_diff']:.1e}")
+
+
 def test_guide_in_sync():
     """The field guide must not drift: every entry resolves to a live function."""
     from utils_lya_halo import check_guide
@@ -296,6 +399,7 @@ def main():
         test_fits_roundtrip(tmp)
         test_stack_measure_flow(tmp)
         test_galaxy_slicing_split(tmp)
+        test_background_variants(tmp)
         test_guide_in_sync()
     print("\nALL SMOKE CHECKS PASSED")
 
