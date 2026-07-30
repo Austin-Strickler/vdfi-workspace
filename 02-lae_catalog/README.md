@@ -1,4 +1,4 @@
-# 03 - LAE Catalog
+# 02 - LAE Catalog
 
 **Status:** scaffolded, not yet started.
 

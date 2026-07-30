@@ -301,7 +301,8 @@ def radial_bin_edges(config: "PipelineConfig", mass: float, z: float) -> np.ndar
     mode = config.bin_mode.lower()
     bins = np.asarray(config.bins, dtype=float)
     if mode in ("virial", "vr"):
-        return virial_to_kpc_bins(bins, mass, z)
+        return virial_to_kpc_bins(bins, mass, z,
+                                  model=getattr(config, "smhm_model", "girelli20"))
     if mode in ("kpc", "arcsec"):
         return bins
     raise ValueError("bin_mode must be 'virial', 'kpc', or 'arcsec'")

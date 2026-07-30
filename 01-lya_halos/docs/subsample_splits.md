@@ -4,7 +4,23 @@ Candidate subsample splits for the stacked Lyα halo measurement, with the physi
 
 Splitting the stack loses statistical power (roughly √N per split), so each candidate here earns its place by testing a specific kinematic prediction or isolating a physical mechanism a full-sample stack would wash out.
 
-**Paper assignment.** Paper 1 (`01-lya_halos`) takes the splits with a clear kinematic prediction, prioritized toward whichever are most likely to yield a detectable signal — this is the discovery paper. Paper 2 (`02-lya_escape`) takes the splits that are fundamentally about flux curves and total photon budget rather than kinematics.
+> ## ⚠️ The paper labels in this file are STALE — 2026-07-30
+>
+> This file still uses the **old two-paper scheme** (kinematic splits → "Paper 1", flux/budget splits
+> → "Paper 2 = `02-lya_escape`"). Both parts of that are now wrong:
+>
+> - **`02-lya_escape` no longer exists.** It was retired; all work is in `01-lya_halos`.
+> - **Under the current provisional structure** (`GOALS.md`), this entire split program is
+>   **Paper II**, organized around one thesis: *the one-halo term tracks the galaxy, the two-halo
+>   term tracks the environment.* Paper I is the virial-radius transition; Paper III is the
+>   geometry–throughput / escape work.
+>
+> **The split list, physical motivations, and directional predictions below are all still good** —
+> only the paper assignment headers are stale. Reconciling them is a known open task
+> (`GOALS.md` §8 item 4); it has deliberately not been done here, because the assignment should be
+> made once against the full split list rather than piecemeal.
+
+**Paper assignment (original text, superseded — see the box above).** Paper 1 (`01-lya_halos`) takes the splits with a clear kinematic prediction, prioritized toward whichever are most likely to yield a detectable signal — this is the discovery paper. Paper 2 takes the splits that are fundamentally about flux curves and total photon budget rather than kinematics.
 
 ---
 
@@ -86,7 +102,7 @@ Splitting the stack loses statistical power (roughly √N per split), so each ca
 
 ---
 
-## Paper 2 (`02-lya_escape`) — flux / photon budget
+## Paper 2 (label stale — see box at top) — flux / photon budget
 
 ### 12. Hβ-normalized escape fraction
 
@@ -114,8 +130,52 @@ Splitting the stack loses statistical power (roughly √N per split), so each ca
 
 ---
 
+---
+
+## 15. LIS-line outflow velocity — [NEW 2026-07-29, reassigned]
+
+- Stacked low-ionization interstellar absorption (Si II 1260, O I + Si II 1303, C II 1334,
+  Si II 1526, Fe II 1608, Al II 1670) gives a direct outflow velocity per subsample
+- **Arrived here by demotion, not by design.** It was proposed as a wavelength-calibration
+  test; it fails at that because LIS lines carry an intrinsic outflow blueshift of
+  ~150–200 km s⁻¹ (Shapley+2003, Steidel+2010) — *larger* than the ~85 km s⁻¹ systematic
+  being searched for, with no independent handle on it. See
+  `../specs/wavelength-zero-point.md` §6
+- As physics it is worth having: a real constraint on the scattering medium, and a
+  literature comparison against Steidel 2010 on a sample with **independent systemic
+  redshifts** — which no prior LIS measurement at these redshifts has had
+- Prediction: outflow velocity should correlate with Lyα peak asymmetry and, if the halo
+  is scattered core light, with halo extent. Decoupling would favour in-situ emission
+- Cost: continuum absorption on H≈24.5–25 galaxies at R~750 — deep stack required, lines
+  are shallow and partly blended. Check achievable S/N before scoping
+
+---
+
+## Cross-cutting constraints on this whole list — [added 2026-07-29]
+
+Before running any of the above, see `../../docs/workstream-roadmap.md` §3.3:
+
+- **Power.** N≈452 after AGN cuts; full-stack outer-bin S/N is 6 / 5 / 2.8. A two-way split
+  gives 4.2 / 3.5 / **2.0**; a three-way gives 3.5 / 2.9 / **1.6**. **No split supports a
+  >2σ outermost-bin claim with current data.** Run splits now for inner/one-halo/core
+  quantities; defer every two-halo claim to the incoming ~2× data.
+- **Multiple comparisons.** ~14 splits × several derived quantities = 40–70 tests. Declare
+  confirmatory vs. exploratory splits *before* running the batch.
+- **Sample composition.** Splits requiring the core spectrum (#3, #7, #9, #12, #13, #14, #15)
+  drop galaxies with halo-but-no-core coverage. Those splits therefore run on a different
+  sample than the catalog-only splits, so cross-split comparisons need the common
+  intersection sample.
+- **#12 is partly circular with an L_Lyα split** (f_esc ∝ L_Lyα / L_Hα,corr). Control for
+  L_Hα and say so.
+- **#14 must not become a per-galaxy fit.** Per-object outer-bin S/N is ~0.13, and splitting
+  on a noisy fitted scale length then measuring scale length is circular (regression to the
+  mean). Sort by a cleanly measured property, stack in 4–5 groups, fit h1 per group.
+
+---
+
 ## See also
 
+- `../../docs/workstream-roadmap.md` — **[NEW 2026-07-29]** §3 specifies the three-layer split pipeline (split catalog → declarative split spec → runner) this list feeds, plus the power and pre-registration constraints above
 - `GOALS.md` — the broader (less detailed) subsample-split candidate list this doc expands on
 - `TODO.md` (workspace root) — subsample splits and their physical predictions in the literature is tracked there as the top-priority open item
 - `../specs/subsample-derived-properties.md` — turns each split's comparison plot into a row of derived numbers (core/halo flux, core/halo velocity) collected into one paper-ready table, not just a figure

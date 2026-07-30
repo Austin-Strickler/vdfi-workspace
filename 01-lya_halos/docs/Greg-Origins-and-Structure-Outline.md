@@ -1,10 +1,31 @@
-# Paper 2 — The Origins & Structure of Lyα Halos
+# The Origins & Structure of Lyα Halos — working outline
+
+> **Status header (2026-07-30 — read this before the rest).**
+> This file was originally written as "Paper 2." **It is no longer Paper II.** Under the
+> current provisional structure (see `GOALS.md`) the splits program is Paper II, and the
+> contents below — escape fraction, the core↔halo fork, the two-halo term, environment,
+> and RT forward-fitting — are the **Paper III** material. It is retitled and kept as a
+> manuscript skeleton rather than merged, because it is the *observational* companion to
+> `Greg-Initial-Driving-Model.md`, which supplies the physical framework for the same paper.
+>
+> **Division of labour between the two Greg docs:**
+> `Greg-Initial-Driving-Model.md` = the physical model and the measurement definitions
+> (engine/valve/distributor/ecosystem; R_comp, HF, r_halo, absolute f_esc).
+> This file = the manuscript structure and the observational fork (does halo flux track
+> core flux, or decouple from it?).
+>
+> **The RT / Byrohl forward-fitting thread in §3 and §4 is no longer assigned to a paper.**
+> It is tracked as its own collaboration workstream (`docs/workstream-roadmap.md` §2), which
+> takes the deliberate position that we should *not* build an RT model ourselves.
+>
+> The paper count is provisional and may collapse to two. Nothing below should be read as
+> a locked scope.
 
 ## Working outline · Intro → Data → Methods → Results → Discussion
 
-*Intentionally lighter and less defined than Paper 1. Same manuscript skeleton, fewer
-locked decisions. This paper inherits Paper 1's pipeline and phenomenology and turns to
-the question Paper 1 deliberately left open: **where does the halo light come from?***
+*Intentionally lighter and less defined than Paper I. Same manuscript skeleton, fewer
+locked decisions. This paper inherits Paper I's pipeline and phenomenology and turns to
+the question Paper I deliberately left open: **where does the halo light come from?***
 
 **Working title (placeholder):** *The Origins and Structure of Lyα Halos: Escape,
 Spatial Profiles, and Environment*

@@ -21,14 +21,25 @@ Tracked in `TODO.md` under Pipeline ("Revisit the virial-radius conversions").
 
 ## SMHM values and methods
 
-Placeholder — no findings logged yet.
+**RESOLVED 2026-07-27 — pipeline default switched to Girelli+2020.** Relevant code: all three stellar-mass↔halo-mass relations (`moster13` legacy, `girelli20` default, `behroozi19`) plus the comparison tools (`compare_smhm`, `rvir_divergence_table`, `plot_smhm_models`, `plot_rvir_vs_mstar`) now live in `virial.py` directly — `smhm_models.py`/`smhm_compare.py` were merged into a standalone `smhm.py` earlier the same day, which was then merged into `virial.py` once Girelli+2020 became the actual pipeline default rather than a side comparison. Model choice is `PipelineConfig.smhm_model` (default `"girelli20"`), cache-signature- and provenance-tracked.
 
-Relevant code: `smhm_models.py` implements three stellar-mass↔halo-mass relations — `moster13` (current pipeline default), `girelli20` (Girelli+2020, COSMOS-calibrated, z≤4), `behroozi19` (Behroozi+2019 UniverseMachine DR1, note it's Mpeak/Bryan-Norman virial mass, not instantaneous M200c — a real convention mismatch to watch for). `smhm_compare.py` already has `compare_smhm` (per-galaxy logMhalo/R200c across all three models) and `rvir_divergence_table` (grid of logMstar → % R200c difference vs. a reference model) built to quantify exactly this. Open question: has `rvir_divergence_table` actually been run and inspected, and if so, at what stellar masses/redshifts does the choice of SMHM relation change R200c (and hence the R/Rvir bin edges) enough to matter for the centroid-vs-radius result?
+Tracked in `TODO.md` under Pipeline (was "Confirm the Moster+2013 SMHM mapping is still the right call", now closed with a re-run follow-up).
 
-Tracked in `TODO.md` under Pipeline ("Confirm the Moster+2013 SMHM mapping is still the right call").
+### 2026-07-27
 
-### YYYY-MM-DD
-- *(add findings here)*
+Ran `rvir_divergence_table` over logM* = 9.0–11.0 (step 0.5) at z=2.3 and z=3.0 (the project's MOSDEF z~2/z~3 bins), `ref='moster13'`. Findings:
+
+- **girelli20 vs moster13**: R200c consistently *smaller*, by −4% (logM*=9.0) widening to −27% (logM*=11.0) at z=2.3; similar shape at z=3.0. Diverges most at the high-mass end.
+- **behroozi19 vs moster13**: R200c consistently *larger* at these masses, +12% at logM*=9.0 shrinking to +6% at logM*=10.5 (z=2.3); no median-relation solution (NaN) above ~logM*=10.5–11 at either z — the known high-z turnover (already noted in `GOALS.md`).
+- **Sanity check**: `smhm.py`'s `moster13` column reproduces `virial.py`'s production `mhalo_from_mstar_moster13` bit-for-bit at every grid point tested — the merge introduced no regression.
+- **Mass-definition caveat, quantified**: `behroozi19`'s naive M200c treatment in `smhm.py` (Mpeak run straight through `R200c_from_M200c`) vs. the proper Mvir→M200c conversion (Diemer & Joyce 2019 concentration-mass via colossus) in `tests/mstar_to_rvir.py` differ by only **+1.7 to +1.9%** in R200c across logM*=9.0–10.5 at both z. The mismatch is real in principle but numerically small in this halo-mass/z regime — if `behroozi19` is adopted, `mstar_to_rvir.py`'s conversion is still the one to wire into the pipeline (it's the mass-definition-correct version), but the naive column here isn't badly wrong for this sample.
+- **Literature (what the field actually does)**: Guo et al. 2024 (A&A 691, A66, Yucheng Guo et al., MXDF) estimate r_vir via **Girelli+2020**, cross-checked against the Garel+2015 r_vir–UV-magnitude semi-analytic relation (~20 vs ~23 kpc for their sample — consistent). Lujan Niemeyer et al. 2022 (arXiv:2207.11098, "Lyα Halos around [OIII]-Selected Galaxies in HETDEX" — this is VDFI's actual external centroid-method check, LN22 in the text) estimate r_vir via **Behroozi+2019**, taken directly under the **Bryan & Norman (1998) virial** definition — they do *not* convert to M200c. For their [O III] sample (logM* 8.8–9.9, 68% of the sample) they get rvir ≈ 59–105 kpc.
+- **Flag for the crossover-radius claim**: the headline "≈76 kpc measured crossover vs. 75 kpc independently-derived R_vir" coincidence (`GOALS.md` item 2) uses Moster+2013. A 6–12% R_vir shift from switching to Behroozi+2019 (the same relation the project's own external-check paper, LN22, uses) is ≈4.5–9 kpc at R_vir≈75 kpc — comparable to or larger than the ~1 kpc gap the coincidence rests on. This doesn't mean the transition result is wrong, but the "75 kpc" number should be reported with which SMHM relation and stellar mass it assumes, and the crossover-vs-Rvir comparison probably needs a systematic-uncertainty band from SMHM choice alongside the fit-parameter uncertainty already tracked.
+- **Still open**: Moster+2013's own halo-mass convention (M200c vs. M200-mean) hasn't been independently re-verified against the original paper — flagged inline in `virial.py`'s module docstring, not yet resolved.
+
+**Decision (same day, after running the divergence table on the real run_table, AGN excluded)**: girelli20 median R_vir = 71.3 kpc [16,84]=[56.9,87.3], 0 turnover failures; moster13 median = 77.1 kpc [58.7,97.6], 0 failures; behroozi19 median = 82.8 kpc [63.3,101.5], **14 galaxies with no median-relation solution** even after the AGN cut (was 34 before — AGN-inflated stellar mass estimates were pushing galaxies past the turnover, consistent with the existing AGN-excluded R_vir convention). Chose **girelli20 as the new pipeline default**: full coverage across the sample's mass range, M200c-native (no mass-definition conversion assumption, unlike behroozi19), and matches Guo et al. 2024's choice for the same kind of measurement. Explicitly did NOT choose based on which relation lands closest to the 75 kpc crossover-coincidence number — that would be picking the answer after seeing it. The crossover-vs-R_vir comparison should report the ±8-12% SMHM-choice spread as a stated systematic rather than a bare 75 kpc.
+
+Implemented 2026-07-27: `PipelineConfig.smhm_model` (default `"girelli20"`), `smhm.py` merged into `virial.py`, all call sites (`extract.py`, `single.py`, `stack.py`) updated, cache signature/provenance/FITS header all track the choice. See `CHANGELOG.md` 2026-07-27 for the full file list. Follow-up (`TODO.md`): re-run everything downstream so figures/tables reflect the new default rather than a stale Moster+2013 cache.
 
 ---
 
@@ -223,6 +234,103 @@ Full function-level diff: `CHANGELOG.md` (2026-07-21).
 **Follow-up, same day: `fitting.py`/`uv_profile.py` registered in `guide.py`, two investigative functions retired.** The pipeline audit above (in the prior chat turn) flagged that `fitting.py` (the PSF/profile-fitting engine) and `uv_profile.py` (the UV-continuum pipeline) had zero entries in `guide.py`'s front-end registry — and since `check_guide()` only scans modules that already have at least one entry, neither file was ever covered by the drift check at all. Added a `fitting` section (47 entries: PSF & convolution, Two-exponential fit, Expcore fit, Model comparison & boundary, UV-continuum fit) and a `uv_continuum` section (27 entries: Field & catalog I/O, Per-galaxy extraction, Coadd & fit, Stellar PSF) to `guide.py`. `check_guide()` now reports clean across all 8 sections.
 
 At the same time, removed `diagnose_crossover_failures`/`summarize_diagnosed_params` from `fitting.py` — both were one-off diagnostic tooling built specifically for the r_c/amplitude-ordering investigation above, and Austin asked for them to be dropped now that the investigation is closed and its fix has shipped as the pipeline standard. Confirmed no other code called them; the removal is noted in-line in `fitting.py` and in `CHANGELOG.md`, with this section remaining the full historical write-up of what they found.
+
+---
+
+## HST-Hyperion grism catalog: evaluation, redshift calibration, and the protosupercluster sample
+
+**Source:** Forrest et al. 2025, ApJ 985, 61 ([arXiv:2503.04884](https://arxiv.org/abs/2503.04884)); public data release at [MAST HLSP HST-HYPERION](https://archive.stsci.edu/hlsp/hst-hyperion), DOI 10.17909/5kka-ms10.
+
+### 2026-07-28 — what the survey is, and the verdict on using it to grow the galaxy sample
+
+**VERDICT: not adopted as a 3D-HST/MOSDEF catalog augmentation. Adopted (provisionally) as a protosupercluster environment sample — see the next sub-entry.**
+
+**What it actually is.** 50 orbits of WFC3/F160W + G141 over 25 new pointings targeting the Hyperion protosupercluster (z~2.45) in COSMOS, *plus* a from-scratch `grizli` v1.9.5 re-reduction of the adjacent 3D-HST COSMOS G141 data, fit jointly against COSMOS2020 CLASSIC photometry. **COSMOS only — nothing for EGS.** So the honest framing is "3D-HST COSMOS v2, with ~2× the area," not "a new field to bolt on." Selection is *not* [O III]-selected: it is magnitude-limited (all sources with m_HST ≤ 25 in the F140W+F160W mosaic get a spectrum). The [O III] selection we associate with 3D-HST is Bowman et al. 2019's cut *applied to* 3D-HST, and is the parent of Lujan Niemeyer 2022's sample.
+
+**Line coverage vs. our redshift range.** G141 usable range 1.10–1.65 µm; VIRUS Lyα window 3500–5500 Å → 1.879 < z < 3.524.
+
+| Line | in G141 at | overlaps our Lyα range? |
+|---|---|---|
+| Hα 6563 | 0.68 < z < 1.51 | **never** |
+| [O III] 5007 | 1.20 < z < 2.30 | 1.88 – 2.30 |
+| Hβ 4861 | 1.26 < z < 2.39 | 1.88 – 2.39 |
+| [O II] 3727 | 1.95 < z < 3.43 | 1.95 – 3.43 |
+
+Consequences: **no Hα anywhere in our range** (no Balmer decrement, no line-based dust correction); z > 2.4 rests on a single, weak, unresolved-doublet [O II] feature; 1.95 < z < 2.30 is the only window where O32 is available.
+
+**Why it was rejected as an augmentation.** Bowman+2019 is the comparison, and it wins on every axis: deeper in continuum (m_JH < 26 vs. m_HST ≤ 25), 759 galaxies across *both* AEGIS (470) and COSMOS (289) rather than COSMOS-only, and it carries the full derived-property set (`stmass`, SFR at four timescales with percentiles, `E(B-V)`, `Log Z`, β, sizes, O32, R23) that HST-Hyperion does not release. Chained through footprint and quality cuts, the genuinely-new usable increment is **~15–30 galaxies** against a base of ~500 MOSDEF + ~110 strong-line Bowman — a 2–3% error-bar improvement, in exchange for a bespoke reader, a doublet-convention fix, a missing SED catalog, and a mass zero-point reconciliation. Not a good trade.
+
+**Catalog mechanics (recorded so we don't rediscover them):**
+
+- **The release columns are not the paper's Table 2.** Delivered: `RA DEC mag ID_C20 bf zp_lp zp_ez ID_g zg qf_g qf_gz spec_com` (12). **Missing: `zg_16`, `zg_84` (the p(z) percentiles — the *only* per-object redshift uncertainty), `zs`, `qf_s`.** Added: `bf` (blending flag). Without `zg_16/84` there is no per-galaxy velocity error to propagate — only a global σ_NMAD. Worth an email to Ben Forrest (bforrest@ucdavis.edu) asking for the percentiles.
+- **No stellar-population catalog in MAST v1.0**, despite §4.3 promising one ("stellar mass, star-formation rate, and stellar age... in a separate, line-matched catalog"). Fallback if ever needed: `ID_C20` → COSMOS2020 CLASSIC, and where `|z_phot − z_grism|/(1+z) < 0.05` the published `lp_mass` is good to ~0.05 dex without refitting.
+- **z-cat has 12812 rows, el-cat has 12814. They are NOT line-matched as delivered — join on `ID_g`.**
+- **Both files break standard ASCII readers.** The column-name line lives inside the leading `#` block, and z-cat's trailing `spec_com` is free text containing spaces, so the per-row token count varies (11–16). Fix: split each row with `maxsplit = n_cols − 1` so the remainder lands in the comment column. Numeric coercion needs an explicit null-token list; several el-cat flux columns otherwise stay `str`.
+- **`F_OIII` is the [O III] 4959+5007 doublet** (grizli convention), while Bowman's `OIII_FLUX` is 5007 alone. Measured `F_OIII / OIII_FLUX = 1.47`, decomposing as 1.335 (doublet/5007) × 1.12 (the paper's own +0.05 dex reduction offset vs. 3D-HST) = 1.50. Fluxes are in **raw cgs**, not 10⁻¹⁷. **This means Hyperion O32 and Bowman O32 differ by 0.125 dex — do not pool raw.**
+- **`ID_g` prefixes (`hyperion_peak1`, `peak2n3n7`, `peak4n5n6`, `peak4extra`) are mosaic-region names, not survey names.** The re-reduced 3D-HST pointings were merged into the `peak1` mosaic (all 65 Bowman cross-matches land there, none elsewhere). To separate footprints, use a convex hull of Bowman's COSMOS positions, not the ID string.
+- **`spec_com` is more informative than `qf_gz` for our purposes** — it names *which feature* produced the redshift, and `wide_` (feature broader than the LSF, ~>100 Å) is an explicit **type-1 AGN flag**, which is a free spectroscopic AGN rejection given our AGN-excluded R_vir = 75 kpc convention. `co` ("contamination offset from window") is benign — do not cut on it.
+
+**Footprint accounting, qf_gz ≥ 4, inside the Lyα window (N = 208):** 65 already in Bowman · ~61 inside the 3D-HST footprint but rejected by Bowman's vetting · **82 genuinely new sky**. At qf_gz = 5 (N = 83): 35 / 15 / 33.
+
+**Quality-flag calibration from the paper** (fraction within |Δz|/(1+z) < 0.004 vs. ground-based spec-z): qf=5 → 93.2%, qf=4 → 80.6%, qf=3 → **67.4%**. Catalog shares for qf 0–5: 6.19 / 8.67 / 41.21 / 31.49 / 7.34 / 5.10%. Note the flag system is *anti-correlated* with our redshift range — qf=5 effectively means "Hα in band," i.e. z < 1.5 — so the published calibration is dominated by z < 1.5 and does not transfer to z ~ 2.
+
+### 2026-07-28 — grism redshift precision against MOSDEF systemic redshifts (**the real result of this investigation**)
+
+Cross-matched Bowman+2019 and the HST-Hyperion qf≥4 sample against the MOSDEF catalog (1″ radius) and measured Δz/(1+z) directly. **This is the first direct calibration of grism-redshift precision against true rest-optical systemic redshifts at cosmic noon that we have, and it decides the Bowman question (759 galaxies), not just the Hyperion one.**
+
+| sample / cut | N | median | σ_NMAD | at Lyα |
+|---|---|---|---|---|
+| Bowman × MOSDEF, all | 81 | +86 km/s | **391 km/s** | 5.0 Å |
+| ... [O III] S/N > 5 | 63 | +62 | 315 | 4.1 Å |
+| ... S/N > 10 | 38 | +61 | 315 | 4.1 Å |
+| ... S/N > 20 | 14 | +85 | **128** | **1.7 Å** |
+| ... OIII_EW < 100 Å | 31 | +133 | 571 | 7.4 Å |
+| ... EW 100–250 Å | 39 | +60 | 366 | 4.7 Å |
+| ... EW 250–500 Å | 8 | +68 | **107** | **1.4 Å** |
+| ... z 2.0–2.1 | 10 | +33 | 340 | 4.3 Å |
+| ... z 2.1–2.2 | 35 | +86 | 310 | 4.0 Å |
+| ... z 2.2–2.35 | 35 | +97 | **485** | 6.4 Å |
+| HST-Hyperion × MOSDEF, qf≥4 | 18 | +45 | 456 | 5.9 Å |
+
+Also measured Hyperion × Bowman (same objects, both grism): σ = 330 km/s, +28 km/s. That comparison shares G141 photons, so it measures only reduction/photometry differences and is a **floor**, not the error — which is exactly why the MOSDEF comparison was needed.
+
+**Interpretation.**
+
+1. **The scatter is a line-strength effect, not a floor.** Strong-line objects reach ~110–130 km/s — within a factor of two of MOSDEF's ~60 km/s, and 1.4–1.7 Å at Lyα, comfortably inside our ±4 Å measurement window with **no window widening needed**. Weak-line objects (EW < 100 Å) are at 571 km/s and are unusable.
+2. **The z 2.2–2.35 degradation is [O III] λ5007 hitting the red edge of G141** (it exits at z = 2.295), where throughput falls and the wavelength solution is least constrained. A `z < 2.2` cut is cheaper in galaxies than an S/N cut for similar benefit.
+3. **The +86 km/s median offset is small and correctable** — its uncertainty is ~1.25σ/√N ≈ 54 km/s, so it is only ~1.6σ from zero. Same sign as the paper's uncorrected +210 km/s against ground-based [O II], consistent with a G141 wavelength zero-point. Residual after correction ≈ 0.7 Å.
+4. **The whole-sample merge fails on arithmetic, and this is the reasoning to keep.** At 391 km/s (5.0 Å) against a ±4 Å window, ~35% of the line flux falls outside the aperture — and because the lost fraction depends on the local line width, which varies with radius, it is a **radius-dependent shape bias on h1 and the crossover radius**, not just noise. Widening to ±15 Å restores flux conservation but costs √(30/8) = 1.94× more background noise, against a √(1050/500) = 1.45× sample gain — **net 1.34× worse**, and the penalty lands squarely on the correlated outer-bin background noise that is already the program's #1 blocker.
+5. **Therefore: if Bowman is used at all, use it strong-line-selected** (`OIII_EW > 250` or S/N > 20) **and `z < 2.2`**, at the existing ±4 Å window — ~110 galaxies, ~+10% precision, no bias and no noise penalty. **But state the confound:** a high-EW cut selects low-mass, high-sSFR, low-metallicity galaxies, so that arm is an extreme-emission-line population, not a random extension of MOSDEF. It is a good **split** ("EELGs vs. normal SFGs") and a bad **filler** for the mean profile. Tier it — MOSDEF-only for anything velocity-referenced, Bowman normalized and *compared*, never co-added into the fiducial stack.
+6. **These numbers belong in the Methods section** regardless of what we do with the catalogs. They are the quantitative justification for why VDFI's MOSDEF anchoring matters — every competitor (Niemeyer 2022, Davis 2023, McKay 2026, Cooper 2026) is working without it, and this table says what that costs.
+
+### 2026-07-28 — the protosupercluster sample (the one thing worth extracting)
+
+**Why this and not the catalog merge.** The two-halo interpretation rests on Byrohl 2021 — photons originating in *other* halos — which predicts the two-halo term scales with environment. A median-density split on Chartab+2020 is a weak version of that test; a stack on a spectroscopically confirmed protosupercluster is the extreme end of the axis, and nothing else in our data provides it. This is core measurement #3 territory, approached from the opposite end.
+
+**The sample, reproduced against the paper.** `qf_gz ≥ 3` and `2.35 < zg < 2.65`, no other cuts → **196 galaxies**, against the paper's §7 figure of 196 (Fig. 18's caption says 192; the paper is mildly inconsistent with itself). Exact agreement validates the catalog parsing end-to-end. Flag breakdown: qf 3 / 4 / 5 = 166 / 24 / 6.
+
+Assigning to the seven Cucciati+2018 ≥5σ peaks (Forrest+2025 Table 4 centres, 3′ radius, |Δz| < 0.025 — **our parameters, not the paper's**): Selene 11, peak5 11, Theia 9, Eos 7, Helios 6, peak7 2, peak6 2 = **48 peak-associated, 148 'field'**. The 3′ aperture is almost certainly too small and too circular — Cucciati's overdensity contours are irregular and filamentary — so treat 48 as a lower bound and tune against Table 4's per-peak counts (which are the *combined* grism + ground-based census, so grism-only should come out lower).
+
+Note the paper's "125 confirmed members at 2.40 < z < 2.53" is that **combined** census, not 125 grism redshifts. Since the release dropped `zs`/`qf_s`, the ground-based half is not recoverable from these files — it would need Forrest+2024's C3VO compilation, which is not public.
+
+**Two properties that make this work despite qf≥3:**
+
+- **Outliers dilute rather than bias.** A 33% catastrophic-outlier rate at qf=3 scatters *field* galaxies into the structure sample, which weakens a two-halo enhancement rather than manufacturing one. Seeing enhancement despite that contamination is therefore a conservative result.
+- **The 148 'field' galaxies are an internal matched control** — same redshift range, same instrument, same selection, same sky, same reduction, just not in a peak. That is a far cleaner comparison than anything cross-field.
+
+Velocity-frame work is off the table here: at z ~ 2.5 the redshifts are [O II]-only. This is a **flux-profile measurement** (wide window, shape/amplitude of the two-halo term), not a centroid measurement.
+
+**Implementation plan (per Austin, 2026-07-28).** Manufacture a MOSDEF-shaped catalog rather than touching the pipeline: `field = 'COSMOS'`, `CATALOG = 'HYPERION'`, `z = zg`, `mass = np.nan`, and extract with `bin_mode = 'kpc'` so the virial machinery is never invoked. Then `combine_products` / `split_product_by` handle peak-vs-field as an ordinary categorical split.
+
+Blockers to clear first, in order:
+
+1. **Does VDFI cover the new pointings?** They span RA 149.79–150.35, Dec 2.05–2.50; our COSMOS field is ~0.25 deg². Peaks 4/5/6 sit at the eastern edge (RA ~150.23–150.33) and Peak 2 at the southern (Dec ~2.05–2.10). `plot_field_coverage` answers this in one call. **If coverage misses the eastern peaks this whole section is moot** — and note Selene + peak5 together are 22 of the 48 peak-associated galaxies, both at RA ~150.23–150.26.
+2. **Segmentation-mask coverage.** `mask_method='segmap'` uses a baked per-field mask; galaxies in the new pointings sit outside the CANDELS COSMOS strip. Confirm the mask actually covers them — undefined behaviour there means either no masking (bright-neighbour contamination) or everything masked.
+3. **`mass = np.nan` guard.** Verify Stage 1 doesn't compute R_vir unconditionally even under `bin_mode='kpc'`; `virial.py` clips log-mass to [7, 11] and NaN may not propagate cleanly.
+4. **Background annulus at the field edge.** The 80–90″ annulus will be truncated for galaxies near the coverage boundary — check fiber counts per galaxy before trusting per-galaxy backgrounds out there.
+5. **`id_col`.** `ID_g` is a string (`hyperion_peak1_00013`); MOSDEF's `ID` is likely integer. Check `select_core_by_id` / `plot_fiber_mask_appendix` tolerate it.
+
+**Not doing:** adding any of these galaxies to the MOSDEF or Bowman stacks. This is a standalone environment measurement with its own internal control.
 
 ---
 

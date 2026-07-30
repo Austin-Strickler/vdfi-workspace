@@ -14,11 +14,17 @@ Individually, each fiber spectrum is unremarkable (medium resolution, R~800), bu
 
 This shared dataset feeds multiple VDFI subprojects:
 
-- [`01-lya_halos`](../01-lya_halos/) — Lyα halo stacking (this doc's immediate context)
-- [`02-lya_escape`](../02-lya_escape/) — Lyα escape fraction, not yet started
-- [`03-lae_catalog`](../03-lae_catalog/) — LAE/AGN catalog construction, not yet started
+- [`01-lya_halos`](../01-lya_halos/) — Lyα halo stacking (this doc's immediate context), and the
+  umbrella for the whole science program: the virial-radius transition, the subsample splits, and
+  the escape-fraction / geometry–throughput work. See
+  [`01-lya_halos/docs/GOALS.md`](../01-lya_halos/docs/GOALS.md).
+- [`02-lae_catalog`](../02-lae_catalog/) — LAE/AGN catalog construction, not yet started
+
+> *(2026-07-30: the former `03-lya_escape` subproject was retired — escape work shares the `01`
+> pipeline entirely, so it now lives there. Note also that the `02`/`03` numbers were previously
+> swapped between this list and the actual directories; `02-lae_catalog` is correct.)*
 
 ## See also
 
-- `docs/papers/` — reference literature
+- `docs/literature/` — reference literature
 - `docs/VDFI Notes.txt` — running working notes (meeting notes, dated technical decisions)

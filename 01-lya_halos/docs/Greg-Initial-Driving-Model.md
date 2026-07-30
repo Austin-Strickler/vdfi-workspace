@@ -1,5 +1,35 @@
 # Project: Compact vs. Total Lyα Escape — A Geometry–Time–Environment Framework
 
+> **Status header (2026-07-30 — read this before the rest).**
+> This is the **physical framework for the provisional Paper III**, adopted 2026-07-30. It
+> replaces the earlier "photon budget" framing for that paper, which `three-paper-program.md`
+> §8 item 7 itself warned would read as an increment on Weiss et al. 2021. The thesis —
+> **redistribution, not loss** — is the sharper and more falsifiable version of the same idea,
+> and the absolute f_esc accounting survives inside it as the *throughput* half.
+> Its observational companion is `Greg-Origins-and-Structure-Outline.md`.
+>
+> **Two open feasibility questions gate the parts of this document that assume per-object
+> measurements. Neither is a documentation problem; both change what the paper is.**
+>
+> 1. **Per-object S/N.** Everything built so far is stacked. The data table below, and the
+>    hierarchical regressions of E2, assume one row per galaxy. At H ≲ 24.5 with ~2″ seeing,
+>    a core+halo decomposition in a *single* MOSDEF galaxy is very likely not achievable —
+>    Niemeyer 2022 and Weiss 2021 both stacked, on this population, for this reason.
+>    **Decision (Austin, 2026-07-30): pursue both.** Stack-level is the deliverable now;
+>    per-object stays in scope as a low-signal measurement that may become real with the
+>    incoming ~2× data and better reductions. Report per-object as limits until it isn't.
+> 2. **κ·r_e,conv may be PSF-degenerate.** These galaxies have r_e ~ 1–4 kpc ≈ 0.12–0.5″
+>    against a ~2″ PSF. After convolution, κ·r_e,conv is close to the PSF itself for *every*
+>    galaxy, so R_comp may barely respond to r_e — which would make the table's
+>    "r_e↓ ⇒ R_comp↑" row untestable with VIRUS. **This needs an injection–recovery check at
+>    the real seeing (E6 already specifies the machinery) before that prediction is quoted
+>    in an abstract.**
+>
+> **Vocabulary.** The three-zone language (core / one-halo / two-halo, split at the fitted
+> crossover and R_vir) stays primary throughout the project, because it carries the R_vir
+> transition that Paper I establishes. Greg's R_comp and HF are defined as aliases onto it —
+> see the glossary in `GOALS.md`.
+
 ## Overview
 We measure **compact** and **total** Lyα emission with a **PSF-aware forward model** designed for VDFI (≈2.0″ seeing) and anchored by **JWST** morphology:
 - **Compact Lyα (ISM-scale):** flux within κ·`r_e,conv` where `r_e` is the JWST rest-frame optical size **convolved to the VDFI PSF** (κ ≈ 1–1.5).

@@ -24,8 +24,9 @@ import numpy as np
 import astropy.units as u
 from astropy.table import vstack
 from scipy.interpolate import interp1d
+from specutils.utils.wcs_utils import air_to_vac
 
-from .virial import cosmo, estimate_M200c_R200c_from_Mstar   # Planck18 + Moster+2013 R200c chain
+from .virial import cosmo, estimate_M200c_R200c_from_Mstar   # Planck18 + SMHM->R200c chain
 from .config import PipelineConfig
 from .extract import combine_fibers, radial_bin_edges   # reused for galaxy-axis combine + Rvir
 
@@ -100,15 +101,32 @@ def rest_grid(config: "PipelineConfig") -> np.ndarray:
 def stack_spec_values(fs, es, zs, wavelength, new_wavelength):
     """
     Rest-frame resample spectra ALREADY in the desired y-units.
-    Spectral axis -> /(1+z); linear interpolation onto new_wavelength.
-    NO flux_unit multiplication, NO (1+z) flux multiplication (done upstream).
+    Spectral axis -> air-to-vacuum, THEN /(1+z); linear interpolation onto
+    new_wavelength. NO flux_unit multiplication, NO (1+z) flux multiplication
+    (done upstream).
+
+    `wavelength` is VIRUS's observed-frame axis. HETDEX's public data release
+    documentation states this is AIR (3470-5540 A) -- confirmed independently
+    by the Gaia-anchored stellar test in star_lines.py. `new_wavelength`
+    (rest_grid(), built around config.LYA_REST = 1215.67) is VACUUM, which is
+    the only valid convention for a rest-UV line: air is not defined below
+    ~2000 A. Dividing the raw air-labeled `wavelength` by (1+z) without first
+    converting to vacuum introduces a RIGID ~84 km/s blueward bias in every
+    rest-frame spectrum this function produces -- see
+    specs/wavelength-zero-point.md Tier 0(c) and the star_lines.py Gaia test
+    (Austin, 2026-07-30) that measured it directly. The conversion is done
+    ONCE here, outside the per-galaxy loop, since `wavelength` (unlike `zs`)
+    is the same array for every galaxy in the call.
 
     fs/es : (ngal, nwave). Returns (ngal, nwave_rest).
     """
+    wavelength_vac = air_to_vac(
+        np.asarray(wavelength, dtype=float) * u.AA
+    ).to(u.AA).value
     out_f = np.full((len(fs), new_wavelength.size), np.nan)
     out_e = np.full((len(es), new_wavelength.size), np.nan)
     for i in range(len(fs)):
-        rest_axis = np.asarray(wavelength) / (1 + zs[i])
+        rest_axis = wavelength_vac / (1 + zs[i])
         good = np.isfinite(fs[i])
         if good.sum() < 2:
             continue
@@ -157,8 +175,9 @@ def sample_virial_radius_kpc(config: "PipelineConfig", mass, z,
     scatter across the sample (VR_biweight_e).
 
     For EACH galaxy, derives its own R200c [kpc] directly from its stellar
-    mass + z via the Moster+2013 SHMR chain (estimate_M200c_R200c_from_Mstar --
-    the SAME relation virial_to_kpc_bins uses per galaxy when bin_mode='virial'),
+    mass + z via config.smhm_model's SHMR chain (estimate_M200c_R200c_from_Mstar
+    -- the SAME relation virial_to_kpc_bins uses per galaxy when
+    bin_mode='virial'; default Girelli+2020 since 2026-07-27, was Moster+2013),
     with the same log-mass clipping (m_min/m_max) as virial_to_kpc_bins. Then
     biweight-combines that per-galaxy R200c array over the sample.
 
@@ -182,6 +201,7 @@ def sample_virial_radius_kpc(config: "PipelineConfig", mass, z,
     mass = np.asarray(mass, dtype=float)
     z = np.asarray(z, dtype=float)
 
+    model = getattr(config, "smhm_model", "girelli20")
     rvir = np.full(len(z), np.nan)
     for i in range(len(z)):
         mi, zi = float(mass[i]), float(z[i])
@@ -189,7 +209,7 @@ def sample_virial_radius_kpc(config: "PipelineConfig", mass, z,
             continue
         try:
             m_used = np.clip(mi, m_min, m_max)
-            _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, zi)
+            _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, zi, model=model)
             rvir[i] = r200c
         except Exception:
             rvir[i] = np.nan
@@ -338,7 +358,8 @@ def _single_galaxy_rvir_kpc(config, mass, z, m_min: float = 7.0, m_max: float = 
         return None
     try:
         m_used = np.clip(float(mass), m_min, m_max)
-        _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, float(z))
+        model = getattr(config, "smhm_model", "girelli20")
+        _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, float(z), model=model)
         return float(r200c) if np.isfinite(r200c) else None
     except Exception:
         return None

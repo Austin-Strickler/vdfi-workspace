@@ -2,6 +2,23 @@
 
 Lyman-alpha halo stacking pipeline: measures the extended, diffuse Lya emission around galaxies by stacking spectra/imaging across a sample and characterizing the resulting halo signal (including comparisons from stellar mass to dark matter halo mass to virial radius).
 
+## Scope — this folder is the whole program
+
+As of 2026-07-30 this is not just the halo-stacking paper. **`01-lya_halos` is the umbrella folder
+for the entire VDFI Lyα science program** while the paper structure is still exploratory:
+
+- the **virial-radius transition** in an absolute velocity frame,
+- the **subsample-split** program (one-halo tracks the galaxy, two-halo tracks the environment),
+- the **escape-fraction / geometry–throughput** work (redistribution, not loss).
+
+There is no folder-per-paper, deliberately. The measurement machinery (`measure_*`, `fitting.py`,
+`background.py`, the three-zone decomposition) is shared across all of it, and **we do not yet know
+whether this is one, two, or three papers** — splitting the tree before the papers are real just
+creates stale cross-references. The retired `03-lya_escape` subproject is the cautionary example.
+
+**Start at [`docs/GOALS.md`](docs/GOALS.md)** — that is the current scope document, including the
+per-paper sections, the three-zone vocabulary glossary, and the open feasibility questions.
+
 ## Pipeline
 
 Built around `utils_lya_halo`, a three-stage pipeline keyed on a single `PipelineConfig` (field, catalog, etc.) so every run and output is reproducible and traceable back to its config:

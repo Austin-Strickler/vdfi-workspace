@@ -87,7 +87,8 @@ def _single_galaxy_rvir_kpc(config, mass, z, m_min: float = 7.0, m_max: float = 
         return None
     try:
         m_used = np.clip(float(mass), m_min, m_max)
-        _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, float(z))
+        model = getattr(config, "smhm_model", "girelli20")
+        _, r200c = estimate_M200c_R200c_from_Mstar(10 ** m_used, float(z), model=model)
         return float(r200c) if np.isfinite(r200c) else None
     except Exception:
         return None

@@ -70,6 +70,20 @@ class PipelineConfig:
         default_factory=lambda: [0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
     )
     bin_mode: str = "virial"             # 'virial' | 'kpc' | 'arcsec'
+    smhm_model: str = "girelli20"        # stellar-mass<->halo-mass relation used by
+                                          #   virial.py's Mstar->Mhalo->R200c chain
+                                          #   (only matters when bin_mode='virial', but
+                                          #   also affects the reporting-only
+                                          #   sample_virial_radius_kpc / median_virial_
+                                          #   kpc_bins regardless of bin_mode). Default
+                                          #   since 2026-07-27 (was 'moster13'); see
+                                          #   docs/research-notes.md "SMHM values and
+                                          #   methods" for the divergence test that
+                                          #   motivated the switch. 'moster13' (legacy)
+                                          #   | 'behroozi19' (Bryan-Norman virial mass,
+                                          #   not M200c -- see virial.py's caveat;
+                                          #   also turns over at high stellar mass, so
+                                          #   some galaxies get NaN R_vir).
 
     # --- fiber masking (Stage 1.1) --------------------------------------
     mask_method: str = "segmap"           # single method ('segmap') OR a '+'-joined
@@ -529,7 +543,7 @@ class PipelineConfig:
         "bg_outer_arcsec", "min_bg_fibers", "smooth_bg", "bg_smooth_method",
         "bg_smooth_sigma_A", "line_mask_halfwidth_A", "smoothing_values",
         "bg_combine_method", "fiber_combine_method", "mass_col", "z_col",
-        "wave_min", "wave_max", "nwave",
+        "smhm_model", "wave_min", "wave_max", "nwave",
     )
 
     def extract_signature_dict(self) -> dict:
@@ -624,6 +638,7 @@ class PipelineConfig:
             "bins_tag": self.bins_tag(),
             "bins": list(self.bins),
             "bin_mode": self.bin_mode,
+            "smhm_model": self.smhm_model,
             "mask_method": self.mask_method,
             "mask_percentile_image": self.mask_percentile_image,
             "mask_percentile_spec_high": self.mask_percentile_spec_high,
@@ -669,6 +684,7 @@ class PipelineConfig:
             "BINMODE":  self.bin_mode,
             "BINS":     bins_str,                     # exact edges (bin_mode units)
             "NRAD":     len(self.bins) - 1,
+            "SMHMMOD":  self.smhm_model,               # SMHM relation -> R200c (2026-07-27+)
             "MASKMETH": self.mask_method,             # e.g. 'segmap+spec_global' (composite,
                                                         #   '+'-joined, OR-combined components)
             # Per-component percentiles; 0 when that component isn't active so

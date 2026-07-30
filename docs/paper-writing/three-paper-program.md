@@ -6,6 +6,34 @@ documents did their job: the objections that survived scrutiny are collected in 
 requirements, and the ones that didn't are gone. This document is the constructive version — what
 the three papers are, why three is the right number, and what each one contributes to the field.*
 
+> ## ⚠️ Partially superseded — 2026-07-30
+>
+> **This document remains the long-form *argument*. It is no longer the current *state*.**
+> That is now `01-lya_halos/docs/GOALS.md`. Where the two disagree, GOALS.md wins.
+>
+> Five specific changes, all made 2026-07-30:
+>
+> 1. **The paper count is explicitly provisional.** This document argues for three and argues it
+>    well, but "three" is now a working hypothesis, not a commitment — it may collapse to two. Read
+>    §2 ("Why three, and not one or two") as *the case for three if three is what the results
+>    support*, not as a settled structure.
+> 2. **Paper III's framing changed** from "photon budget" to the geometry–throughput framework in
+>    `01-lya_halos/docs/Greg-Initial-Driving-Model.md`, whose thesis is **redistribution, not loss**.
+>    The closed budget survives inside it as the *throughput* half, so §5 is not wrong — it is now a
+>    component of a larger frame. This change is a direct response to §8 item 7 of this document.
+> 3. **JWST morphology (COSMOS-Web / PRIMER / CEERS) is a new data axis** for Paper III. §2's
+>    capability table has been updated in GOALS.md accordingly; the version here predates it.
+> 4. **`03-lya_escape` has been retired.** All papers are prototyped in `01-lya_halos` while the
+>    structure is exploratory. §8 item 11 (`03-lae_catalog`, now `02-lae_catalog`) is still open.
+> 5. **`Paper2_Outline_Lya_Halo_Origins_Structure.md` → `Greg-Origins-and-Structure-Outline.md`**,
+>    and it is **not** Paper II — the splits are Paper II, per §4 here, and the outline's contents
+>    are Paper III material. The **RT / Byrohl forward-fitting thread is unassigned** and tracked as
+>    its own workstream in `docs/workstream-roadmap.md` §2.
+>
+> Everything else here — the capability argument, the Paper I/II boundary, the Leclercq/Guo
+> treatment, the power analysis, the systematics tiering in §7, and the delivery requirements in §8
+> — still stands and is still the reasoning GOALS.md summarizes.
+
 ---
 
 ## 1. The program in one paragraph
@@ -463,7 +491,7 @@ assignment (kinematic splits → Paper 1, flux splits → Paper 2), which the re
 Burstiness and classification should live wherever the core spectrum lives; Paper III keeps only
 what requires Balmer-line photon accounting.
 
-**11. Decide what `03-lae_catalog` is.** It's a scaffolded subproject with no slot in this program —
+**11. Decide what `02-lae_catalog` is.** It's a scaffolded subproject with no slot in this program —
 either a fourth paper, or infrastructure for Paper II's classification scheme. Right now it's an
 unpriced item on the schedule.
 

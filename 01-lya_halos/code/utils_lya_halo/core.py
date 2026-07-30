@@ -95,8 +95,10 @@ import warnings
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
+import astropy.units as u
 from astropy.io import fits
 from astropy.table import Table
+from specutils.utils.wcs_utils import air_to_vac
 
 from .measure import (
     get_continuum_model, integrated_line_flux, DEFAULT_CONT_BOUNDS,
@@ -127,19 +129,32 @@ def to_rest_frame(wave_obs, flux, err=None, z=None, rest_density=True):
     """
     Shift observed-frame core spectrum to rest frame.
 
-    wave_rest = wave_obs / (1+z). With rest_density=True the flux density is
-    multiplied by (1+z) so the rest-frame integral preserves the physical line
-    flux -- same convention as Stage 2 (config.rest_density).
+    wave_rest = air_to_vac(wave_obs) / (1+z). wave_obs is VIRUS's observed
+    axis, which HETDEX's public data release states is AIR (3470-5540 A);
+    LYA_REST (this module's module-level constant, and config.LYA_REST) is
+    1215.67 in VACUUM -- the only valid convention for a rest-UV line, since
+    air is not defined below ~2000 A. Converting wave_obs to vacuum before the
+    (1+z) divide is what keeps wave_rest comparable to LYA_REST; skipping it
+    introduces a RIGID ~84 km/s blueward bias (specs/wavelength-zero-point.md
+    Tier 0(c); confirmed directly by the star_lines.py Gaia test,
+    Austin 2026-07-30). This mirrors the identical fix in
+    stack.py::stack_spec_values, the other (separate) observed->rest
+    implementation in this pipeline.
+
+    With rest_density=True the flux density is multiplied by (1+z) so the
+    rest-frame integral preserves the physical line flux -- same convention as
+    Stage 2 (config.rest_density).
     Returns (wave_rest, flux_rest, err_rest).
     """
     if z is None:
         raise ValueError("to_rest_frame needs z.")
     wave_obs = np.asarray(wave_obs, dtype=float)
+    wave_vac = air_to_vac(wave_obs * u.AA).to(u.AA).value
     flux     = np.asarray(flux,     dtype=float)
     opz      = 1.0 + float(z)
     scale    = opz if rest_density else 1.0
     return (
-        wave_obs / opz,
+        wave_vac / opz,
         flux * scale,
         np.asarray(err, dtype=float) * scale if err is not None else None,
     )

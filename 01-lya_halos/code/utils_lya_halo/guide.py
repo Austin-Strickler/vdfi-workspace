@@ -88,6 +88,14 @@ SECTIONS = {
                     ["Reconstruction", "Inspection", "Background stacks",
                      "Variant comparison", "Mask & smoothing sweep",
                      "Spatial variance", "Profile impact", "Drivers"]),
+    "lis":        ("LIS / rest-UV absorption-line velocities on a rest-frame "
+                   "core stack: the MOSDEF-LRIS cross-instrument wavelength "
+                   "check (Weldon+2022 dv_LIS = -60+/-10) and the sample's "
+                   "outflow velocity (split #15). Two estimators per line -- "
+                   "trough minimum and Gaussian centroid -- because Weldon use "
+                   "different ones for composites and for individual galaxies.",
+                   ["Line table", "Continuum", "Estimators", "Drivers",
+                    "Comparison & reporting", "Diagnostics"]),
     "uv_continuum": ("Part 3's standalone UV-continuum pipeline (CFHT-LS "
                      "r-band): per-galaxy cutout/photometry through coadd, "
                      "bootstrap, and stellar-PSF measurement. Not yet merged "
@@ -873,26 +881,56 @@ _ENTRIES = [
 
     # ===================== MISC =====================
     _e("virial_to_kpc_bins", "virial", "misc", "Virial conversions",
-       "Convert R/Rvir bin edges to kpc for ONE galaxy's mass & z (Moster+2013 "
-       "-> R200c). The per-galaxy mapping extraction uses; call it to see a "
-       "galaxy's physical bin edges.",
-       "kpc = virial_to_kpc_bins(cfg.bins, m=10.5, z=2.3)"),
+       "Convert R/Rvir bin edges to kpc for ONE galaxy's mass & z, via the "
+       "configured SMHM relation (model=cfg.smhm_model, default Girelli+2020 "
+       "since 2026-07-27, was Moster+2013) -> R200c. The per-galaxy mapping "
+       "extraction uses; call it to see a galaxy's physical bin edges.",
+       "kpc = virial_to_kpc_bins(cfg.bins, m=10.5, z=2.3, model=cfg.smhm_model)"),
     _e("virial_to_angular_bins", "virial", "misc", "Virial conversions",
-       "Convert R/Rvir bin edges to arcsec for one galaxy's mass & z. Useful "
-       "for overlaying bins on imaging.",
-       "arcsec = virial_to_angular_bins(cfg.bins, m=10.5, z=2.3)"),
+       "Convert R/Rvir bin edges to arcsec for one galaxy's mass & z, via the "
+       "configured SMHM relation. Useful for overlaying bins on imaging.",
+       "arcsec = virial_to_angular_bins(cfg.bins, m=10.5, z=2.3, model=cfg.smhm_model)"),
     _e("physical_kpc_to_arcsec", "virial", "misc", "Virial conversions",
        "Angular size (arcsec) of a physical size (kpc) at redshift z (Planck18). "
        "The basic cosmology conversion for annotating plots.",
        "theta = physical_kpc_to_arcsec(100.0, z=2.3)"),
     _e("estimate_M200c_R200c_from_Mstar", "virial", "misc", "Virial conversions",
-       "Stellar mass -> (M200c, R200c) via Moster+2013 + R200c(z). The halo "
-       "estimate behind the virial binning.",
+       "Stellar mass -> (Mhalo, R200c) via the chosen SMHM relation (default "
+       "Girelli+2020 since 2026-07-27; model='moster13'|'behroozi19' for the "
+       "alternates) + R200c(z). The halo estimate behind the virial binning.",
        "M200c, R200c = estimate_M200c_R200c_from_Mstar(10**10.5, z=2.3)"),
     _e("median_virial_kpc_bins", "virial", "misc", "Virial conversions",
        "Sample-median mapping of R/Rvir edges -> kpc (median mass & z), for "
        "plots/tables only. NOT how the pipeline bins -- that is per-galaxy.",
        "kpc, m_med, z_med = median_virial_kpc_bins(cfg.bins, run_table)"),
+    _e("mhalo_from_mstar", "virial", "misc", "Virial conversions",
+       "Invert any SMHM forward model (model='girelli20'|'moster13'|"
+       "'behroozi19') to get Mhalo from Mstar at a redshift. Returns NaN if "
+       "Mstar is above that model's median relation (behroozi19's high-mass "
+       "turnover; girelli20/moster13 don't turn over in this sample's mass "
+       "range). The engine behind estimate_M200c_R200c_from_Mstar and every "
+       "SMHM comparison tool below. Merged from smhm.py 2026-07-27.",
+       "Mh = mhalo_from_mstar(10**10.5, z=2.3, model='girelli20')"),
+    _e("compare_smhm", "virial", "misc", "Virial conversions",
+       "For one galaxy (logMstar, z), logMhalo + R200c under all three SMHM "
+       "models side by side. The quick 'how much does the choice of relation "
+       "matter for THIS galaxy' check. Merged from smhm.py 2026-07-27.",
+       "compare_smhm(10.5, 2.3)"),
+    _e("rvir_divergence_table", "virial", "misc", "Virial conversions",
+       "R200c vs logMstar across a grid, for every model, plus % difference "
+       "against a reference model. What research-notes.md's 2026-07-27 SMHM "
+       "divergence entry was built from. Merged from smhm.py 2026-07-27.",
+       "rows = rvir_divergence_table(np.arange(9,11.01,0.5), 2.3)"),
+    _e("plot_smhm_models", "virial", "misc", "Virial conversions",
+       "Plot logM* vs logMhalo (or M*/Mh ratio) for all three SMHM models at "
+       "one redshift. The shape-level view of how the relations diverge. "
+       "Merged from smhm.py 2026-07-27.",
+       "plot_smhm_models(2.3)"),
+    _e("plot_rvir_vs_mstar", "virial", "misc", "Virial conversions",
+       "Plot R200c vs logM* for all three models at one redshift -- the exact "
+       "quantity that sets the R/Rvir bin edges. Gaps = above that model's "
+       "median relation. Merged from smhm.py 2026-07-27.",
+       "plot_rvir_vs_mstar(2.3)"),
     _e("stack_lsf", "speclsf", "misc", "LSF / intrinsic profile",
        "Build each galaxy's observed-frame line-spread kernel and route them "
        "through the SAME Stage-2 path as the science line to get the stacked "
@@ -1647,6 +1685,103 @@ _ENTRIES = [
        "(Re)assign each galaxy's PSF metadata -- psf_fwhm_arcsec, "
        "psf_fwhm_kpc, etc. -- onto an existing extraction-results list.",
        "profiles = apply_psf_to_results(profiles, psf_r, psf_vals)"),
+
+    # ===================== LIS / REST-UV LINE VELOCITIES =====================
+    _e("line_spec", "lis", "lis", "Line table",
+       "Resolve a line name (or a LineSpec) into its LineSpec: rest "
+       "wavelength, absorption/emission sign, the Weldon+2022 Table 1 "
+       "continuum windows, and any blended fine-structure partners. Every "
+       "window in the table is theirs verbatim -- none are invented.",
+       "spec = line_spec('SiII1526'); print(spec.cont_bounds, spec.note)"),
+    _e("science_lines", "lis", "lis", "Line table",
+       "Topping's three best redshift lines (Si II 1260, C II 1334, "
+       "Si II 1526) as LineSpecs. Note that 'uncontaminated' was their "
+       "judgement at LRIS-B resolution (~7 A), which is COARSER than VIRUS, "
+       "so two of the three are still blended for us -- see BLENDED_AT_VIRUS.",
+       "for s in science_lines(): print(s.name, s.ncomp_recommended)"),
+    _e("normalize_local", "lis", "lis", "Continuum",
+       "Local continuum and normalized spectrum over one line's window. "
+       "'weldon_linear' is their sec 2.2 recipe verbatim (a straight line "
+       "between the two window means); 'poly' is the robust sigma-clipped "
+       "polynomial, for the sensitivity test.",
+       "n = normalize_local(rest_wave, flux, err, 'SiII1526')"),
+    _e("measure_extremum", "lis", "lis", "Estimators",
+       "Weldon's COMPOSITE estimator: the wavelength of the absolute trough "
+       "minimum (or peak maximum). Parabola-refined by default because one "
+       "rest-grid pixel is ~40-50 km/s, comparable to the effect being "
+       "measured. Compare this to their composite values, not to -60.",
+       "e = measure_extremum(n['wave'], n['nflux'], 'SiII1526')"),
+    _e("fit_line_profile", "lis", "lis", "Estimators",
+       "Weldon's PER-OBJECT estimator: polynomial continuum plus N Gaussians "
+       "fit simultaneously, sharing one velocity and width, amplitudes "
+       "sign-constrained. Velocity is a direct fit parameter. ncomp>1 adds the "
+       "blended partners; simultaneous=False gives the two-step variant.",
+       "f = fit_line_profile(rest_wave, flux, err, 'CII1334', ncomp=2, z=2.3)"),
+    _e("measure_line", "lis", "lis", "Drivers",
+       "One line, BOTH estimators, plus Topping's error model (100 refits of "
+       "the spectrum perturbed by its error spectrum; value = MC mean, error = "
+       "MC std). This is measurement error on one stack only -- sample error "
+       "is a separate bootstrap term and must not be conflated with it.",
+       "r = measure_line(rest_wave, flux, err, 'SiII1526', z=2.3)"),
+    _e("measure_lines", "lis", "lis", "Drivers",
+       "Loop measure_line over a line set. lines='science' for Topping's "
+       "three, None for all. ncomp accepts an int, a per-line dict, or "
+       "'recommended' (enough components per line for an unbiased velocity).",
+       "res = measure_lines(rest_wave, flux, err, lines='science', z=2.3)"),
+    _e("measure_lis_stack", "lis", "lis", "Drivers",
+       "Wrapper over a stack.build_core_stacks return value: picks a combine "
+       "method, carries z_median through for the LSF prior, and warns when the "
+       "stack is not the Weldon-matching coadd (output='L_fiber', "
+       "method='mean' -- luminosity density, unweighted average).",
+       "res = measure_lis_stack(core_stacks, method='mean', lines='science')"),
+    _e("compare_ncomp", "lis", "lis", "Comparison & reporting",
+       "Run every line at ncomp=1 (the Topping-matched estimator) and at its "
+       "recommended ncomp, and report the shift. That shift IS the blend "
+       "systematic for the line -- quote it, don't silently apply it. "
+       "Injection-recovery: C II 1334 shifts ~83 km/s, Si II 1260 ~42, "
+       "Si II 1526 ~3.",
+       "cmp = compare_ncomp(rest_wave, flux, err, lines='science', z=2.3)"),
+    _e("compare_cont_order", "lis", "lis", "Comparison & reporting",
+       "Refit each line at several continuum polynomial orders (default 2 then "
+       "1) and report the velocity shift as a systematic. A quadratic over the "
+       "~30-45 A fit span can curve into the trough, eat the wings and leave a "
+       "narrow core -- the tell is a fitted FWHM sitting on the LSF floor. "
+       "Order 2 stays primary because it is Topping-matched.",
+       "describe_cont_order(compare_cont_order(w, f, e, z=z_med))"),
+    _e("describe_cont_order", "lis", "lis", "Comparison & reporting",
+       "Printer for compare_cont_order; flags any order whose fitted width "
+       "sits on the instrumental floor.",
+       "describe_cont_order(cmp)"),
+    _e("z_lis_average", "lis", "lis", "Comparison & reporting",
+       "Topping's z_LIS: the UNWEIGHTED mean over Si II 1260, C II 1334 and "
+       "Si II 1526 of whichever fits succeeded. Unweighted is deliberate -- "
+       "inverse-variance weighting would stop the estimator matching "
+       "-60+/-10. Also returns the line-to-line spread (an optical-depth "
+       "term, not an error on the mean).",
+       "avg = z_lis_average(res, estimator='gauss')"),
+    _e("describe_lis", "lis", "lis", "Comparison & reporting",
+       "Print the per-line table (both estimators, asymmetry, FWHM, EW, S/N) "
+       "with the Weldon comparison, the combined sigma including the 22 km/s "
+       "LRIS floor, and a reminder that this constrains eps_VIRUS - eps_LRIS "
+       "rather than the MOSDEF tie.",
+       "describe_lis(res)"),
+    _e("as_line_result", "lis", "lis", "Diagnostics",
+       "Coerce any of the three result shapes (measure_line single-line dict, "
+       "measure_lines name->dict mapping, measure_lis_stack {'lines','meta'}) "
+       "down to ONE single-line dict. Raises with the available line names "
+       "instead of guessing when a multi-line container is passed without "
+       "line=.",
+       "r = as_line_result(res, line='SiII1526')"),
+    _e("plot_lis_fit", "lis", "lis", "Diagnostics",
+       "Normalized spectrum, fitted model, continuum windows, and both "
+       "estimator positions for one line. This is Topping's 'manually "
+       "inspected the fits to each line' step -- look before trusting. "
+       "Accepts any result shape; pass line= when handing it a container.",
+       "plot_lis_fit(res, line='SiII1526')"),
+    _e("plot_lis_grid", "lis", "lis", "Diagnostics",
+       "plot_lis_fit for every measured line in one figure, science lines "
+       "first.",
+       "fig, axes = plot_lis_grid(res)"),
 ]
 
 
@@ -1693,6 +1828,7 @@ _BACKEND = {
                 "plot_blank_sky_null", "plot_line_sn", "plot_line_sn_radial",
                 "plot_line_profiles"},
     "virial": {"moster13_mstar_from_mhalo", "mhalo_from_mstar_moster13",
+               "girelli20_mstar_from_mhalo", "behroozi19_mstar_from_mhalo",
                "R200c_from_M200c", "compute_annuli_from_virial",
                "virial_to_angular_bins"},   # angular is doc'd; leave the rest ignored
     "smoothing": set(),
