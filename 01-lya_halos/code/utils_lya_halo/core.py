@@ -6,7 +6,8 @@ pipeline coadds annular bins ACROSS galaxies and measures a stacked CENTROID;
 this module extracts ONE optimally-weighted core spectrum PER GALAXY and
 measures that galaxy's integrated Lya FLUX, enabling per-object classification
 (emitter / absorber / null) and a Lya escape fraction. The C1 extraction wraps
-the PSF-weighted optics.py functions that the binned path explicitly deferred.
+the PSF-weighted optics helpers (extract.py, merged from optics.py) that the
+binned path explicitly deferred.
 
 ----------------------------------------------------------------------
 THE OVERALL RUN PATTERN (what "simply run this" looks like)
@@ -34,7 +35,7 @@ That is it. ~500 galaxies, one spectrum each: the extraction runs in minutes
 ----------------------------------------------------------------------
 STAGES
 ----------------------------------------------------------------------
-C1  extract_core_spectra  [SOCKET -- wires optics.py; heavy, run once]
+C1  extract_core_spectra  [SOCKET -- wires extract.py's optics helpers; heavy, run once]
     PSF-weighted optimal extraction per galaxy per exposure; inverse-variance
     combine exposures -> (ngal, nwave) observed-frame core spectra.
 
@@ -1495,7 +1496,7 @@ from .stack import build_core_stacks, concat_core_prods   # noqa: E402,F401
 
 
 # =====================================================================
-# 6.  C1 EXTRACTION SOCKET  (wires optics.py; heavy, run once)
+# 6.  C1 EXTRACTION SOCKET  (wires extract.py's optics helpers; heavy, run once)
 # =====================================================================
 
 def extract_core_spectra(config: "PipelineConfig", run_table=None,
@@ -1503,7 +1504,8 @@ def extract_core_spectra(config: "PipelineConfig", run_table=None,
                          return_extras=False, bad_fiber_mask=None, vdfi=None,
                          save_background=True):
     """
-    C1 -- PSF-weighted optimal core extraction.   SOCKET over optics.py.
+    C1 -- PSF-weighted optimal core extraction.   SOCKET over extract.py's
+    optics helpers (formerly optics.py).
 
     Runs the point-source path that the binned extraction explicitly deferred.
     No per-galaxy caching (the sample is small; the whole extraction fits in
@@ -1519,14 +1521,14 @@ def extract_core_spectra(config: "PipelineConfig", run_table=None,
            bg from the [bg_inner, bg_outer) annulus, smoothed -- REUSE the
            per-exposure background block from extract.extract_fibers verbatim
            so core and halo share one background definition.
-           optics.get_spectrum_exposure(spectra_e, error_e, dra, ddec,
+           extract.get_spectrum_exposure(spectra_e, error_e, dra, ddec,
                                         seeing_e, vdfi['PSF'], wave)
            -> spec_e (nwave,), err_e (nwave,), weights_e, goodpix_mask_e
       3. inverse-variance combine across exposures:
            w = 1 / err_e^2  (per pixel, where goodpix)
            Spec[i] = sum(spec_e * w, axis=0) / sum(w, axis=0)
            Err[i]  = 1 / sqrt(sum(w, axis=0))
-      4. optics.get_continuum(Spec[i:i+1, :], nbins=25) -> continuum diagnostic
+      4. extract.get_continuum(Spec[i:i+1, :], nbins=25) -> continuum diagnostic
          (store or discard; the C2 estimators re-derive their own continuum in
          rest frame)
 
@@ -1568,10 +1570,13 @@ def extract_core_spectra(config: "PipelineConfig", run_table=None,
       (+ extras dict if return_extras=True)
     """
     # Lazy imports: keep core.py's top-level import cheap and dodge any
-    # circular import with extract.py (which imports optics, masking, virial...).
-    from . import optics
+    # circular import with extract.py (which imports virial, and is itself
+    # imported by background.py). The PSF/optics helpers used below --
+    # get_spectrum_exposure, get_continuum -- were merged into extract.py from
+    # the old optics.py on 2026-08-03, so they come from the same import now.
     from .extract import (
         load_field, build_run_table, build_bad_fiber_mask, combine_fibers,
+        get_spectrum_exposure, get_continuum,
     )
 
     # ---- 0. field + PSF + masks + catalog -------------------------------
@@ -1612,13 +1617,13 @@ def extract_core_spectra(config: "PipelineConfig", run_table=None,
             return spec_1d
         method = getattr(config, "bg_smooth_method", "interp_gauss").lower()
         if method == "interp_gauss":
-            from .smoothing import smooth_interp_then_gauss
+            from .background import smooth_interp_then_gauss
             return smooth_interp_then_gauss(
                 spec_1d, wave, z, lya_rest=config.LYA_REST,
                 sigma_A=config.bg_smooth_sigma_A,
                 mask_halfwidth_A=config.line_mask_halfwidth_A,
             )
-        from .smoothing import smooth_spectrum_nan_safe_adaptive   # legacy 'adaptive'
+        from .background import smooth_spectrum_nan_safe_adaptive   # legacy 'adaptive'
         sv = config.smoothing_values
         return smooth_spectrum_nan_safe_adaptive(
             spec_1d, wave, sigma_A=sv[0], edge_sigma_A=sv[1], edge_width_A=sv[2]
@@ -1720,7 +1725,7 @@ def extract_core_spectra(config: "PipelineConfig", run_table=None,
             with np.errstate(divide="ignore", invalid="ignore"), \
                  warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
-                spec_e, err_e, _w, _pf = optics.get_spectrum_exposure(
+                spec_e, err_e, _w, _pf = get_spectrum_exposure(
                     sp_e, er_e, dra_w, ddec_w, see_e, PSF, wave,
                 )
             spec_e = np.atleast_1d(np.asarray(spec_e, dtype=float))
@@ -1745,7 +1750,7 @@ def extract_core_spectra(config: "PipelineConfig", run_table=None,
                 with np.errstate(divide="ignore", invalid="ignore"), \
                      warnings.catch_warnings():
                     warnings.simplefilter("ignore", category=RuntimeWarning)
-                    bgspec_e, _, _, _ = optics.get_spectrum_exposure(
+                    bgspec_e, _, _, _ = get_spectrum_exposure(
                         bg_bcast, er_e, dra_w, ddec_w, see_e, PSF, wave,
                     )
                 bgspec_e = np.atleast_1d(np.asarray(bgspec_e, dtype=float))
@@ -1763,7 +1768,7 @@ def extract_core_spectra(config: "PipelineConfig", run_table=None,
         # continuum diagnostic (C2 re-derives its own in rest frame; this is just
         # a quick-look, e.g. for the overlay plot's spectrum inset)
         try:
-            Cont[cnt] = optics.get_continuum(Spec[cnt:cnt + 1, :], nbins=25)[0]
+            Cont[cnt] = get_continuum(Spec[cnt:cnt + 1, :], nbins=25)[0]
         except Exception:
             pass
 
@@ -1863,12 +1868,12 @@ def inspect_core_background(
             return spec_1d
         method = getattr(config, "bg_smooth_method", "interp_gauss").lower()
         if method == "interp_gauss":
-            from .smoothing import smooth_interp_then_gauss
+            from .background import smooth_interp_then_gauss
             return smooth_interp_then_gauss(
                 spec_1d, wave, z, lya_rest=config.LYA_REST,
                 sigma_A=config.bg_smooth_sigma_A,
                 mask_halfwidth_A=config.line_mask_halfwidth_A)
-        from .smoothing import smooth_spectrum_nan_safe_adaptive
+        from .background import smooth_spectrum_nan_safe_adaptive
         sv = config.smoothing_values
         return smooth_spectrum_nan_safe_adaptive(
             spec_1d, wave, sigma_A=sv[0], edge_sigma_A=sv[1], edge_width_A=sv[2])
@@ -2192,7 +2197,7 @@ def _exposure_seeing(seeing, e, sel=None):
     """
     Return ONE scalar seeing FWHM for exposure `e`.
 
-    This is the contract optics.get_spectrum_exposure expects: it does
+    This is the contract extract.get_spectrum_exposure expects: it does
     `wavelength_corrected_seeing(seeing, wave)` -> needs `seeing` to broadcast
     against the (nwave,) grid, then `seeing[None, :]` broadcast across fibers.
     That only works if `seeing` is a SCALAR (one value per exposure, identical
@@ -2297,7 +2302,8 @@ def fiber_extraction_geometry(
         exp             (nfib_pooled,)  which exposure each fiber came from
         core_radius, wave_ref, n_in_aperture
     """
-    from . import optics
+    # (the old `from . import optics` here was dead -- nothing in this function
+    # calls into it; the PSF weight below is evaluated straight off vdfi['PSF'])
     RA = vdfi["RA"]; DEC = vdfi["DEC"]
     wave = np.asarray(vdfi["wave"], dtype=float)
     PSF  = vdfi["PSF"]

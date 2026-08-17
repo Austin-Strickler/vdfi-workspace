@@ -9,7 +9,7 @@ USE IT (retro-terminal, argument-driven -- no blocking prompts):
 
     from utils_lya_halo import guide
 
-    guide()                      # main menu: the six sections
+    guide()                      # main menu: pipeline spine, then side tracks
     guide("measure")             # everything in a section
     guide("measure", "centroid") # one subsection
     guide("run_stack")           # full detail card for one function
@@ -31,11 +31,21 @@ preamble (so the snippets stay short and consistent):
     res     = run_measurement_suite(cfg, stacks)   # boot+stacks+errors bundle
 
 MAINTENANCE. This index is a single registry (_ENTRIES below). check_guide()
-diffs it against the live code and reports drift both ways -- entries whose
-function no longer exists, and new public front-end functions not yet listed
-(back-end names are ignored via _BACKEND). It runs inside test_framework.py, so
-the smoke test fails if the guide falls out of sync. When you add/rename a
-front-end function, add/edit its one entry here.
+diffs it against the live code and reports drift three ways -- entries whose
+function no longer exists, new public front-end functions not yet listed
+(back-end names are ignored via _BACKEND), and STRUCTURE problems in the
+section/subsection keys, which are free text and would otherwise go unnoticed.
+It runs inside test_framework.py, so the smoke test fails if the guide falls
+out of sync. When you add/rename a front-end function, add/edit its one entry
+here.
+
+LAYOUT. Sections are grouped into two TIERS: the pipeline spine you walk in
+order (extraction -> measure -> fitting -> plotting -> validation) and the side
+tracks you dip into (sample, background, core, uv, misc). A section is a
+DISPLAY bucket and has nothing to do with which module the function lives in --
+e.g. the UV radial-profile fit is filed under "uv" with the rest of that track
+while the code stays in fitting.py. Group entries by the task the reader is in
+the middle of, not by what kind of thing the function is.
 """
 
 from __future__ import annotations
@@ -44,9 +54,25 @@ import importlib
 import textwrap
 
 # ---------------------------------------------------------------------
-# SECTION METADATA  (order + one-line blurb + subsection order)
+# SECTION METADATA  (tier + order + one-line blurb + subsection order)
+#
+# TIERS group the menu into the pipeline you walk in order, and the side
+# tracks you dip into. Every key in SECTIONS must appear in exactly one tier;
+# check_guide() enforces that.
+#
+# SUBSECTION ORDER IS AN OVERRIDE, NOT A WHITELIST. The list below fixes the
+# display order for the subs it names; any sub used by an entry but not listed
+# is appended after them rather than silently dropped. (It used to be a
+# whitelist, which quietly hid 20 entries -- see _ordered_subs.)
 # ---------------------------------------------------------------------
+TIERS = {
+    "PIPELINE SPINE": ["extraction", "measure", "fitting", "plotting",
+                       "validation"],
+    "TRACKS & TOOLKITS": ["sample", "background", "core", "uv", "misc"],
+}
+
 SECTIONS = {
+    # ---------------- pipeline spine ----------------
     "extraction": ("Stage 1-2: turn the fiber data + catalog into the galaxy "
                    "FITS and the rest-frame stacks.",
                    ["Drivers", "Inputs & catalog", "Masking",
@@ -56,53 +82,93 @@ SECTIONS = {
                    ["Drivers", "Centroid estimators", "Flux & asymmetry",
                     "Continuum", "Bootstrap", "Method comparison",
                     "Derived properties"]),
+    "fitting":    ("Radial flux-profile fitting: PSF forward-modeling, the "
+                   "two-exponential and expcore (core + two-halo) models. The "
+                   "UV-continuum fit moved to the UV section with the rest of "
+                   "that track.",
+                   ["PSF & convolution", "Two-exponential fit (Part 1)",
+                    "Expcore fit (Part 2)", "Model comparison & boundary"]),
     "plotting":   ("Figures for stacks, radial profiles, and per-run "
                    "diagnostics.",
                    ["Stack spectra", "Radial profiles", "Two-sample overlays",
                     "Diagnostics", "One-call bundles", "Fiber & mask visuals"]),
     "validation": ("Prove the centroid is real: nulls, robustness sweeps, "
-                   "error cross-checks, injection-recovery, and the dossier.",
-                   ["Nulls", "Robustness sweeps", "Method scoring",
-                    "Error checks", "Injection-recovery", "S/N spectrum",
-                    "Synthesis", "Core characterization"]),
+                   "error cross-checks, injection-recovery, and the dossier. "
+                   "This IS the test suite -- there is no separate 'tests' "
+                   "section, by design.",
+                   ["Nulls", "Robustness sweeps", "Error checks",
+                    "Combined significance", "Bin correlation",
+                    "Injection-recovery", "S/N spectrum", "Synthesis",
+                    "Method scoring"]),
+
+    # ---------------- tracks & toolkits ----------------
     "sample":     ("Slice, split, and match the sample -- pure Stage-2, no "
-                   "re-extraction.",
-                   ["Slice & select", "Split", "Multi-catalog", "Sky plots"]),
-    "misc":       ("Science extras and separate tracks: virial conversions, "
-                   "LSF/intrinsic profile, star-PSF & line profiles, core "
-                   "(escape-fraction) extraction, single-galaxy halo profiles.",
+                   "re-extraction. Layer A is the split catalog, Layer B the "
+                   "declarative recipe library for the ~15 candidate splits, "
+                   "Layer C the resumable runner that turns any list of them "
+                   "into one paper-ready table.",
+                   ["Slice & select", "Ad-hoc splits", "Split catalog (Layer A)",
+                    "Recipe library (Layer B)",
+                    "Runner, cache & reporting (Layer C)",
+                    "Multi-catalog", "Sky plots"]),
+    "background": ("Offline background systematics: swap the annulus, mask "
+                   "width or smoothing AFTER extraction, map how the "
+                   "background changes with annulus radius, and check what "
+                   "that does to the profile and the centroid. Needs a run "
+                   "with store_raw_bg / store_spec_nobg.",
+                   ["Drivers", "Reconstruction", "Inspection",
+                    "Background stacks", "Variant comparison",
+                    "Mask & smoothing sweep", "Fill methods",
+                    "Spatial variance", "Profile impact", "Background impact",
+                    "Continuum windows"]),
+    "core":       ("Everything measured on the CORE spectrum rather than the "
+                   "radial halo profile: PSF-weighted core extraction and the "
+                   "escape fraction, the core characterization suite, and the "
+                   "LIS / rest-UV absorption-line velocities on a rest-frame "
+                   "core stack (the MOSDEF-LRIS wavelength check, Weldon+2022 "
+                   "dv_LIS = -60+/-10, and the outflow velocity for split #15).",
+                   ["Core extraction & escape fraction", "Core characterization",
+                    "LIS: lines & continuum", "LIS: estimators & drivers",
+                    "LIS: comparison & diagnostics"]),
+    "uv":         ("The standalone UV-continuum track (Part 3, CFHT-LS r-band "
+                   "imaging -- a DIFFERENT telescope from the VDFI fiber "
+                   "data): per-galaxy cutout and photometry through coadd, "
+                   "bootstrap, the radial profile fit, and the stellar PSF "
+                   "that fit is deconvolved against.",
+                   ["Field & catalog I/O", "Per-galaxy extraction",
+                    "Coadd & bootstrap", "Radial profile fit", "Stellar PSF"]),
+    "misc":       ("Standalone toolkits that do not belong to one stage: "
+                   "virial conversions, the LSF / intrinsic profile, star-PSF "
+                   "and line profiles, and single-galaxy halo profiles.",
                    ["Virial conversions", "LSF / intrinsic profile",
-                    "Star-PSF & line profiles", "Core / escape-fraction",
-                    "Single galaxy"]),
-    "fitting":    ("Radial flux-profile fitting: PSF forward-modeling, the "
-                   "two-exponential and expcore (core + two-halo) models, "
-                   "and the UV-continuum single-component fit.",
-                   ["PSF & convolution", "Two-exponential fit (Part 1)",
-                    "Expcore fit (Part 2)", "Model comparison & boundary",
-                    "UV-continuum fit (Part 3)"]),
-    "background":  ("Offline background testing: swap the annulus, mask width "
-                    "or smoothing AFTER extraction, map how the background "
-                    "changes with annulus radius, and check what that does to "
-                    "the profile and the centroid. Needs a run with "
-                    "store_raw_bg / store_spec_nobg.",
-                    ["Reconstruction", "Inspection", "Background stacks",
-                     "Variant comparison", "Mask & smoothing sweep",
-                     "Spatial variance", "Profile impact", "Drivers"]),
-    "lis":        ("LIS / rest-UV absorption-line velocities on a rest-frame "
-                   "core stack: the MOSDEF-LRIS cross-instrument wavelength "
-                   "check (Weldon+2022 dv_LIS = -60+/-10) and the sample's "
-                   "outflow velocity (split #15). Two estimators per line -- "
-                   "trough minimum and Gaussian centroid -- because Weldon use "
-                   "different ones for composites and for individual galaxies.",
-                   ["Line table", "Continuum", "Estimators", "Drivers",
-                    "Comparison & reporting", "Diagnostics"]),
-    "uv_continuum": ("Part 3's standalone UV-continuum pipeline (CFHT-LS "
-                     "r-band): per-galaxy cutout/photometry through coadd, "
-                     "bootstrap, and stellar-PSF measurement. Not yet merged "
-                     "into extract.py -- see uv_profile.py's own module note.",
-                     ["Field & catalog I/O", "Per-galaxy extraction",
-                      "Coadd & fit", "Stellar PSF"]),
+                    "Star-PSF & line profiles", "Single galaxy"]),
 }
+
+
+def _ordered_subs(section):
+    """
+    Subsection render order for `section`: the declared order first (for the
+    subs that actually have entries), then any sub used by an entry but never
+    declared, in first-appearance order.
+
+    THE APPEND IS THE POINT. The declared list used to be consumed as a
+    whitelist -- `for s in subs:` -- so an entry whose sub had drifted out of
+    SECTIONS was skipped by the renderer with no error anywhere. That silently
+    hid 20 of 343 entries (they still counted in the menu totals and still
+    turned up in guide(search=...), which is why it went unnoticed). Deriving
+    the order from the data instead makes losing an entry structurally
+    impossible; check_guide() still reports undeclared subs so the drift is
+    visible, it just is not destructive any more.
+    """
+    declared, _ = (SECTIONS[section][1], None)
+    used = []
+    for e in _ENTRIES:
+        if e["section"] == section and e["sub"] not in used:
+            used.append(e["sub"])
+    ordered = [s for s in declared if s in used]
+    ordered += [s for s in used if s not in declared]
+    return ordered
+
 
 # ---------------------------------------------------------------------
 # THE REGISTRY  (single source of truth)
@@ -157,12 +223,12 @@ _ENTRIES = [
        "cfg.mask_protect_radius_arcsec (spec_* components only). Call it "
        "directly for a diagnostic or A/B comparison without running extraction.",
        "bad = build_bad_fiber_mask(cfg, vdfi, run_table=catalog)"),
-    _e("segmentation_mask", "masking", "extraction", "Masking",
+    _e("segmentation_mask", "extract", "extraction", "Masking",
        "The default ('segmap') method: flag fibers landing on a baked binary "
        "mask FITS via a pure WCS lookup. All masking intelligence and dilation "
        "is frozen into the mask upstream, so this just reads the verdict.",
        "bad = segmentation_mask(cfg.resolve_seg_mask_path(), vdfi['RA'], vdfi['DEC'])"),
-    _e("make_spectral_continuum_mask", "masking", "extraction", "Masking",
+    _e("make_spectral_continuum_mask", "extract", "extraction", "Masking",
        "Alternative ('spec_global'/'spec_local') method: flag fibers by their "
        "own continuum level. Two INDEPENDENT tails OR'd together -- "
        "mask_percentile_high (bright/leakage) and mask_percentile_low "
@@ -170,25 +236,25 @@ _ENTRIES = [
        "straight off the spectra. mode 'global' (one threshold) | 'local' "
        "(per-exposure).",
        "bad = make_spectral_continuum_mask(vdfi['spectra'], mask_percentile_high=99.5, mask_percentile_low=0.5)"),
-    _e("continuum_image_mask", "masking", "extraction", "Masking",
+    _e("continuum_image_mask", "extract", "extraction", "Masking",
        "Legacy ('image') method, kept as the A/B baseline: smooth + threshold + "
        "dilate a continuum image, then flag fibers on masked pixels. Superseded "
        "by segmentation_mask, which bakes these decisions upstream.",
        "bad = continuum_image_mask(cfg.resolve_cont_image_path(), 'AEGIS', 90, vdfi['RA'], vdfi['DEC'])"),
-    _e("apply_protect_radius", "masking", "extraction", "Masking",
+    _e("apply_protect_radius", "extract", "extraction", "Masking",
        "Force-UNMASK fibers within radius_arcsec of ANY galaxy position "
        "(spec_* components only, applied inside build_bad_fiber_mask when "
        "cfg.mask_protect_radius_arcsec is set). Protects real core science "
        "fibers from spectral percentile masking. Returns a new mask; does not "
        "mutate the input.",
        "mask = apply_protect_radius(mask, vdfi['RA'], vdfi['DEC'], gal_RA, gal_DEC, 10.0)"),
-    _e("smooth_interp_then_gauss", "smoothing", "extraction", "Background smoothing",
+    _e("smooth_interp_then_gauss", "background", "extraction", "Background smoothing",
        "The default background smoother: mask the Lya line, linearly "
        "interpolate across the gap, then one uniform Gaussian. ~100x faster "
        "than the adaptive smoother and free of line/pulse artifacts; used "
        "internally by extraction but callable for A/B on a real background.",
        "bg = smooth_interp_then_gauss(prod.background[0], prod.wave, z=2.3)"),
-    _e("smooth_fill_then_gauss", "smoothing", "extraction", "Background smoothing",
+    _e("smooth_fill_then_gauss", "background", "extraction", "Background smoothing",
        "DIAGNOSTIC generalization of smooth_interp_then_gauss: same mask and "
        "same Gaussian, but the gap can be filled by 'linear' (== production), "
        "'median' (flat, both sidebands pooled) or 'median_interp' (robust "
@@ -196,7 +262,7 @@ _ENTRIES = [
        "but-not-yet-smoothed stage. NOT wired into cfg.bg_smooth_method; it is "
        "what the fill-method sweep varies.",
        "bg = smooth_fill_then_gauss(p.bg_variants[i,0], p.wave, z_i, fill_method='median_interp')"),
-    _e("smooth_spectrum_nan_safe_adaptive", "smoothing", "extraction", "Background smoothing",
+    _e("smooth_spectrum_nan_safe_adaptive", "background", "extraction", "Background smoothing",
        "The legacy adaptive smoother (ramped edge->interior sigma, NaN-safe). "
        "Kept for comparison; select it with cfg.bg_smooth_method='adaptive'.",
        "bg = smooth_spectrum_nan_safe_adaptive(prod.background[0], prod.wave, 200, 20, 300)"),
@@ -543,6 +609,16 @@ _ENTRIES = [
        "The two-sample companion: every half-sample comparison figure (panels + "
        "centroid + flux + asymmetry) in one call.",
        "run_all_plots_two(stacks_a, stacks_b, boot_a, boot_b, labels=('lo','hi'))"),
+    _e("plot_all_subsamples_grid", "analysis", "plotting", "One-call bundles",
+       "Visual QA grid over EVERY recipe in a split run at once: centroid "
+       "profile in column 0, flux profile (+ optional expcore fit) in column 1, "
+       "one row per recipe. Built for eyeballing scatter on small-N subsamples "
+       "(e.g. an 80-galaxy inclination split) across the whole recipe library "
+       "instead of one recipe at a time. Recomputes nothing but the fit "
+       "overlay -- the points come straight out of each run's cached boot "
+       "dict, so panels match the table. fit_kw is required when fit=True and "
+       "should be the same FIT_PLOT_KW the single-recipe cell passes.",
+       "plot_all_subsamples_grid(res, fit_kw=FIT_PLOT_KW)"),
     _e("plot_core_stack", "plotting", "plotting", "Fiber & mask visuals",
        "Three-panel quicklook of a build_core_stacks result: full spectrum with "
        "rest-UV lines, clipped continuum view, and the Lya region. For the "
@@ -798,24 +874,24 @@ _ENTRIES = [
        "product, in its current row order. The hand-off from top_sn_galaxies "
        "to multicat.stack_id_list.",
        "ids = id_list(sub)[:5]"),
-    _e("split_by_derived", "selection", "sample", "Split",
+    _e("split_by_derived", "selection", "sample", "Ad-hoc splits",
        "Split a product into sub-products by a DERIVED quantity (e.g. low/high "
        "sSFR). Returns a labelled dict ready for stack_each.",
        "parts = split_by_derived(product, lambda c: c['SFR'])"),
-    _e("split_by_mask", "selection", "sample", "Split",
+    _e("split_by_mask", "selection", "sample", "Ad-hoc splits",
        "Split a product into sub-products by your own boolean mask (True/False "
        "groups). For an ad-hoc two-way cut you already computed.",
        "parts = split_by_mask(product, product.catalog['z'] > 2.3)"),
-    _e("split_controlled", "selection", "sample", "Split",
+    _e("split_controlled", "selection", "sample", "Ad-hoc splits",
        "Low/high split of one property while holding a control variable fixed "
        "(matched within control bins). Use to compare samples without a "
        "confounding mass/z difference.",
        "lo, hi = split_controlled(product.catalog, 'SFR', control_col='MASS_50')"),
-    _e("split_by_redshift", "multicat", "sample", "Split",
+    _e("split_by_redshift", "multicat", "sample", "Ad-hoc splits",
        "Convenience split by the redshift column, by value edges or "
        "percentiles. The common low-z vs high-z cut in one call.",
        "parts = split_by_redshift(product, percentiles=(50,))"),
-    _e("split_product_by", "multicat", "sample", "Split",
+    _e("split_product_by", "multicat", "sample", "Ad-hoc splits",
        "Split ONE product into sub-products by any catalog column (edges / "
        "percentiles / groups), optionally writing each to disk. The general "
        "splitter split_by_redshift wraps.",
@@ -837,6 +913,31 @@ _ENTRIES = [
        "external catalog, matched by sky position. For splitting on a property "
        "that lives in another file.",
        "product = add_matched_column(product, external_table, 'sSFR')"),
+    _e("build_split_catalog", "multicat", "sample", "Split catalog (Layer A)",
+       "Layer A of the subsample-split pipeline: one row per galaxy, one column "
+       "per splittable quantity, keyed on the galaxy ID rather than a product's "
+       "galaxy axis. Exact ID join to the core extraction, positional match to "
+       "foreign catalogs, plus derived columns. Build it once, reuse it "
+       "everywhere.",
+       "sc = build_split_catalog(mega, core=prod_core)"),
+    _e("attach_split_catalog", "multicat", "sample", "Split catalog (Layer A)",
+       "Reindex a split catalog onto ANY product's galaxy axis by ID and return "
+       "the product with those columns on its catalog -- ready for "
+       "split_product_by. The counterpart to build_split_catalog.",
+       "mega2 = attach_split_catalog(mega, sc)"),
+    _e("split_catalog_report", "multicat", "sample", "Split catalog (Layer A)",
+       "Coverage audit: how many galaxies actually have each split variable, and "
+       "how much sample survives requiring several at once. Run this BEFORE "
+       "scoping a batch of splits -- it is the number roadmap Sec 3.3b turns on.",
+       "rep = split_catalog_report(sc, ['MASS_50', 'CORE_LOGL_LYA'])"),
+    _e("write_split_catalog", "multicat", "sample", "Split catalog (Layer A)",
+       "Write a split catalog to FITS with its provenance meta. Goes to OUTPUTS, "
+       "not the extraction cache -- it is cheap to rebuild.",
+       "write_split_catalog('outputs/split_catalog.fits', sc)"),
+    _e("read_split_catalog", "multicat", "sample", "Split catalog (Layer A)",
+       "Read a split catalog back. Restores the id_col and derived-column "
+       "provenance from the FITS header.",
+       "sc = read_split_catalog('outputs/split_catalog.fits')"),
     _e("stack_each", "multicat", "sample", "Multi-catalog",
        "Run build_stacks on each product in a labelled dict -> {label: stacks}. "
        "The batch Stage-2 for a split sample.",
@@ -864,7 +965,7 @@ _ENTRIES = [
        "and attach the density column. add_matched_column, specialized for this "
        "one catalog. Folded in from environment.py (2026-07-21).",
        "product = attach_overdensity(product, field='COSMOS')"),
-    _e("split_by_overdensity", "multicat", "sample", "Split",
+    _e("split_by_overdensity", "multicat", "sample", "Ad-hoc splits",
        "Low/high environment-density split using the attached Chartab column, "
        "across one or both fields, with an optional mass-matching pass. "
        "split_product_by, specialized for this one catalog. Folded in from "
@@ -990,7 +1091,7 @@ _ENTRIES = [
        "Galaxy-resampling bootstrap of the line-profile measurement, with a "
        "per-line S/N ranking. The error-bar version of measure_line_profiles.",
        "lb = bootstrap_line_profiles(cfg, stacks, lines)"),
-    _e("inspect_core_background", "core", "misc", "Core / escape-fraction",
+    _e("inspect_core_background", "core", "core", "Core extraction & escape fraction",
        "Diagnostic: compute the per-exposure + pooled annulus background for a "
        "few galaxies, RAW and SMOOTHED, WITHOUT running the full PSF core "
        "extraction. Returns exactly what extract_core_spectra would subtract, "
@@ -998,44 +1099,44 @@ _ENTRIES = [
        "or absorption lines dipping below zero) against its own background "
        "before deciding the subtraction scheme needs to change.",
        "bg = inspect_core_background(cfg, [17632, 30032], run_table=run_table)"),
-    _e("extract_core_spectra", "core", "misc", "Core / escape-fraction",
+    _e("extract_core_spectra", "core", "core", "Core extraction & escape fraction",
        "C1: PSF-weighted optimal extraction of ONE aperture spectrum per galaxy "
-       "(the core), a socket over optics.py. The start of the deferred "
+       "(the core), a socket over extract.py's optics helpers. The start of the deferred "
        "escape-fraction track; also the engine behind the mask A/B tool.",
        "Spec, Err, wave, cat = extract_core_spectra(cfg)"),
-    _e("run_core_hierarchical", "core", "misc", "Core / escape-fraction",
+    _e("run_core_hierarchical", "core", "core", "Core extraction & escape fraction",
        "The two-tier core measurement pass: detect, then measure/classify and "
        "(optionally) escape fraction for every galaxy. The main driver of the "
        "core / escape-fraction analysis.",
        "results = run_core_hierarchical(core_spec, core_err, wave_obs, catalog)"),
-    _e("lya_escape_fraction", "core", "misc", "Core / escape-fraction",
+    _e("lya_escape_fraction", "core", "core", "Core extraction & escape fraction",
        "Lya escape fraction anchored on dust-corrected Hbeta (Case B). The "
        "physics endpoint of the core track.",
        "fesc = lya_escape_fraction(Flya, e_Flya, Hb, e_Hb, ebv, e_ebv)"),
-    _e("compare_mask_spectra", "core", "misc", "Core / escape-fraction",
+    _e("compare_mask_spectra", "core", "core", "Core extraction & escape fraction",
        "Extract a few galaxies' core spectra once per candidate bad-fiber mask "
        "and overlay them -- the A/B instrument for validating a new mask "
        "against the old. Warns when two masks flag identical core fibers.",
        "fig, res = compare_mask_spectra(cfg, [17632, 30032], masks=[('img', bad_img), ('seg', bad_seg)])"),
-    _e("diagnose_core_fibers", "core", "misc", "Core / escape-fraction",
+    _e("diagnose_core_fibers", "core", "core", "Core extraction & escape fraction",
        "Explain WHY a core spectrum is NaN (or confirm it should extract) for a "
        "few galaxies, counting fibers at each stage. The debugger for empty "
        "cores.",
        "diagnose_core_fibers(cfg, [17632, 30032])"),
-    _e("audit_galaxy_mask_overlap", "core", "misc", "Core / escape-fraction",
+    _e("audit_galaxy_mask_overlap", "core", "core", "Core extraction & escape fraction",
        "Per-galaxy count of masked fibers near each galaxy's own center -- 'does "
        "the bad-fiber mask overlap this galaxy?'. Drives the appendix figure "
        "and the self-masking audit.",
        "audit = audit_galaxy_mask_overlap(vdfi, run_table, bad)"),
-    _e("read_core_fits", "core", "misc", "Core / escape-fraction",
+    _e("read_core_fits", "core", "core", "Core extraction & escape fraction",
        "Read a core product FITS back into plain arrays (flat or hierarchical "
        "schema). The loader for a saved core extraction.",
        "core = read_core_fits('outputs/core_AEGIS.fits')"),
-    _e("select_core", "core", "misc", "Core / escape-fraction",
+    _e("select_core", "core", "core", "Core extraction & escape fraction",
        "Pull galaxies from a core product by index, catalog id, or sky cone "
        "(pick one). The sample selector for the core track.",
        "sub = select_core(core, id_value=17632)"),
-    _e("core_mask", "core", "misc", "Core / escape-fraction",
+    _e("core_mask", "core", "core", "Core extraction & escape fraction",
        "Boolean per-galaxy mask from a criterion over the core results+catalog "
        "table (e.g. emitters). Feeds select/slice for the core sample.",
        "emitters = core_mask(core, lambda t: t['sn'] > 5)"),
@@ -1059,37 +1160,134 @@ _ENTRIES = [
        "product. No bootstrap (one object can't be resampled over galaxies); "
        "trust only bins where sg['sn'] is decent.",
        "m = measure_single_galaxy(sg, method='flux_weighted')"),
+    _e("psf_fwhm_kpc_for_galaxy", "single", "misc", "Single galaxy",
+       "This galaxy's PSF FWHM in kpc, per config.psf (config.PSFSpec) -- the "
+       "one entry point every single.py function uses to resolve a per-galaxy "
+       "PSF. provenance='measured' (default) needs vdfi+ra+dec (real per-"
+       "exposure VDFI seeing); 'fiducial' only needs z (fixed analytic Moffat).",
+       "p = psf_fwhm_kpc_for_galaxy(cfg, z, vdfi=vdfi, ra=ra, dec=dec)"),
+    _e("measure_single_galaxy_core_halo", "single", "misc", "Single galaxy",
+       "specs/single-galaxy-pipeline.md Part A: per-galaxy core flux, halo "
+       "flux, and the halo fraction, LEAK-AWARE (PSF flux corrected out of "
+       "the core is subtracted from the halo zone before summing, mirroring "
+       "measure.measure_psf_corrected_core_onehalo_luminosity for ONE galaxy, "
+       "no bootstrap). core_method='aperture' (default, innermost bin) | "
+       "'psf_weighted' (join to core.extract_core_spectra) | 'both'. Also "
+       "returns a two-halo zone (bins beyond boundary_kpc out to "
+       "twohalo_outer_kpc) measured with the same leak-aware formula, and "
+       "per-zone fiber counts as a coverage nuisance.",
+       "row = measure_single_galaxy_core_halo(cfg, product, gid=12345)"),
+    _e("measure_catalog_core_halo", "single", "misc", "Single galaxy",
+       "measure_single_galaxy_core_halo run over a whole catalog -> one "
+       "astropy Table, one row per galaxy, optionally hstacked with the "
+       "catalog's own columns so mass/z/SFR/overdensity sit next to "
+       "core_flux/halo_flux ready for a regression. Failures are KEPT as "
+       "ok=False rows, never dropped, and no S/N cut is applied -- negative "
+       "and low-S/N fluxes must survive for the downstream regression to be "
+       "unbiased. save_path writes the table once the pass finishes.",
+       "t = measure_catalog_core_halo(cfg, prod, core_method='aperture',\n"
+       "                              save_path='core_halo_cos.fits')"),
+    _e("variance_budget", "single", "misc", "Single galaxy",
+       "Go/no-go test for a per-galaxy statistic: splits the observed "
+       "scatter into real object-to-object variance and measurement noise "
+       "(Var_int = Var(y) - <sigma_i^2>), and reports how large the true "
+       "correlation would have to be to detect at this N given the noise "
+       "dilution. Screens BOTH the regression and the stack splits -- if "
+       "Var_int is consistent with zero, no split on anything will show a "
+       "difference either. ALWAYS pass reference= (an off-band / z-scrambled "
+       "null run of the SAME statistic): Var_int measures excess scatter of "
+       "any origin, so a per-galaxy systematic sails through every other "
+       "check -- the two-halo zone scored sigma_int/sigma_noise = 12.6 and "
+       "then the off-band null returned a LARGER sigma_int. f_sys is the "
+       "fraction the null explains; f_sys >~ 1 means the scatter is dead "
+       "even though the STACKED mean (reported separately as "
+       "mean_excess_sigma) may be perfectly fine.",
+       "null = measure_catalog_core_halo(cfg, prod, bounds=(1257., 1263.),\n"
+       "        cont_bounds=((1245.,1255.),(1265.,1275.)), join_catalog=False)\n"
+       "vb = variance_budget(t['halo_flux'], t['halo_flux_err'], name='halo',\n"
+       "        reference=(null['halo_flux'], null['halo_flux_err']))"),
+    _e("galaxy_image", "single", "misc", "Single galaxy",
+       "specs/single-galaxy-pipeline.md Part C: 2D narrowband on-band + "
+       "off-band image of ONE galaxy, gridded straight from vdfi's fibers "
+       "(no azimuthal-symmetry assumption). Fixed-kernel inverse-variance "
+       "gridder (h, pixel_size_kpc REQUIRED, no default -- tune by hand); "
+       "off-band uses config.cont_bounds as the built-in null.",
+       "vdfi = extract.load_field(cfg)   # once\n"
+       "img = galaxy_image(cfg, vdfi, product.catalog[i:i+1], h=8.0, pixel_size_kpc=4.0)"),
+    _e("plot_galaxy_image", "single", "misc", "Single galaxy",
+       "Display for galaxy_image's output: on-band + off-band on a SHARED "
+       "color scale, PSF contour overlaid by default (show_psf=False to "
+       "disable), optional N_eff panel.",
+       "fig, axs = plot_galaxy_image(img, show_n_eff=True)"),
+    _e("plot_psf_as_image", "single", "misc", "Single galaxy",
+       "DIAGNOSTIC (not required): this galaxy's own PSF rendered through "
+       "the SAME gridder + SAME fiber positions as its on-band image, so "
+       "coverage gaps/sampling irregularity an analytic curve can't show "
+       "become visible. Part C4's 'useful half' of the empirical-PSF idea.",
+       "fig, ax, grid = plot_psf_as_image(img)"),
+    _e("stack_galaxy_images", "single", "misc", "Single galaxy",
+       "specs/single-galaxy-pipeline.md Part D: stack per-galaxy kpc-gridded "
+       "images (median AND inv_var, a JOIN to measure.stack_galaxies) on ONE "
+       "shared physical grid. `rows` is any catalog subset -- splits.py cuts "
+       "work here with no new plumbing. random_rotate=True gives the "
+       "position-angle null.",
+       "stk = stack_galaxy_images(cfg, vdfi, product.catalog, h=8.0, "
+       "pixel_size_kpc=4.0, extent_kpc=600.0)"),
+    _e("azimuthal_profile", "single", "misc", "Single galaxy",
+       "Azimuthally-averaged radial profile of a 2D (stacked) image, binned "
+       "into the SAME r_edges the 1D pipeline uses -- the building block of "
+       "Part D's gating validation.",
+       "az = azimuthal_profile(image, x_centers, y_centers, r_edges)"),
+    _e("quadrant_asymmetry", "single", "misc", "Single galaxy",
+       "Part D symmetry diagnostic: total flux per quadrant + a simple "
+       "asymmetry statistic. Compare real vs random-rotation-null stacks.",
+       "q = quadrant_asymmetry(image, x_centers, y_centers)"),
+    _e("image_ellipticity", "single", "misc", "Single galaxy",
+       "Part D symmetry diagnostic: intensity-weighted second moments -> "
+       "axis ratio q and position angle.",
+       "e = image_ellipticity(image, x_centers, y_centers)"),
+    _e("validate_stack_vs_1d_profile", "single", "misc", "Single galaxy",
+       "Part D's GATING check: stacked-image azimuthal profile vs the "
+       "existing 1D radial profile, two independent code paths. "
+       "normalize='peak' (default) compares SHAPE only -- see the "
+       "docstring's unit caveat before trusting an absolute comparison.",
+       "val = validate_stack_vs_1d_profile(stack, r_edges, boot['total_flux_fid'])"),
+    _e("plot_stack_diagnostics", "single", "misc", "Single galaxy",
+       "One-stop Part D figure: stacked on/off-band images with PSF "
+       "contour, plus the azimuthal profile (and 1D overlay if a "
+       "validate_stack_vs_1d_profile result is passed).",
+       "fig, axs = plot_stack_diagnostics(stack, r_edges_kpc=r_edges, validation=val)"),
 
     # ---- Core characterization (moved from core.py) ----
-    _e("run_core_characterization", "validation", "validation", "Core characterization",
+    _e("run_core_characterization", "validation", "core", "Core characterization",
        "One-call driver for the whole per-galaxy core-credibility suite: runs the "
        "synthetic + real-noise injections, the redshift null, and (optionally) the "
        "estimator comparison, extracting completeness curves along the way. Every "
        "sub-function's parameters are exposed here (syn_/samp_/null_/compare_) so "
        "nothing runs on a hidden default.",
        "cc = run_core_characterization(Spec, Err, wave_obs, catalog)"),
-    _e("injection_recovery_synthetic", "validation", "validation", "Core characterization",
+    _e("injection_recovery_synthetic", "validation", "core", "Core characterization",
        "Method characterization on SYNTHETIC noise: inject a Lya line of known "
        "flux many times per level and report each estimator's bias, scatter, and "
        "detection rate. The input-flux=0 case exposes peak-chasing bias and sets "
        "the flux floor. (This is core's old injection_recovery, renamed to avoid "
        "clashing with validation's cube-based one.)",
        "inj = injection_recovery_synthetic(wave_obs, np.nanmedian(Err, axis=0))"),
-    _e("injection_recovery_sample", "validation", "validation", "Core characterization",
+    _e("injection_recovery_sample", "validation", "core", "Core characterization",
        "Realistic completeness: inject at controlled input S/N into each galaxy's "
        "ACTUAL noise spectrum, so the recovery fraction reflects the real sample "
        "-- 'at input S/N=3, what fraction would I detect?'.",
        "inj = injection_recovery_sample(Err, wave_obs, catalog)"),
-    _e("detection_completeness", "validation", "validation", "Core characterization",
+    _e("detection_completeness", "validation", "core", "Core characterization",
        "Pull the completeness curve (detection rate vs input flux or input S/N) "
        "out of either injection result. The summarizing step you'd plot or quote.",
        "x, rate = detection_completeness(inj)"),
-    _e("null_redshift_test", "validation", "validation", "Core characterization",
+    _e("null_redshift_test", "validation", "core", "Core characterization",
        "False-positive test: permute redshifts and measure 'Lya' at the WRONG z, "
        "so any line found is spurious. Calibrates the per-galaxy significance "
        "threshold (the per-galaxy analog of the z-scramble stack null).",
        "nz = null_redshift_test(Spec, Err, wave_obs, catalog['z'])"),
-    _e("compare_estimators", "validation", "validation", "Core characterization",
+    _e("compare_estimators", "validation", "core", "Core characterization",
        "Run all three core flux estimators on ONE rest-frame spectrum and "
        "tabulate their flux / S-N / classification side by side. A fast "
        "'do my estimators agree on this galaxy?' check.",
@@ -1312,61 +1510,61 @@ _ENTRIES = [
        "Generic numerical local log-log slope d(ln y)/d(ln r) via central "
        "differences, for any curve (not just the expcore two-halo term).",
        "slope = local_loglog_slope(r_fine, y_fine)"),
-    _e("sersic_bn", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("sersic_bn", "fitting", "uv", "Radial profile fit",
        "Ciotti & Bertin (1999) approximation for b_n, the constant in the "
        "Sersic profile's exponent -- feeds intrinsic_profile_uv_sersic.",
        "bn = sersic_bn(n=1.0)"),
-    _e("intrinsic_profile_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("intrinsic_profile_uv_exp", "fitting", "uv", "Radial profile fit",
        "I(r) = A*exp(-r/h_uv) -- Part 3's default single-exponential "
        "UV-continuum model.",
        "y = intrinsic_profile_uv_exp(r_fine, A, h_uv)"),
-    _e("intrinsic_profile_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("intrinsic_profile_uv_sersic", "fitting", "uv", "Radial profile fit",
        "I(r) = A*exp(-b_n*[(r/r_e)^(1/n) - 1]) -- Part 3's optional Sersic "
        "alternative to the single exponential.",
        "y = intrinsic_profile_uv_sersic(r_fine, A, r_e, n)"),
-    _e("bin_average_no_psf_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("bin_average_no_psf_uv_exp", "fitting", "uv", "Radial profile fit",
        "Mean intrinsic single-exponential UV flux in each bin, no PSF.",
        "y_bin = bin_average_no_psf_uv_exp(r_edges, r_fine, A, h_uv)"),
-    _e("bin_average_psf_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("bin_average_psf_uv_exp", "fitting", "uv", "Radial profile fit",
        "Mean PSF-smeared single-exponential UV surface brightness in each bin.",
        "y_bin = bin_average_psf_uv_exp(R, r_fine, A, h_uv)"),
-    _e("bin_average_no_psf_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("bin_average_no_psf_uv_sersic", "fitting", "uv", "Radial profile fit",
        "Sersic analogue of bin_average_no_psf_uv_exp.",
        "y_bin = bin_average_no_psf_uv_sersic(r_edges, r_fine, A, r_e, n)"),
-    _e("bin_average_psf_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("bin_average_psf_uv_sersic", "fitting", "uv", "Radial profile fit",
        "Sersic analogue of bin_average_psf_uv_exp.",
        "y_bin = bin_average_psf_uv_sersic(R, r_fine, A, r_e, n)"),
-    _e("describe_fit_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("describe_fit_uv_exp", "fitting", "uv", "Radial profile fit",
        "Pretty-print a single-exponential UV fit result -- same role as "
        "describe_fit_expcore, for the UV-continuum model.",
        "describe_fit_uv_exp(result)"),
-    _e("describe_fit_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("describe_fit_uv_sersic", "fitting", "uv", "Radial profile fit",
        "Pretty-print a Sersic UV fit result.",
        "describe_fit_uv_sersic(result)"),
-    _e("fit_naive_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("fit_naive_uv_exp", "fitting", "uv", "Radial profile fit",
        "Single-exponential UV-continuum fit with NO PSF -- drop-inner-bin(s) "
        "convention, same as fit_naive.",
        "result = fit_naive_uv_exp(r_mid, r_edges, r_fine, y_fid, sigma)"),
-    _e("fit_psf_aware_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("fit_psf_aware_uv_exp", "fitting", "uv", "Radial profile fit",
        "Single-exponential UV-continuum fit WITH the PSF forward model -- "
        "the real UV/Lya-scale-ratio result (h1~16-17kpc Lya, UV~1.55kpc, "
        "ratio ~10:1) came from this fit.",
        "result = fit_psf_aware_uv_exp(r_mid, y_fid, sigma, R, r_fine, r_edges)"),
-    _e("fit_naive_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("fit_naive_uv_sersic", "fitting", "uv", "Radial profile fit",
        "Sersic UV-continuum fit with NO PSF -- same naive/drop-inner-bin(s) "
        "convention as fit_naive_uv_exp.",
        "result = fit_naive_uv_sersic(r_mid, r_edges, r_fine, y_fid, sigma)"),
-    _e("fit_psf_aware_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("fit_psf_aware_uv_sersic", "fitting", "uv", "Radial profile fit",
        "Sersic UV-continuum fit WITH the PSF forward model -- same structure "
        "as fit_psf_aware_uv_exp.",
        "result = fit_psf_aware_uv_sersic(r_mid, y_fid, sigma, R, r_fine, r_edges)"),
-    _e("binned_model_from_result_uv_exp", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("binned_model_from_result_uv_exp", "fitting", "uv", "Radial profile fit",
        "UV-exponential analogue of binned_model_from_result.",
        "y_pred = binned_model_from_result_uv_exp(result, r_fine, r_edges, R)"),
-    _e("binned_model_from_result_uv_sersic", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("binned_model_from_result_uv_sersic", "fitting", "uv", "Radial profile fit",
        "UV-Sersic analogue of binned_model_from_result_expcore.",
        "y_pred = binned_model_from_result_uv_sersic(result, r_fine, r_edges, R)"),
-    _e("plot_uv_fit", "fitting", "fitting", "UV-continuum fit (Part 3)",
+    _e("plot_uv_fit", "fitting", "uv", "Radial profile fit",
        "Notebook-testing convenience for halo-flux-fitting.md Part 3's UV "
        "fit -- quick-look plot of a UV coadd + its fitted curve.",
        "plot_uv_fit(r_mid, y_fid, result, r_fine)"),
@@ -1571,217 +1769,349 @@ _ENTRIES = [
     # ratio, see [[uv-lya-scale-result]]), but it isn't wired into the main
     # Stage 1-3 driver path the way measure.py/analysis.py are.
     # =====================================================================
-    _e("resolve_uv_image_path", "uv_profile", "uv_continuum", "Field & catalog I/O",
+    _e("resolve_uv_image_path", "uv_profile", "uv", "Field & catalog I/O",
        "Per-field CFHT-LS r-band image path, from the normalized field name.",
        "path = resolve_uv_image_path('COSMOS')"),
-    _e("resolve_uv_segmap_path", "uv_profile", "uv_continuum", "Field & catalog I/O",
+    _e("resolve_uv_segmap_path", "uv_profile", "uv", "Field & catalog I/O",
        "Per-field background segmap path, or None if not configured for "
        "that field.",
        "path = resolve_uv_segmap_path('COSMOS')"),
-    _e("read_seeing_fwhm_arcsec", "uv_profile", "uv_continuum", "Field & catalog I/O",
+    _e("read_seeing_fwhm_arcsec", "uv_profile", "uv", "Field & catalog I/O",
        "Seeing FWHM (arcsec) for a field, tried from each of the configured "
        "FITS header keys in turn.",
        "fwhm = read_seeing_fwhm_arcsec('COSMOS')"),
-    _e("get_uv_sample_catalog", "uv_profile", "uv_continuum", "Field & catalog I/O",
+    _e("get_uv_sample_catalog", "uv_profile", "uv", "Field & catalog I/O",
        "Pull the RA/Dec/z/mass sample straight from the already-built Lya "
        "product -- the same galaxies the halo-profile pipeline uses.",
        "catalog = get_uv_sample_catalog(product)"),
-    _e("compute_field_bbox", "uv_profile", "uv_continuum", "Field & catalog I/O",
+    _e("compute_field_bbox", "uv_profile", "uv", "Field & catalog I/O",
        "RA/Dec bounding box for one field's subsample of the catalog, "
        "padded by a margin -- sizes build_field_cutout.",
        "bbox = compute_field_bbox(catalog, 'COSMOS')"),
-    _e("validate_cutout_covers_sample", "uv_profile", "uv_continuum", "Field & catalog I/O",
+    _e("validate_cutout_covers_sample", "uv_profile", "uv", "Field & catalog I/O",
        "Check whether an existing cutout FITS's WCS footprint covers every "
        "galaxy in the sample -- a sanity check before extraction, not a "
        "measurement.",
        "validate_cutout_covers_sample(cutout_path, catalog, 'COSMOS')"),
-    _e("build_field_cutout", "uv_profile", "uv_continuum", "Field & catalog I/O",
+    _e("build_field_cutout", "uv_profile", "uv", "Field & catalog I/O",
        "Build a WCS-aware cutout FITS from the full ~1 deg^2 mosaic, sized "
        "to cover the field's sample with margin.",
        "cutout_path = build_field_cutout('COSMOS', catalog)"),
-    _e("psf_fwhm_kpc_for_z", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("psf_fwhm_kpc_for_z", "uv_profile", "uv", "Per-galaxy extraction",
        "Convert an angular seeing FWHM (arcsec) to a physical FWHM (kpc) at "
        "one galaxy's redshift.",
        "fwhm_kpc = psf_fwhm_kpc_for_z(fwhm_arcsec, z)"),
-    _e("make_galaxy_cutout", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("make_galaxy_cutout", "uv_profile", "uv", "Per-galaxy extraction",
        "Small WCS-aware stamp around (ra, dec), sized by size_arcsec -- the "
        "per-galaxy starting point for centroiding and photometry.",
        "cutout = make_galaxy_cutout(field_cutout, ra, dec, size_arcsec=10)"),
-    _e("centroid_galaxy", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("centroid_galaxy", "uv_profile", "uv", "Per-galaxy extraction",
        "2D-Gaussian centroid (photutils.centroid_2dg) on a galaxy cutout, "
        "windowed to avoid neighbor contamination. Kept-but-flagged, never "
        "silently dropped, if it fails.",
        "xc, yc, ok = centroid_galaxy(cutout)"),
-    _e("align_segmap_to_grid", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("align_segmap_to_grid", "uv_profile", "uv", "Per-galaxy extraction",
        "Reproject a segmentation-mask FITS onto a target (wcs, shape) grid -- "
        "aligns the neighbor-masking segmap to a galaxy cutout's own pixels.",
        "seg_aligned = align_segmap_to_grid(segmap, target_wcs, target_shape)"),
-    _e("compute_field_background", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("compute_field_background", "uv_profile", "uv", "Per-galaxy extraction",
        "Global background level for one field's cutout: masked-median of "
        "unmasked sky pixels.",
        "bg = compute_field_background(field_cutout, segmap)"),
-    _e("radial_bin_edges_uv", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("radial_bin_edges_uv", "uv_profile", "uv", "Per-galaxy extraction",
        "Per-galaxy kpc bin edges converted to arcsec, using that galaxy's "
        "own z -- reuses the halo-profile pipeline's bin_mode convention.",
        "edges_arcsec = radial_bin_edges_uv(r_edges_kpc, z)"),
-    _e("measure_uv_annuli", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("measure_uv_annuli", "uv_profile", "uv", "Per-galaxy extraction",
        "Per-annulus flux, background-subtracted, reduced across pixels via "
        "masked-median with segmap-based neighbor masking.",
        "flux_per_bin = measure_uv_annuli(cutout, edges_arcsec, bg, segmap)"),
-    _e("extract_uv_profiles_for_field", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("extract_uv_profiles_for_field", "uv_profile", "uv", "Per-galaxy extraction",
        "Single-field-at-a-time loop over every galaxy in the catalog: "
        "cutout -> centroid -> background -> annuli, one dict per galaxy.",
        "profiles = extract_uv_profiles_for_field('COSMOS', catalog, cfg)"),
-    _e("summarize_uv_extraction", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("summarize_uv_extraction", "uv_profile", "uv", "Per-galaxy extraction",
        "QC summary over a list of per-galaxy extraction dicts -- centroid "
        "success rate, flagged galaxies, basic sanity stats. Diagnostic, not "
        "part of the measurement itself.",
        "summarize_uv_extraction(profiles)"),
-    _e("run_uv_extraction_testbed", "uv_profile", "uv_continuum", "Per-galaxy extraction",
+    _e("run_uv_extraction_testbed", "uv_profile", "uv", "Per-galaxy extraction",
        "One-call smoke test: get_uv_sample_catalog -> resolve image path -> "
        "extract_uv_profiles_for_field, for a quick end-to-end check. Testing "
        "convenience, not a production driver.",
        "profiles = run_uv_extraction_testbed('COSMOS', cfg)"),
-    _e("coadd_uv_profiles", "uv_profile", "uv_continuum", "Coadd & fit",
+    _e("coadd_uv_profiles", "uv_profile", "uv", "Coadd & bootstrap",
        "Coadd per-galaxy UV profiles (extract_uv_profiles_for_field's list) "
        "into one stacked radial profile, via a chosen combine method.",
        "stack = coadd_uv_profiles(profiles, method='biweight')"),
-    _e("bootstrap_uv_coadd", "uv_profile", "uv_continuum", "Coadd & fit",
+    _e("bootstrap_uv_coadd", "uv_profile", "uv", "Coadd & bootstrap",
        "Bootstrap error band for one coadd_uv_profiles() method, resampling "
        "the galaxy list.",
        "boot = bootstrap_uv_coadd(profiles, method='biweight', nboot=1000)"),
-    _e("fit_and_plot_uv_coadd", "uv_profile", "uv_continuum", "Coadd & fit",
+    _e("fit_and_plot_uv_coadd", "uv_profile", "uv", "Coadd & bootstrap",
        "Fit + plot one coadd_uv_profiles() method's stacked profile, via "
        "fitting.fit_psf_aware_uv_exp/_uv_sersic.",
        "result = fit_and_plot_uv_coadd(boot, r_edges_kpc)"),
-    _e("stack_and_bootstrap_uv", "uv_profile", "uv_continuum", "Coadd & fit",
+    _e("stack_and_bootstrap_uv", "uv_profile", "uv", "Coadd & bootstrap",
        "Coadd + bootstrap ONCE, decoupled from fitting -- run this a single "
        "time, then fit_and_plot_uv_coadd/fitting.* as many times as needed "
        "without re-stacking.",
        "boot = stack_and_bootstrap_uv(profiles, r_edges_kpc)"),
-    _e("bootstrap_and_fit_uv", "uv_profile", "uv_continuum", "Coadd & fit",
+    _e("bootstrap_and_fit_uv", "uv_profile", "uv", "Coadd & bootstrap",
        "One-call coadd -> bootstrap -> fit -> plot for the UV-continuum "
        "sample -- the end-to-end convenience wrapping the steps above.",
        "result = bootstrap_and_fit_uv(profiles, r_edges_kpc)"),
-    _e("measure_stellar_psf", "uv_profile", "uv_continuum", "Stellar PSF",
+    _e("measure_stellar_psf", "uv_profile", "uv", "Stellar PSF",
        "Measure the empirical stellar PSF for a field: each star's radial "
        "profile, coadded -- the psf_empirical alternative to a fitted Moffat.",
        "psf_r, psf_vals = measure_stellar_psf('COSMOS', star_catalog)"),
-    _e("fit_moffat_psf", "uv_profile", "uv_continuum", "Stellar PSF",
+    _e("fit_moffat_psf", "uv_profile", "uv", "Stellar PSF",
        "Fit an analytic Moffat (both FWHM and beta free) to a measured "
        "stellar PSF curve -- the alternative to keeping the empirical curve "
        "as-is (see [[uv-psf-empirical-decision]]).",
        "fwhm, beta = fit_moffat_psf(psf_r, psf_vals)"),
-    _e("psf_empirical_entry", "uv_profile", "uv_continuum", "Stellar PSF",
+    _e("psf_empirical_entry", "uv_profile", "uv", "Stellar PSF",
        "Turn a measured stellar-PSF curve into a paste-ready config entry "
        "for the psf_empirical slot.",
        "entry = psf_empirical_entry(psf_r, psf_vals)"),
-    _e("build_effective_psf_uv", "uv_profile", "uv_continuum", "Stellar PSF",
+    _e("build_effective_psf_uv", "uv_profile", "uv", "Stellar PSF",
        "Build the sample's effective PSF curve (psf_r, psf_vals) in kpc, "
        "per-galaxy kpc-converted and combined -- what the UV PSF-aware fit "
        "actually convolves with.",
        "psf_r, psf_vals = build_effective_psf_uv(profiles)"),
-    _e("apply_psf_to_results", "uv_profile", "uv_continuum", "Stellar PSF",
+    _e("apply_psf_to_results", "uv_profile", "uv", "Stellar PSF",
        "(Re)assign each galaxy's PSF metadata -- psf_fwhm_arcsec, "
        "psf_fwhm_kpc, etc. -- onto an existing extraction-results list.",
        "profiles = apply_psf_to_results(profiles, psf_r, psf_vals)"),
 
     # ===================== LIS / REST-UV LINE VELOCITIES =====================
-    _e("line_spec", "lis", "lis", "Line table",
+    _e("line_spec", "measure_lines", "core", "LIS: lines & continuum",
        "Resolve a line name (or a LineSpec) into its LineSpec: rest "
        "wavelength, absorption/emission sign, the Weldon+2022 Table 1 "
        "continuum windows, and any blended fine-structure partners. Every "
        "window in the table is theirs verbatim -- none are invented.",
        "spec = line_spec('SiII1526'); print(spec.cont_bounds, spec.note)"),
-    _e("science_lines", "lis", "lis", "Line table",
+    _e("science_lines", "measure_lines", "core", "LIS: lines & continuum",
        "Topping's three best redshift lines (Si II 1260, C II 1334, "
        "Si II 1526) as LineSpecs. Note that 'uncontaminated' was their "
        "judgement at LRIS-B resolution (~7 A), which is COARSER than VIRUS, "
        "so two of the three are still blended for us -- see BLENDED_AT_VIRUS.",
        "for s in science_lines(): print(s.name, s.ncomp_recommended)"),
-    _e("normalize_local", "lis", "lis", "Continuum",
+    _e("normalize_local", "measure_lines", "core", "LIS: lines & continuum",
        "Local continuum and normalized spectrum over one line's window. "
        "'weldon_linear' is their sec 2.2 recipe verbatim (a straight line "
        "between the two window means); 'poly' is the robust sigma-clipped "
        "polynomial, for the sensitivity test.",
        "n = normalize_local(rest_wave, flux, err, 'SiII1526')"),
-    _e("measure_extremum", "lis", "lis", "Estimators",
+    _e("measure_extremum", "measure_lines", "core", "LIS: estimators & drivers",
        "Weldon's COMPOSITE estimator: the wavelength of the absolute trough "
        "minimum (or peak maximum). Parabola-refined by default because one "
        "rest-grid pixel is ~40-50 km/s, comparable to the effect being "
        "measured. Compare this to their composite values, not to -60.",
        "e = measure_extremum(n['wave'], n['nflux'], 'SiII1526')"),
-    _e("fit_line_profile", "lis", "lis", "Estimators",
+    _e("fit_line_profile", "measure_lines", "core", "LIS: estimators & drivers",
        "Weldon's PER-OBJECT estimator: polynomial continuum plus N Gaussians "
        "fit simultaneously, sharing one velocity and width, amplitudes "
        "sign-constrained. Velocity is a direct fit parameter. ncomp>1 adds the "
        "blended partners; simultaneous=False gives the two-step variant.",
        "f = fit_line_profile(rest_wave, flux, err, 'CII1334', ncomp=2, z=2.3)"),
-    _e("measure_line", "lis", "lis", "Drivers",
+    _e("measure_line", "measure_lines", "core", "LIS: estimators & drivers",
        "One line, BOTH estimators, plus Topping's error model (100 refits of "
        "the spectrum perturbed by its error spectrum; value = MC mean, error = "
        "MC std). This is measurement error on one stack only -- sample error "
        "is a separate bootstrap term and must not be conflated with it.",
        "r = measure_line(rest_wave, flux, err, 'SiII1526', z=2.3)"),
-    _e("measure_lines", "lis", "lis", "Drivers",
+    _e("measure_lines", "measure_lines", "core", "LIS: estimators & drivers",
        "Loop measure_line over a line set. lines='science' for Topping's "
        "three, None for all. ncomp accepts an int, a per-line dict, or "
        "'recommended' (enough components per line for an unbiased velocity).",
        "res = measure_lines(rest_wave, flux, err, lines='science', z=2.3)"),
-    _e("measure_lis_stack", "lis", "lis", "Drivers",
+    _e("measure_lis_stack", "measure_lines", "core", "LIS: estimators & drivers",
        "Wrapper over a stack.build_core_stacks return value: picks a combine "
        "method, carries z_median through for the LSF prior, and warns when the "
        "stack is not the Weldon-matching coadd (output='L_fiber', "
        "method='mean' -- luminosity density, unweighted average).",
        "res = measure_lis_stack(core_stacks, method='mean', lines='science')"),
-    _e("compare_ncomp", "lis", "lis", "Comparison & reporting",
+    _e("compare_ncomp", "measure_lines", "core", "LIS: comparison & diagnostics",
        "Run every line at ncomp=1 (the Topping-matched estimator) and at its "
        "recommended ncomp, and report the shift. That shift IS the blend "
        "systematic for the line -- quote it, don't silently apply it. "
        "Injection-recovery: C II 1334 shifts ~83 km/s, Si II 1260 ~42, "
        "Si II 1526 ~3.",
        "cmp = compare_ncomp(rest_wave, flux, err, lines='science', z=2.3)"),
-    _e("compare_cont_order", "lis", "lis", "Comparison & reporting",
+    _e("compare_cont_order", "measure_lines", "core", "LIS: comparison & diagnostics",
        "Refit each line at several continuum polynomial orders (default 2 then "
        "1) and report the velocity shift as a systematic. A quadratic over the "
        "~30-45 A fit span can curve into the trough, eat the wings and leave a "
        "narrow core -- the tell is a fitted FWHM sitting on the LSF floor. "
        "Order 2 stays primary because it is Topping-matched.",
        "describe_cont_order(compare_cont_order(w, f, e, z=z_med))"),
-    _e("describe_cont_order", "lis", "lis", "Comparison & reporting",
+    _e("describe_cont_order", "measure_lines", "core", "LIS: comparison & diagnostics",
        "Printer for compare_cont_order; flags any order whose fitted width "
        "sits on the instrumental floor.",
        "describe_cont_order(cmp)"),
-    _e("z_lis_average", "lis", "lis", "Comparison & reporting",
+    _e("z_lis_average", "measure_lines", "core", "LIS: comparison & diagnostics",
        "Topping's z_LIS: the UNWEIGHTED mean over Si II 1260, C II 1334 and "
        "Si II 1526 of whichever fits succeeded. Unweighted is deliberate -- "
        "inverse-variance weighting would stop the estimator matching "
        "-60+/-10. Also returns the line-to-line spread (an optical-depth "
        "term, not an error on the mean).",
        "avg = z_lis_average(res, estimator='gauss')"),
-    _e("describe_lis", "lis", "lis", "Comparison & reporting",
+    _e("describe_lis", "measure_lines", "core", "LIS: comparison & diagnostics",
        "Print the per-line table (both estimators, asymmetry, FWHM, EW, S/N) "
        "with the Weldon comparison, the combined sigma including the 22 km/s "
        "LRIS floor, and a reminder that this constrains eps_VIRUS - eps_LRIS "
        "rather than the MOSDEF tie.",
        "describe_lis(res)"),
-    _e("as_line_result", "lis", "lis", "Diagnostics",
+    _e("as_line_result", "measure_lines", "core", "LIS: comparison & diagnostics",
        "Coerce any of the three result shapes (measure_line single-line dict, "
        "measure_lines name->dict mapping, measure_lis_stack {'lines','meta'}) "
        "down to ONE single-line dict. Raises with the available line names "
        "instead of guessing when a multi-line container is passed without "
        "line=.",
        "r = as_line_result(res, line='SiII1526')"),
-    _e("plot_lis_fit", "lis", "lis", "Diagnostics",
+    _e("plot_lis_fit", "measure_lines", "core", "LIS: comparison & diagnostics",
        "Normalized spectrum, fitted model, continuum windows, and both "
        "estimator positions for one line. This is Topping's 'manually "
        "inspected the fits to each line' step -- look before trusting. "
        "Accepts any result shape; pass line= when handing it a container.",
        "plot_lis_fit(res, line='SiII1526')"),
-    _e("plot_lis_grid", "lis", "lis", "Diagnostics",
+    _e("plot_lis_grid", "measure_lines", "core", "LIS: comparison & diagnostics",
        "plot_lis_fit for every measured line in one figure, science lines "
        "first.",
        "fig, axes = plot_lis_grid(res)"),
+
+    # ===================== SUBSAMPLE SPLITS =====================
+    _e("normalize_recipe", "splits", "sample", "Recipe library (Layer B)",
+       "Validate a split recipe and fill its defaults. Rejects unknown keys -- "
+       "a typo'd key would otherwise be silently ignored and you would get the "
+       "DEFAULT behaviour under a name that says otherwise.",
+       "rec = splits.normalize_recipe(splits.LIBRARY['mass_half'], min_n=120)"),
+    _e("recipe_hash", "splits", "sample", "Recipe library (Layer B)",
+       "12-char hash of everything in a recipe that can change a number. Part "
+       "of the cache key; doc/predicted prose is excluded so fixing a typo "
+       "cannot invalidate a 6-hour batch.",
+       "h = splits.recipe_hash(rec)"),
+    _e("resolve_recipes", "splits", "sample", "Recipe library (Layer B)",
+       "Accept a name, a recipe dict, or any list/dict of either and return "
+       "{name: recipe}. This is what lets run() take 'all of them' and 'just "
+       "this one' as the same call.",
+       "recs = splits.resolve_recipes(['mass_half', 'inclination'])"),
+    _e("edit_recipe", "splits", "sample", "Recipe library (Layer B)",
+       "Change one recipe and save it, from a notebook cell -- no text editor. "
+       "Reads your JSON (creating it if needed), applies the change, validates, "
+       "writes it back, and reloads LIBRARY so the next preview/run sees it.",
+       "splits.edit_recipe(PATH, 'dust_massctrl', column='EBV')"),
+    _e("is_unreviewed", "splits", "sample", "Recipe library (Layer B)",
+       "True if a recipe's `predicted` string is still Claude's draft rather "
+       "than yours. show() marks these and describe() warns on them -- a "
+       "prediction you did not write is not a pre-registration. Clear it by "
+       "setting predicted_by in your own recipe JSON.",
+       "unrev = [n for n,r in splits.LIBRARY.items() if splits.is_unreviewed(r)]"),
+    _e("save_library", "splits", "sample", "Recipe library (Layer B)",
+       "Write recipes to JSON so you can edit them OUTSIDE the code. Default "
+       "dumps the whole shipped LIBRARY as a correctly-shaped starting point; "
+       "trim it to just what you change.",
+       "splits.save_library('../catalogs/split_catalogs/my_recipes.json')"),
+    _e("load_library", "splits", "sample", "Recipe library (Layer B)",
+       "Read recipes from JSON and merge them into LIBRARY by name -- matching "
+       "names replace the shipped entry, new names are added, the rest are left "
+       "alone. Validates on the way in, so a typo raises here rather than three "
+       "hours into a batch.",
+       "splits.load_library('../catalogs/split_catalogs/my_recipes.json')"),
+    _e("use_recipes", "splits", "sample", "Recipe library (Layer B)",
+       "Merge recipes from a PYTHON OBJECT into LIBRARY. The whole library lives "
+       "in utils_lya_halo/splits_recipes.py and is loaded automatically when "
+       "splits.py is imported, so you only need this after EDITING that file -- "
+       "reload it, then push the edits in. Same merge-by-name semantics and same "
+       "validation as load_library.",
+       "importlib.reload(splits_recipes)\n"
+       "splits.use_recipes(splits_recipes.RECIPES)"),
+    _e("cache_status", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Would run()/load() HIT the cache with these arguments? Milliseconds, no "
+       "measurement. Reports HIT / MISS / STALE per side, and when STALE says "
+       "WHICH of the five key components differs from the file on disk. Pass "
+       "EXACTLY the arguments you intend to give run() -- a cache miss and a "
+       "first run are otherwise indistinguishable, which is how seed=None on "
+       "load() silently returns nothing after a successful run.",
+       "splits.cache_status(cfg2, BATCH, product=prod_combined, splitcat=sc,\n"
+       "                    level=LEVEL, seed=SEED, nboot_fit=NBOOT_FIT, fit_kw=FIT_KW)"),
+    _e("why_miss", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Alias for cache_status() -- the name you will actually think of at 2am.",
+       "splits.why_miss(cfg2, ['mass_half'], product=prod_combined, seed=SEED)"),
+    _e("show", "splits", "sample", "Recipe library (Layer B)",
+       "Print the recipe library: column, mode, control, base, core tier, "
+       "family, confirmatory/exploratory, and the pre-specified prediction. "
+       "Needs no data -- the 'what could I run' view.",
+       "splits.show()"),
+    _e("resolve_eligibility", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Which galaxies a recipe may use, and what removed the rest: base mask, "
+       "then CORE_COVERED only if asked for, then require expressions, then "
+       "finite column. A catalog split must NOT inherit a core cut.",
+       "el = splits.resolve_eligibility(prod.catalog, rec, verbose=True)"),
+    _e("cut", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Turn one recipe into labelled sides, recording the realized cut value "
+       "in physical units, the per-side median, and (controlled recipes) the "
+       "residual control offset. Handles half/trend/bounds/groups, controlled "
+       "and per-field.",
+       "sides = splits.cut(prod, rec)"),
+    _e("check_cut_equivalence", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Acceptance test: run splits.cut and multicat.split_product_by on the "
+       "same sample and assert identical ID sets per side. If this fails, the "
+       "runner diverged from a hand-run split at the very first step.",
+       "assert splits.check_cut_equivalence(prod, 'mass_half')"),
+    _e("preview", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Eligibility + cut + warnings only -- no stacking, no bootstrap. Seconds "
+       "for the whole library versus ~20 min per recipe to run. Run it first "
+       "after any change to the split catalog.",
+       "splits.preview(cfg, prod, splitcat=sc)"),
+    _e("independence", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Spearman correlation of the split variables, overlap matrix of the "
+       "resulting sides (0.5 = chance, 1.0 = the same split twice), and M_eff. "
+       "Runs on the split catalog alone -- no extraction needed.",
+       "splits.independence(splitcat)"),
+    _e("plot_independence", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Both independence matrices as lower-triangle heatmaps, colour only -- "
+       "at 15x15 the printed tables are unreadable and the figure is not. "
+       "Recipes are grouped by family so the redundancy blocks are visible. "
+       "Reachable as independence(..., graph=True).",
+       "splits.independence(sc, graph=True, save_fig=True)"),
+    _e("run", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "THE runner. Slice -> stack -> bootstrap -> fit -> boundary -> derived "
+       "quantities -> power flags -> cache, for one recipe or the whole "
+       "library. Resumable: one cache file per side. "
+       "level='quick'|'standard'|'full'.",
+       "res = splits.run(cfg, prod, 'mass_half', splitcat=sc)"),
+    _e("intersect", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Re-run a set of recipes on their COMMON eligible sample. Use when two "
+       "splits are being compared TO EACH OTHER -- otherwise the comparison is "
+       "of sample composition as much as physics.",
+       "res = splits.intersect(cfg, prod, ['mass_half','lya_lum'], splitcat=sc)"),
+    _e("load", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "Rehydrate every cached side under the current extraction signature "
+       "without computing anything. The cache-key arguments must match the run "
+       "that wrote them.",
+       "res = splits.load(cfg, 'mass_half')"),
+    _e("describe", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "One printed summary per side via analysis.describe_subsample_properties, "
+       "preceded by the recipe's pre-specification and tier -- so 'we predicted "
+       "this' is on record before the numbers.",
+       "splits.describe(res['mass_half'])"),
+    _e("table", "splits", "sample", "Runner, cache & reporting (Layer C)",
+       "A table straight from results, no adapter code -- side dicts are already "
+       "shaped to formatting's kwargs. fmt='latex' (default) is the PAPER table: "
+       "footnote letters, units in a Note line. fmt='markdown' is the READING "
+       "table: units in the headers, recipe/side as separate sortable columns, "
+       "an N column, and a flags column that surfaces degenerate fits and "
+       "fallback boundaries. Both footnote the measurement level.",
+       "print(splits.table(res))                       # .tex draft\n"
+       "print(splits.table(res, fmt='markdown'))       # Obsidian / Jupyter\n"
+       "print(splits.table(res, fmt='md', math=False)) # terminal"),
+    _e("split_controlled_bins", "selection", "sample", "Ad-hoc splits",
+       "N-way ORDERED split at fixed control variable -- the trend-mode "
+       "generalization of split_controlled. Rank-within-control-bin, then "
+       "pooled, so the control's distribution matches across all N groups.",
+       "masks = selection.split_controlled_bins(cat, 'MASS_50', 'z', n_bins=4)"),
 ]
 
 
@@ -1797,9 +2127,21 @@ _BACKEND = {
                 # combine acceleration (specs/extraction-speedup.md 9)
                 "biweight_fused", "combine_fibers_fused",
                 "combine_fibers_threaded", "get_combine_executor",
-                "shutdown_combine_threads"},
-    "masking": {"flag_fibers_on_mask", "make_circular_structure",
-                "get_pixscale_arcsec", "nan_safe_gaussian_smooth"},
+                "shutdown_combine_threads",
+                # merged in from masking.py, 2026-08-03 (the four DOCUMENTED
+                # masking functions have real _e() entries under "extract";
+                # these are the shared lookup + legacy-image helpers)
+                "flag_fibers_on_mask", "make_circular_structure",
+                "get_pixscale_arcsec", "nan_safe_gaussian_smooth",
+                # merged in from optics.py, 2026-08-03. These were NEVER in the
+                # guide -- optics.py had no _e() entries at all, so it carried
+                # zero audit coverage. Listing them here keeps check_guide()
+                # clean now that they live in an audited module; promote any of
+                # them to a real _e() entry if the deferred core-extraction work
+                # makes them user-facing.
+                "manual_convolution", "pca_fit", "get_continuum",
+                "wavelength_corrected_seeing", "moffat_psf_integration",
+                "get_spectrum_exposure"},
     "io": {"write_galaxy_fits"},
     "stack": {"convert_avg_fiber_bin", "rest_grid", "stack_spec_values",
               "coadd_galaxies", "sample_virial_radius_kpc", "build_core_stacks",
@@ -1831,13 +2173,34 @@ _BACKEND = {
                "girelli20_mstar_from_mhalo", "behroozi19_mstar_from_mhalo",
                "R200c_from_M200c", "compute_annuli_from_virial",
                "virial_to_angular_bins"},   # angular is doc'd; leave the rest ignored
-    "smoothing": set(),
+    # "smoothing": merged into background.py 2026-08-03; key removed
     # continuum_noise_metric is the internal metric; noise_from_stacks is the
     # documented front door onto it. The _bar_colors/_rank_column/_resolve_bin
     # helpers start with '_' and are auto-ignored by check_guide.
     "optimize": {"continuum_noise_metric"},
+    # single.py, first registered 2026-08-04 (measure_single_galaxy_core_halo /
+    # psf_fwhm_kpc_for_galaxy). The four names below ALSO live in single.py
+    # (resolve_galaxy_index, single_galaxy_spectra, _single_galaxy_rvir_kpc,
+    # measure_single_galaxy, plot_single_galaxy_panels) but are already
+    # DOCUMENTED above under module='stack'/'measure'/'plotting' -- because
+    # single.py turns out to be a near-verbatim DUPLICATE of code that also
+    # still lives in stack.py/measure.py/plotting.py (not a thin wrapper
+    # around it), a pre-existing drift found while building Part A, flagged
+    # to Austin rather than fixed here (deleting either copy could break a
+    # caller of the other). Listed here purely so check_guide()'s per-module
+    # scan doesn't double-report them as "new" now that 'single' is itself a
+    # contributing module.
+    "single": {"resolve_galaxy_index", "single_galaxy_spectra",
+               "plot_single_galaxy_panels", "measure_single_galaxy"},
+    # Part C (2026-08-04) internal helpers, deliberately not user-facing:
+    # galaxy_image/plot_galaxy_image/plot_psf_as_image below are the real
+    # entries; _galaxy_fiber_photometry/_gaussian_grid are private (leading
+    # underscore) and already auto-excluded by check_guide's own scan.
 }
 # measure_centroid and virial_to_angular_bins ARE documented; drop them from ignore
+_BACKEND["splits"] = {"cache_dir", "clear_cache", "compare", "fit_profile"}
+_BACKEND["selection"] = _BACKEND.get("selection", set())
+
 _BACKEND["measure"].discard("measure_centroid")
 _BACKEND["virial"].discard("virial_to_angular_bins")
 
@@ -1886,16 +2249,24 @@ def _main_menu(color=True):
     out = [_box_top("LYAHALO · FIELD GUIDE", color)]
     out.append(_box_line("", color))
     out.append(_box_line("  pick a section, e.g.  guide(\"measure\")", color))
-    out.append(_box_line("", color))
-    for i, (key, (blurb, _subs)) in enumerate(SECTIONS.items(), 1):
-        n = sum(e["section"] == key for e in _ENTRIES)
-        # room computed from the ACTUAL plain-text prefix length (not a
-        # hardcoded guess) so the blurb is clipped exactly where the line
-        # itself gets clipped -- no extra mid-word chars lost to a mismatch.
-        prefix = f"  ► {i}  {key.upper():<11}({n:>2})  "
-        room = max(0, _W - len(prefix))
-        raw = prefix + blurb[:room]
-        out.append(_c("║ ", _ACCENT, color) + f"{raw:<{_W}}"[:_W] + _c(" ║", _ACCENT, color))
+    i = 0
+    for tier, keys in TIERS.items():
+        out.append(_box_line("", color))
+        out.append(_c("║ ", _ACCENT, color)
+                   + _c(f"{'  ' + tier:<{_W}}"[:_W], _DIM, color)
+                   + _c(" ║", _ACCENT, color))
+        for key in keys:
+            i += 1
+            blurb = SECTIONS[key][0]
+            n = sum(e["section"] == key for e in _ENTRIES)
+            # room computed from the ACTUAL plain-text prefix length (not a
+            # hardcoded guess) so the blurb is clipped exactly where the line
+            # itself gets clipped -- no extra mid-word chars lost to a mismatch.
+            prefix = f"   ► {i:>2}  {key.upper():<11}({n:>2})  "
+            room = max(0, _W - len(prefix))
+            raw = prefix + blurb[:room]
+            out.append(_c("║ ", _ACCENT, color) + f"{raw:<{_W}}"[:_W]
+                       + _c(" ║", _ACCENT, color))
     out.append(_box_line("", color))
     out.append(_box_line("  detail: guide(\"run_stack\")   search: guide(search=\"flux\")", color))
     out.append(_box_line("  figure: pipeline_map()        audit:  check_guide()", color))
@@ -1922,12 +2293,15 @@ def _fmt_entry_full(e, color):
 
 
 def _show_section(section, sub=None, color=True):
-    blurb, subs = SECTIONS[section]
+    blurb, _declared = SECTIONS[section]
+    subs = _ordered_subs(section)          # data-driven; never drops an entry
     print(_box_top(section.upper(), color))
-    print(_box_line("  " + blurb[:_W - 4], color))
+    for ln in textwrap.wrap(blurb, _W - 4):
+        print(_box_line("  " + ln, color))
     if sub is None:
-        subline = "  subsections: " + " · ".join(subs)
-        print(_box_line(subline[:_W - 2], color))
+        for i, ln in enumerate(textwrap.wrap("subsections: " + " · ".join(subs),
+                                             _W - 4)):
+            print(_box_line("  " + ln, color))
     print(_box_bot(color))
     ents = [e for e in _ENTRIES if e["section"] == section]
     for s in subs:
@@ -2015,7 +2389,7 @@ def check_guide(verbose=True):
     Returns {'missing': [...], 'new': [...]}. test_framework asserts 'missing'
     is empty; 'new' is advisory.
     """
-    missing, new = [], []
+    missing, new, structure = [], [], []
     documented = {}
     for e in _ENTRIES:
         documented.setdefault(e["module"], set()).add(e["name"])
@@ -2044,22 +2418,58 @@ def check_guide(verbose=True):
         for n in sorted(pub - known):
             new.append(f"{module}.{n}")
 
+    # 3. STRUCTURE: the section/subsection keys are free text and nothing else
+    #    validates them, so a typo used to be invisible -- the entry just never
+    #    rendered. _ordered_subs no longer drops anything, but drift is still
+    #    worth reporting, and a section key that is missing from SECTIONS or
+    #    from TIERS is a genuine break (guide("<key>") cannot reach it, or the
+    #    menu cannot list it).
+    tiered = [k for keys in TIERS.values() for k in keys]
+    for key in SECTIONS:
+        if tiered.count(key) != 1:
+            structure.append(f"section '{key}' appears {tiered.count(key)}x in "
+                             f"TIERS (must be exactly 1)")
+        if not any(e["section"] == key for e in _ENTRIES):
+            structure.append(f"section '{key}' is declared but has 0 entries")
+    for key in tiered:
+        if key not in SECTIONS:
+            structure.append(f"TIERS lists '{key}', which is not in SECTIONS")
+    for sec in sorted({e["section"] for e in _ENTRIES}):
+        if sec not in SECTIONS:
+            structure.append(f"entries use section '{sec}', not declared in "
+                             f"SECTIONS -- guide('{sec}') will not find it")
+            continue
+        declared = set(SECTIONS[sec][1])
+        used = {e["sub"] for e in _ENTRIES if e["section"] == sec}
+        for s in sorted(used - declared):
+            n = sum(1 for e in _ENTRIES if e["section"] == sec and e["sub"] == s)
+            structure.append(f"{sec}: subsection '{s}' ({n} entr{'y' if n==1 else 'ies'}) "
+                             f"is not in the SECTIONS order list -- it renders "
+                             f"last; add it to fix the order")
+        for s in sorted(declared - used):
+            structure.append(f"{sec}: subsection '{s}' is declared but empty")
+
     if verbose:
         color = True
         print(_box_top("GUIDE AUDIT", color))
         print(_box_bot(color))
-        if not missing and not new:
-            print("  [OK] guide is in sync with the code.")
+        if not missing and not new and not structure:
+            print(f"  [OK] guide is in sync with the code "
+                  f"({len(_ENTRIES)} entries, {len(SECTIONS)} sections).")
         if missing:
             print(f"  [X] {len(missing)} STALE ent(y/ies) -- function gone/renamed:")
             for m in missing:
+                print("      - " + m)
+        if structure:
+            print(f"  [!] {len(structure)} STRUCTURE issue(s) -- section/subsection keys:")
+            for m in structure:
                 print("      - " + m)
         if new:
             print(f"  • {len(new)} public function(s) not in the guide "
                   f"(add an entry or list in _BACKEND):")
             for m in new:
                 print("      - " + m)
-    return {"missing": missing, "new": new}
+    return {"missing": missing, "new": new, "structure": structure}
 
 
 # =====================================================================

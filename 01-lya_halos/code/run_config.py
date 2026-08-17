@@ -37,8 +37,8 @@ cfg = PipelineConfig(
     vdfi_base_path  = None,               # None -> resolved from field; or set e.g. ".../HETDEX-Work/vdfi/egs"
 
     # ===== RADIAL BINNING ============================================
-    bins      = [0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0],
-    #bins      = [0, 10, 20, 30, 50, 80, 140, 300, 600, 1000, 2000],
+    #bins      = [0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0],
+    bins      = [0, 10, 20, 30, 50, 80, 140, 300, 600, 1000, 2000],
 
                                           # edges in the unit named by bin_mode
                                           #   virial -> R/Rvir edges (per-gal kpc derived in Stage 1)

@@ -1875,6 +1875,7 @@ def plot_centroid_profile_two(
     grid_alpha: float = 0.15,
     save_fig: bool = False,
     save_name: str | None = None,
+    ax=None,
 ):
     """
     Overlay the bootstrapped centroid profiles of TWO samples on one axis
@@ -1894,6 +1895,12 @@ def plot_centroid_profile_two(
     VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
                 radius, shaded around the Rvir line. None -> auto-read
                 stacks_a['VR_biweight_e'] if present.
+    ax        : None (default) -- create a fresh standalone figure exactly
+                as before, then tight_layout+show it. Pass an existing
+                matplotlib Axes (e.g. one panel of a plt.subplots grid) to
+                draw onto it instead -- in that case this function does NOT
+                call tight_layout/show/savefig on its own; the caller owns
+                the figure (see plot_all_subsamples_grid).
 
     Example
     -------
@@ -1915,7 +1922,11 @@ def plot_centroid_profile_two(
     vr   = _get_vr_biweight_v(VR_biweight_v, stacks_a or boot_a)
     vr_e = _get_vr_biweight_e(VR_biweight_error, stacks_a or boot_a)
 
-    fig, ax = plt.subplots(figsize=figsize)
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
     r_mid, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims,
                                      show_vr=show_vr, VR_biweight_error=vr_e)
 
@@ -1943,11 +1954,13 @@ def plot_centroid_profile_two(
         ax.set_title(title, fontsize=title_fontsize)
     ax.legend(frameon=False, fontsize=legend_fontsize, loc=legend_loc, title=legend_title)
     ax.grid(alpha=grid_alpha)
-    plt.tight_layout()
+    if own_fig:
+        plt.tight_layout()
     if save_fig:
         plt.savefig(_resolve_savename(save_name, "Figure_centroid_profile_two.png"),
                     dpi=300, bbox_inches="tight")
-    plt.show()
+    if own_fig:
+        plt.show()
     return fig, ax
 
 
@@ -2003,11 +2016,20 @@ def plot_flux_profile_two(
     grid_alpha: float = 0.15,
     save_fig: bool = False,
     save_name: str | None = None,
+    ax=None,
+    psf_R_cache: dict | None = None,
 ):
     """
     Overlay integrated Lyα flux +/- bootstrap 16/84 for TWO samples on one axis.
     Replaces calling plot_flux_profile twice. logy=True by default (faint outer
     bins). Requires compute_side_ratio=True in the bootstrap (the default).
+
+    ax : None (default) -- create a fresh standalone figure exactly as
+        before, then tight_layout+show it. Pass an existing matplotlib Axes
+        (e.g. one panel of a plt.subplots grid) to draw onto it instead --
+        in that case this function does NOT call tight_layout/show/savefig
+        on its own; the caller owns the figure (see
+        plot_all_subsamples_grid).
 
     Self-contained (not a plotting.py engine wrapper) so every color, marker,
     and font size below is a keyword argument. For a LINEAR axis (logy=False)
@@ -2143,7 +2165,11 @@ def plot_flux_profile_two(
             hi=np.asarray(b["total_flux_hi"], float),
         ))
 
-    fig, ax = plt.subplots(figsize=figsize)
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.figure
     r_mid, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims,
                                      show_vr=show_vr, VR_biweight_error=vr_e)
 
@@ -2184,7 +2210,15 @@ def plot_flux_profile_two(
             if psf_r is not None and psf_vals is not None:
                 psf_r_use = np.asarray(psf_r, dtype=float)
                 psf_vals_use = np.asarray(psf_vals, dtype=float)
-                R_shared = fitting.ring_convolution_matrix(r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
+                ckey = ("explicit", tuple(np.round(radial_bins, 6)),
+                        tuple(np.round(r_fine_arr, 6)), tuple(np.round(psf_r_use, 6)),
+                        tuple(np.round(psf_vals_use, 8)))
+                if psf_R_cache is not None and ckey in psf_R_cache:
+                    R_shared = psf_R_cache[ckey]
+                else:
+                    R_shared = fitting.ring_convolution_matrix(r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
+                    if psf_R_cache is not None:
+                        psf_R_cache[ckey] = R_shared
                 R_by_sample[0] = R_shared
                 R_by_sample[1] = R_shared
             else:
@@ -2194,14 +2228,23 @@ def plot_flux_profile_two(
                 )
                 for kk, z_med in enumerate(z_meds):
                     fwhm_kpc = _psf_fwhm_arcsec_to_kpc(psf_fwhm_arcsec, z_med, sample_label=labels[kk])
-                    psf_r_use = np.linspace(0.0, 20.0 * fwhm_kpc, 400)
-                    psf_vals_use = fitting.moffat_1d(psf_r_use, fwhm=fwhm_kpc, beta=psf_beta)
-                    R_by_sample[kk] = fitting.ring_convolution_matrix(
-                        r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
+                    ckey = ("moffat", round(fwhm_kpc, 6), round(psf_beta, 4),
+                            tuple(np.round(radial_bins, 6)), tuple(np.round(r_fine_arr, 6)))
+                    cache_hit = psf_R_cache is not None and ckey in psf_R_cache
+                    if cache_hit:
+                        R_by_sample[kk] = psf_R_cache[ckey]
+                    else:
+                        psf_r_use = np.linspace(0.0, 20.0 * fwhm_kpc, 400)
+                        psf_vals_use = fitting.moffat_1d(psf_r_use, fwhm=fwhm_kpc, beta=psf_beta)
+                        R_by_sample[kk] = fitting.ring_convolution_matrix(
+                            r_fine_arr, radial_bins, psf_r_use, psf_vals_use)
+                        if psf_R_cache is not None:
+                            psf_R_cache[ckey] = R_by_sample[kk]
                     if fit_verbose:
                         print(f"plot_flux_profile_two: {labels[kk]} PSF FWHM = "
                               f"{psf_fwhm_arcsec:.2f}\" -> {fwhm_kpc:.3g} kpc "
-                              f"(z_median={z_med:.3g}, beta={psf_beta:g})")
+                              f"(z_median={z_med:.3g}, beta={psf_beta:g})"
+                              + ("  [R cache hit]" if cache_hit else ""))
 
         for k, s in enumerate(series):
             sigma = ((s["hi"] - s["y"]) + (s["y"] - s["lo"])) / 2.0
@@ -2311,14 +2354,227 @@ def plot_flux_profile_two(
         ax.set_title(title, fontsize=title_fontsize)
     ax.legend(frameon=False, fontsize=legend_fontsize, loc=legend_loc, title=legend_title)
     ax.grid(alpha=grid_alpha)
-    plt.tight_layout()
+    if own_fig:
+        plt.tight_layout()
     if save_fig:
         plt.savefig(_resolve_savename(save_name, "Figure_flux_profile_two.png"),
                     dpi=300, bbox_inches="tight")
-    plt.show()
+    if own_fig:
+        plt.show()
     if fit:
         return fig, ax, fit_results[0], fit_results[1]
     return fig, ax
+
+
+def _split_boots(res, name, sides=None):
+    """(labels, boots, z_medians) for one recipe in `res`. Skips failed
+    sides. Same logic as the notebook `split_boots` helper -- kept here so
+    plot_all_subsamples_grid doesn't depend on notebook-local state."""
+    d = res[name]["sides"]
+    labs = (list(sides) if sides else
+            [l for l, s in d.items() if s.get("boot") is not None and not s.get("failed")])
+    return labs, [d[l]["boot"] for l in labs], [d[l].get("z_median") for l in labs]
+
+
+def plot_all_subsamples_grid(
+    res,
+    fit_kw: dict,
+    fit: bool = True,
+    ncols: int = 2,
+    panel_size=(4.5, 3.2),
+    names=None,
+    bin_mode="kpc",
+    xlims=(3, 3000),
+    vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5, 10, 20),
+    centroid_ylims=(-200, 400),
+    flux_logy: bool = True,
+    colors=("tab:blue", "tab:red"),
+    fmts=("o-", "s--"),
+    jitter: float = 0.05,
+    sample_b_alpha: float = 1.0,
+    fit_verbose: bool = False,
+    share_flux_ylims: bool = True,
+    share_centroid_ylims: bool = True,
+    use_R_cache: bool = True,
+    save_fig: bool = False,
+    save_name: str | None = None,
+):
+    """
+    One-shot visual QA grid over EVERY recipe in a bootstrap run: centroid
+    profile in column 0, flux profile (+ optional fit) in column 1, one row
+    per recipe. Built for exactly the use case in split_boots's notebook
+    cell -- eyeballing scatter/noise on small-N subsamples (e.g. an 80-
+    galaxy inclination split) across the whole recipe library at once,
+    rather than one recipe at a time.
+
+    Nothing here recomputes the bootstrap itself -- centroid points and the
+    flux errorbars are read straight out of each res[name]['sides'][lab]
+    ['boot'] dict, exactly like the single-recipe cell. The only thing
+    genuinely recomputed per panel is the flux fit overlay (fit=True), via
+    the same fit_psf_aware_expcore/fit_naive_expcore call the single-recipe
+    cell makes -- see that cell's own "redrawn vs in res" print if you want
+    to double check a given panel's fit against the table's cached one.
+
+    res       : the full per-run results dict (recipe_name -> {'sides': ...}),
+                same object the notebook's split_boots(res, name) reads.
+    fit_kw    : the SAME dict of fit keywords the notebook cell calls
+                FIT_PLOT_KW -- passed straight through to
+                plot_flux_profile_two so the drawn fit matches whatever the
+                table reports (fit_model, fit_method, fit_skip_inner,
+                gamma_fixed, r_c_fixed, psf_fwhm_arcsec, psf_beta). Required
+                whenever fit=True.
+    fit       : True (default) -- draw the expcore fit overlay on the flux
+                panel. Pass False for a faster, fit-free pass over raw
+                points only (useful once you've already sanity-checked the
+                fits and just want to rescan the scatter).
+    ncols     : kept as an explicit parameter for future use (e.g. wrapping
+                recipes 2-across instead of centroid|flux paired columns),
+                but the current layout is always centroid|flux -- i.e. 2
+                columns, one row per recipe -- regardless of this value.
+    names     : explicit ordered subset/order of res.keys() to plot; None
+                (default) -> every recipe in res, in dict order.
+    share_flux_ylims / share_centroid_ylims : True (default) -- compute ONE
+                y-range from the fiducial+16/84 values across ALL recipes
+                and ALL sides, and apply it to every panel in that column,
+                per Austin's call that the params here don't vary much
+                sample to sample. Set False to let each row autoscale
+                independently (plot_flux_profile_two/plot_centroid_
+                profile_two's own default behavior).
+    use_R_cache : True (default) -- share one PSF ring_convolution_matrix
+                cache dict across every panel's fit (plot_flux_profile_two's
+                new psf_R_cache= hook). ring_convolution_matrix is the slow
+                part of the PSF-aware fit (a nested-loop numerical
+                quadrature, ~30-60s), NOT curve_fit itself -- and it only
+                depends on (r_edges, r_fine, PSF FWHM-in-kpc, beta), which
+                repeats heavily across recipes/sides at fixed z. Sharing the
+                cache turns most of those ~30-60s builds into a dict lookup.
+                Only affects fit_method="psf" (fit_kw['fit_method']);
+                irrelevant for "naive".
+    save_fig/save_name : saves the WHOLE grid figure once at the end (not
+                per panel). None -> "Figure_subsamples_grid.png".
+
+    Returns
+    -------
+    (fig, axes, all_fit_results) --
+        axes            : (n_recipes, 2) array of Axes, same order as `names`.
+        all_fit_results : {recipe_name: (fit_a, fit_b)} when fit=True, else
+                          {recipe_name: None}. Same dicts
+                          plot_flux_profile_two would have returned for that
+                          recipe on its own -- e.g. to re-run the "redrawn vs
+                          in res" cross-check for a panel that looked off.
+
+    Example
+    -------
+        FIT_PLOT_KW = dict(
+            fit_model="expcore", fit_method="psf", fit_skip_inner=1,
+            gamma_fixed=0.8, r_c_fixed=400.0,
+            psf_fwhm_arcsec=1.3, psf_beta=3.0,
+        )
+        fig, axes, fits = analysis.plot_all_subsamples_grid(
+            res, fit_kw=FIT_PLOT_KW, fit=True,
+        )
+        # re-check one recipe's fit against the table's cached value, same
+        # pattern as the single-recipe cell:
+        fit_a, fit_b = fits["environment"]
+        cached = res["environment"]["sides"]["low"].get("fit_result") or {}
+        print(fit_a.get("h1"), cached.get("h1"))
+    """
+    if fit and not fit_kw:
+        raise ValueError("fit=True requires fit_kw (pass the same dict the "
+                         "notebook cell calls FIT_PLOT_KW)")
+
+    names = list(names) if names is not None else list(res.keys())
+    n = len(names)
+    if n == 0:
+        raise ValueError("res has no recipes to plot")
+
+    # Gather all (labs, boots, zmed) up front -- also lets us compute shared
+    # y-limits across every recipe/side BEFORE any panel is drawn.
+    per_recipe = {}
+    for name in names:
+        labs, boots, zmed = _split_boots(res, name)
+        if len(labs) > 2:
+            labs, boots, zmed = [labs[0], labs[-1]], [boots[0], boots[-1]], [zmed[0], zmed[-1]]
+        per_recipe[name] = (labs, boots, zmed)
+
+    def _shared_ylims(key_fid, key_lo, key_hi, pad_frac=0.1, floor_zero=False):
+        lows, highs = [], []
+        for labs, boots, _ in per_recipe.values():
+            for b in boots:
+                for arr in (b[key_fid], b[key_lo], b[key_hi]):
+                    a = np.asarray(arr, dtype=float)
+                    a = a[np.isfinite(a)]
+                    if a.size:
+                        lows.append(a.min()); highs.append(a.max())
+        if not lows:
+            return None
+        lo, hi = min(lows), max(highs)
+        pad = pad_frac * (hi - lo if hi > lo else abs(hi) or 1)
+        lo_out = lo - pad
+        if floor_zero:
+            lo_out = min(lo_out, 0)
+        return (lo_out, hi + pad)
+
+    centroid_ylims_use = (centroid_ylims if not share_centroid_ylims else
+                          (_shared_ylims("centroid_v_fid", "centroid_v_lo", "centroid_v_hi",
+                                        floor_zero=False) or centroid_ylims))
+    # logy flux panels self-scale sensibly per-row already (log floor set from
+    # the row's own positive minimum); a shared LINEAR ylims only matters
+    # when flux_logy=False, so only compute/force it in that case.
+    flux_ylims_use = None
+    if share_flux_ylims and not flux_logy:
+        flux_ylims_use = _shared_ylims("total_flux_fid", "total_flux_lo", "total_flux_hi",
+                                       floor_zero=True)
+
+    fig, axes = plt.subplots(n, 2, figsize=(panel_size[0] * 2, panel_size[1] * n),
+                             squeeze=False)
+
+    psf_R_cache = {} if (use_R_cache and fit) else None
+    all_fit_results = {}
+
+    for row, name in enumerate(names):
+        labs, boots, zmed = per_recipe[name]
+        ax_cent, ax_flux = axes[row, 0], axes[row, 1]
+
+        analysis_kw_common = dict(
+            labels=tuple(labs), bin_mode=bin_mode, xlims=xlims, vr_ticks=vr_ticks,
+            colors=colors, fmts=fmts, jitter=jitter, sample_b_alpha=sample_b_alpha,
+            title=None, legend_title=name,
+        )
+
+        plot_centroid_profile_two(
+            boots[0], boots[1], boots[0], boots[1],
+            ylims=centroid_ylims_use, ax=ax_cent, **analysis_kw_common,
+        )
+
+        if fit:
+            _, _, fit_a, fit_b = plot_flux_profile_two(
+                boots[0], boots[1], boots[0], boots[1],
+                logy=flux_logy, ylims=flux_ylims_use, ax=ax_flux,
+                z_median_a=zmed[0], z_median_b=zmed[1],
+                fit=True, fit_verbose=fit_verbose, psf_R_cache=psf_R_cache,
+                **fit_kw, **analysis_kw_common,
+            )
+            all_fit_results[name] = (fit_a, fit_b)
+        else:
+            plot_flux_profile_two(
+                boots[0], boots[1], boots[0], boots[1],
+                logy=flux_logy, ylims=flux_ylims_use, ax=ax_flux,
+                fit=False, **analysis_kw_common,
+            )
+            all_fit_results[name] = None
+
+        # recipe name as a left-aligned row label, once per row (on the
+        # centroid axis) rather than relying on plot_*_two's own `title`
+        # (which we deliberately suppressed above via legend_title instead).
+        ax_cent.set_title(name, fontsize=9, loc="left")
+
+    plt.tight_layout()
+    if save_fig:
+        plt.savefig(_resolve_savename(save_name, "Figure_subsamples_grid.png"),
+                    dpi=300, bbox_inches="tight")
+    plt.show()
+    return fig, axes, all_fit_results
 
 
 # ---------------------------------------------------------------------

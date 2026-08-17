@@ -547,6 +547,95 @@ def split_controlled(catalog, split_col, control_col,
         print(f"  {control_col} offset between halves: {abs(xh-xl):.3g}  (want ~0)")
     return low, high
 
+
+def split_controlled_bins(catalog, split_col, control_col, n_bins=4,
+                          control_bins=None, n_control_bins=4,
+                          min_per_bin=6, verbose=True):
+    """
+    N-way ORDERED split of `split_col` at fixed `control_col` -- the trend-mode
+    generalization of split_controlled (which only does 2 ways: median, or the
+    top/bottom tercile with the middle dropped).
+
+    Within each bin of the control variable, galaxies are RANK-ordered in
+    `split_col` and dealt into `n_bins` equal-population groups; the groups are
+    then pooled across control bins. Rank-within-control-bin (rather than a
+    global percentile cut) is what makes the control variable's distribution
+    come out nearly identical in every output group -- the whole point of a
+    controlled split, and the same mechanism split_controlled's balance=True
+    already uses for the 2-way case.
+
+    n_bins=2 is NOT identical to split_controlled(method='median', balance=True):
+    that function alternates the odd middle galaxy's side bin-to-bin to keep the
+    pooled halves exactly equal, and this one does not (it distributes the
+    remainder to the lowest groups within each control bin instead, which is the
+    only rule that generalizes to n_bins>2). Use split_controlled for the binary
+    case so the published 2-way numbers keep coming from one code path.
+
+    Parameters
+    ----------
+    n_bins : number of ordered output groups (>=2). splits.py's `trend` mode
+        defaults to 4; 3 for a thin sample, 5 when S/N allows.
+    control_bins / n_control_bins : explicit control-variable edges, or how many
+        equal-population control bins to build. Same meaning as split_controlled.
+    min_per_bin : control bins with fewer than this many eligible galaxies are
+        skipped entirely (not partially filled). Because a control bin now has
+        to fill `n_bins` groups rather than 2, this is enforced as
+        max(min_per_bin, n_bins) -- a control bin that cannot supply at least
+        one galaxy per group would silently bias the ordering.
+
+    Returns
+    -------
+    list of `n_bins` boolean masks, aligned to the catalog, ordered from lowest
+    to highest `split_col`.
+    """
+    n_bins = int(n_bins)
+    if n_bins < 2:
+        raise ValueError(f"n_bins must be >= 2 (got {n_bins}).")
+
+    x = np.asarray(catalog[control_col], float)
+    y = np.asarray(catalog[split_col], float)
+    ok = np.isfinite(x) & np.isfinite(y)
+
+    if control_bins is None:
+        control_bins = np.nanpercentile(x[ok], np.linspace(0, 100, n_control_bins + 1))
+    control_bins = np.asarray(control_bins, float)
+
+    masks = [np.zeros(len(x), bool) for _ in range(n_bins)]
+    floor = max(int(min_per_bin), n_bins)
+
+    for i in range(len(control_bins) - 1):
+        lo, hi = control_bins[i], control_bins[i + 1]
+        last = (i == len(control_bins) - 2)
+        in_bin = ok & (x >= lo) & ((x <= hi) if last else (x < hi))
+        nb = int(in_bin.sum())
+        if nb < floor:
+            if verbose:
+                print(f"  {control_col} [{lo:.3g},{hi:.3g}): {nb} gal -> skipped "
+                      f"(< {floor}, cannot fill {n_bins} groups)")
+            continue
+        idx = np.flatnonzero(in_bin)
+        order = idx[np.argsort(y[idx], kind="mergesort")]   # stable: ties keep input order
+        # np.array_split deals the remainder to the LOWEST groups first, which is
+        # deterministic and keeps group sizes within 1 of each other.
+        for g, chunk in enumerate(np.array_split(order, n_bins)):
+            masks[g][chunk] = True
+        if verbose:
+            sizes = "/".join(str(int(m[idx].sum())) for m in masks)
+            print(f"  {control_col} [{lo:.3g},{hi:.3g}): {nb:3d} gal  -> {sizes}")
+
+    if verbose:
+        print(f"\n{split_col} in {n_bins} ordered groups at fixed {control_col}:")
+        for g, m in enumerate(masks):
+            print(f"  group {g}: {int(m.sum()):4d} gal,  "
+                  f"median {control_col}={np.median(x[m]) if m.any() else np.nan:.3g},  "
+                  f"median {split_col}={np.median(y[m]) if m.any() else np.nan:.3g}")
+        if all(m.any() for m in masks):
+            xm = [np.median(x[m]) for m in masks]
+            print(f"  {control_col} spread across groups: "
+                  f"{max(xm) - min(xm):.3g}  (want ~0)")
+    return masks
+
+
 # =====================================================================
 # CORE-PRODUCT S/N TRIAGE
 #   Rank + shortlist bright galaxies for single-object halo work. Operates on

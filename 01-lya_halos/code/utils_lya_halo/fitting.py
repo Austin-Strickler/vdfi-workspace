@@ -2541,7 +2541,7 @@ def plot_uv_fit(
     n_fixed=None,
     psf_r=None,
     psf_vals=None,
-    psf_fwhm: float = 1.0,
+    psf_fwhm: float = None,
     psf_beta: float = 3.0,
     p0=None,
     r_fine=None,
@@ -2567,12 +2567,18 @@ def plot_uv_fit(
     n_fixed : only used when model="sersic" -- see fit_naive_uv_sersic's
         docstring.
     psf_r, psf_vals : explicit PSF curve (e.g. an empirical CFHT-LS star
-        measurement). If not given, falls back to an analytic Moffat with
-        psf_fwhm/psf_beta -- psf_fwhm=1.0 here is a PLACEHOLDER, not a
-        real CFHT-LS seeing value (per the spec's open question 3: try the
-        image header / survey docs first, fall back to an empirical
-        star-based measurement only if no documented value is
-        trustworthy). Replace it once a real number is in hand.
+        measurement -- see uv_profile.py's psf_empirical config slot /
+        build_effective_psf_uv, the resolved home for this per the UV-PSF
+        empirical decision). If given, psf_fwhm/psf_beta are ignored.
+    psf_fwhm : REQUIRED when method='psf' and psf_r/psf_vals are not both
+        given -- this used to silently default to 1.0 (a leftover
+        placeholder, not a real CFHT-LS seeing value; killed 2026-08-04 per
+        single-galaxy-pipeline.md Part B4). There is no project-wide UV
+        imaging PSF default to fall back to: this is the CFHT-LS continuum
+        PSF, a different instrument/scale from the VIRUS fiber PSF that
+        config.PSFSpec standardizes, so PSFSpec's fwhm_arcsec is NOT a
+        substitute here. Pass the real measured/documented CFHT-LS seeing
+        explicitly, or pass psf_r/psf_vals from the empirical measurement.
 
     Returns (fig, ax, fit_result), same shape as
     analysis.plot_flux_profile_fit's return.
@@ -2596,6 +2602,13 @@ def plot_uv_fit(
             psf_r_use = np.asarray(psf_r, dtype=float)
             psf_vals_use = np.asarray(psf_vals, dtype=float)
         else:
+            if psf_fwhm is None:
+                raise ValueError(
+                    "plot_uv_fit(method='psf') needs either psf_r AND psf_vals "
+                    "(an explicit/empirical PSF curve) or an explicit psf_fwhm "
+                    "-- there is no default. The old psf_fwhm=1.0 default was a "
+                    "placeholder, not a real CFHT-LS seeing value; see this "
+                    "function's docstring.")
             psf_r_use = np.linspace(0.0, 20.0 * psf_fwhm, 400)
             psf_vals_use = moffat_1d(psf_r_use, fwhm=psf_fwhm, beta=psf_beta)
         R = ring_convolution_matrix(r_fine_arr, r_edges, psf_r_use, psf_vals_use)

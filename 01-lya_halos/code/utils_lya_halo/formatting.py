@@ -80,22 +80,25 @@ import numpy as np
 # ---------------------------------------------------------------------
 # Value+error formatting
 # ---------------------------------------------------------------------
-def _fmt_asym(fid, lo=None, hi=None, sig=2, scale=1, no_error_tag="[point estimate]"):
-    """fid/lo/hi -> '$V^{+a}_{-b}$', pre-divided by `scale`. No unit, no
-    embedded power-of-ten -- both get reported once per COLUMN in the
-    table's auto-generated Note. line (see _lettered_note), not per cell.
+def _asym_parts(fid, lo=None, hi=None, sig=2, scale=1):
+    """The ARITHMETIC behind _fmt_asym, split out so the LaTeX and Markdown
+    renderers cannot drift apart. Returns one of:
 
-    lo/hi are absolute 16/84 bootstrap bounds, not half-widths. Errors
-    round to `sig` sig figs; the central value rounds to match. Missing
-    lo/hi (None, or non-finite) -> just the scaled value + `no_error_tag`,
-    rather than raising -- lets a column be point-estimate-only for some
-    rows (e.g. boundary_radius with no bootstrap refit) without special-
-    casing every caller.
+        None                                 -- no value at all
+        ("point", value)                     -- value, but no usable lo/hi
+        ("asym", fid_s, err_hi_r, err_lo_r, d)  -- value + rounded errors, and
+                                                the decimal count `d` all three
+                                                must be printed at
+
+    lo/hi are absolute 16/84 bootstrap bounds, not half-widths. Errors round to
+    `sig` sig figs and the central value rounds to match -- quoting a central
+    value to more precision than its own error bar is the classic way to make a
+    table look more certain than the measurement is.
     """
     if fid is None or not np.isfinite(fid):
-        return "n/a"
+        return None
     if lo is None or hi is None or not (np.isfinite(lo) and np.isfinite(hi)):
-        return f"${fid / scale:.3g}$ {no_error_tag}"
+        return ("point", fid / scale)
 
     fid_s, hi_s, lo_s = fid / scale, hi / scale, lo / scale
     err_hi, err_lo = hi_s - fid_s, fid_s - lo_s
@@ -109,6 +112,25 @@ def _fmt_asym(fid, lo=None, hi=None, sig=2, scale=1, no_error_tag="[point estima
     err_hi_r, d_hi = _round_to_sig(err_hi, sig)
     err_lo_r, d_lo = _round_to_sig(err_lo, sig)
     d = max(d_hi, d_lo, 0)   # floors negative d (round-to-nearest-10) to 0 -- fine for v1
+    return ("asym", fid_s, err_hi_r, err_lo_r, d)
+
+
+def _fmt_asym(fid, lo=None, hi=None, sig=2, scale=1, no_error_tag="[point estimate]"):
+    """fid/lo/hi -> '$V^{+a}_{-b}$', pre-divided by `scale`. No unit, no
+    embedded power-of-ten -- both get reported once per COLUMN in the
+    table's auto-generated Note. line (see _lettered_note), not per cell.
+
+    Missing lo/hi (None, or non-finite) -> just the scaled value +
+    `no_error_tag`, rather than raising -- lets a column be point-estimate-only
+    for some rows (e.g. boundary_radius with no bootstrap refit) without
+    special-casing every caller.
+    """
+    parts = _asym_parts(fid, lo, hi, sig=sig, scale=scale)
+    if parts is None:
+        return "n/a"
+    if parts[0] == "point":
+        return f"${parts[1]:.3g}$ {no_error_tag}"
+    _, fid_s, err_hi_r, err_lo_r, d = parts
     return f"${fid_s:.{d}f}^{{+{err_hi_r:.{d}f}}}_{{-{err_lo_r:.{d}f}}}$"
 
 
@@ -366,3 +388,266 @@ def make_subsample_latex_table(subsamples, columns=None, scales=None, sig=2,
     return rows_to_latex_table(rows, colnames, caption, label, registry, scales,
                                 table_env=table_env, fontsize=fontsize,
                                 tabcolsep=tabcolsep, rotate=rotate)
+
+
+# =====================================================================
+# MARKDOWN TABLE -- the READING version
+# =====================================================================
+# The LaTeX table above is built for a journal: superscript footnote letters,
+# units banished to a Note line, no sample sizes, no flags. That is correct for
+# a paper and hostile for reading 30 rows on a screen while you decide what is
+# real.
+#
+# This renders the SAME rows, from the SAME registry and the SAME _asym_parts
+# arithmetic, optimised for looking at:
+#
+#   * units in the header, not in a footnote you have to cross-reference
+#   * recipe and side as two sortable columns instead of "recipe: side"
+#   * an N column, because "lya_class: absorber" reading n/a everywhere means
+#     nothing until you know it is N=42
+#   * a flags column, so a degenerate fit or a fallback boundary is visible in
+#     the row rather than buried in a warnings list you never printed
+#
+# math=True emits `$11.43^{+0.88}_{-1.10}$`, which renders in Obsidian, in a
+# Jupyter markdown cell, and on GitHub. math=False emits `11.43 +0.88/-1.10`,
+# which is plain text and lines up in a terminal.
+
+# LaTeX unit macros -> what they mean in plain text. The macros (\kpc, \kms,
+# \ergs) are defined in the paper's preamble and are meaningless anywhere else,
+# so they cannot go straight into a markdown header.
+UNIT_TEXT = {
+    r"\kpc": "kpc",
+    r"\kms": "km/s",
+    r"\ergs": "erg/s",
+    r"\%": "%",
+    "": "",
+}
+
+# Plain-ASCII header per column, for math=False. Keys are registry keys; a
+# column missing from here falls back to its registry header with the LaTeX
+# stripped out.
+PLAIN_HEADER = {
+    "h1": "h1", "r_x": "r_x", "v_core": "v_core", "v_2halo": "v_2halo",
+    "v_diff": "v_core-v_2halo", "L_core": "L_core", "L_1halo": "L_1halo",
+    "L_2halo": "L_2halo", "core_over_1halo_pct": "L_core/L_1halo",
+}
+
+
+def _unit_text(unit):
+    if unit in UNIT_TEXT:
+        return UNIT_TEXT[unit]
+    return str(unit).lstrip("\\")          # unknown macro -> drop the backslash
+
+
+def _strip_math(s):
+    """'$h_1$' -> 'h1', r'$v_{\\rm core}$' -> 'v_core'. Crude on purpose: it is
+    a fallback for columns not in PLAIN_HEADER, not a LaTeX parser."""
+    out = str(s).replace("$", "").replace(r"\rm", "").replace("{", "").replace("}", "")
+    out = out.replace("\\", "").replace("_", "_").replace(" ", "")
+    return out or "?"
+
+
+def _fmt_asym_md(fid, lo=None, hi=None, sig=2, scale=1, math=True,
+                 no_error_tag="(point est.)"):
+    """Same numbers as _fmt_asym, rendered for reading.
+
+        math=True   $11.43^{+0.88}_{-1.10}$      (renders in Obsidian/Jupyter)
+        math=False  11.43 +0.88/-1.10            (plain text, terminal-safe)
+    """
+    parts = _asym_parts(fid, lo, hi, sig=sig, scale=scale)
+    if parts is None:
+        return "--"                       # not "n/a": shorter, and scans as empty
+    if parts[0] == "point":
+        v = f"${parts[1]:.3g}$" if math else f"{parts[1]:.3g}"
+        return f"{v} {no_error_tag}"
+    _, fid_s, err_hi_r, err_lo_r, d = parts
+    if math:
+        return f"${fid_s:.{d}f}^{{+{err_hi_r:.{d}f}}}_{{-{err_lo_r:.{d}f}}}$"
+    return f"{fid_s:.{d}f} +{err_hi_r:.{d}f}/-{err_lo_r:.{d}f}"
+
+
+# Same units again, but as math-mode TeX. Needed because the unit and the
+# power-of-ten have to live INSIDE the header's $...$ -- putting "10^{42}"
+# outside math mode renders it literally, braces and all, which is the one thing
+# that would make these headers worse than the footnote letters they replace.
+UNIT_MATH = {
+    r"\kpc": r"{\rm kpc}",
+    r"\kms": r"{\rm km\,s^{-1}}",
+    r"\ergs": r"{\rm erg\,s^{-1}}",
+    r"\%": r"\%",
+    "": "",
+}
+
+
+def _unit_math(unit):
+    return UNIT_MATH.get(unit, r"{\rm " + str(unit).lstrip("\\") + "}" if unit else "")
+
+
+def _md_header(key, header, registry, scales, math=True, unit_in_header=True):
+    """Column header with its unit and power-of-ten folded in -- the whole
+    reason the markdown table needs no footnote letters.
+
+        math=True   $L_{\\rm 1halo}\\,[10^{42}\\,{\\rm erg\\,s^{-1}}]$
+        math=False  L_1halo (10^42 erg/s)
+    """
+    spec = registry.get(key)
+    if not math:
+        name = PLAIN_HEADER.get(key, _strip_math(header))
+        if not unit_in_header or spec is None:
+            return name
+        scale = scales.get(key, spec["scale"])
+        unit = _unit_text(spec["unit"])
+        if scale == 1:
+            return f"{name} ({unit})" if unit else name
+        exp = int(round(np.log10(scale)))
+        return f"{name} (10^{exp} {unit})" if unit else f"{name} (10^{exp})"
+
+    # math mode: build ONE $...$ so the exponent actually renders as an exponent
+    core = str(header).strip()
+    inner = core[1:-1] if core.startswith("$") and core.endswith("$") else core
+    if not unit_in_header or spec is None:
+        return f"${inner}$"
+    scale = scales.get(key, spec["scale"])
+    unit = _unit_math(spec["unit"])
+    if scale == 1:
+        return f"${inner}$" if not unit else rf"${inner}\,[{unit}]$"
+    exp = int(round(np.log10(scale)))
+    mag = rf"10^{{{exp}}}"
+    body = rf"{mag}\,{unit}" if unit else mag
+    return rf"${inner}\,[{body}]$"
+
+
+# Warning text -> the short tag that goes in the flags column. Matched as
+# substrings, first hit wins, so the ORDER matters: the specific causes come
+# before the generic "no boundary" that they also happen to print.
+_FLAG_PATTERNS = [
+    ("SIDE FAILED",                    "FAILED"),
+    ("DEGENERATE boundary",            "degenerate fit"),
+    ("no core/two-halo boundary",      "no boundary"),
+    ("boundary came from the FULL",    "fallback bdry"),
+    ("did not converge on this side",  "fit !converged"),
+    ("refit draws failed",             "refits failed"),
+    ("< min_n",                        "N<min_n"),
+    ("not leak-corrected",             ""),   # level-wide; already in the note
+]
+
+
+def _row_flags(inputs):
+    """Short, de-duplicated flags for one row, read off the side dict that
+    splits.run() already produces. Returns '' for a clean row."""
+    tags = []
+    if inputs.get("failed"):
+        tags.append("FAILED")
+    for w in inputs.get("warnings", []) or []:
+        for pat, tag in _FLAG_PATTERNS:
+            if pat in str(w):
+                if tag and tag not in tags:
+                    tags.append(tag)
+                break
+    return ", ".join(tags)
+
+
+def make_subsample_markdown_table(subsamples, columns=None, scales=None, sig=2, *,
+                                  caption=None, registry=None, math=True,
+                                  unit_in_header=True, split_label=True,
+                                  show_n=True, show_flags=True, align="right",
+                                  note=None):
+    """
+    The same table as make_subsample_latex_table, rendered as a GitHub-flavoured
+    markdown pipe table you can read in Obsidian, a Jupyter markdown cell, or a
+    terminal.
+
+    Takes exactly the same `subsamples` list -- one dict per row, using the same
+    kwarg names as analysis.describe_subsample_properties -- so anything you can
+    pass to the LaTeX version works here unchanged.
+
+    subsamples : list of row dicts. Only "label" is required. If a row also
+        carries "n_gal", "warnings" or "failed" (which every splits.run() side
+        dict does), the N and flags columns pick them up automatically.
+    columns    : registry keys in display order. None -> DEFAULT_COLUMNS.
+    scales     : {column_key: scale_override}, e.g. {"L_2halo": 1e43}. Shown in
+        the header rather than a footnote.
+    math       : True  -> `$11.43^{+0.88}_{-1.10}$`, renders in Obsidian/Jupyter
+                 False -> `11.43 +0.88/-1.10`, plain text, terminal-safe
+    unit_in_header : fold units and powers of ten into the header. Turn off only
+        if you are pasting into something that already states them.
+    split_label : a label of the form "recipe: side" becomes two columns, so you
+        can sort or scan by recipe. Labels without ": " are left alone.
+    show_n     : include the galaxy count. ON BY DEFAULT AND WORTH KEEPING -- a
+        row of "--" means one thing at N=226 and something else entirely at
+        N=42, and the LaTeX table shows neither.
+    show_flags : include the flags column (degenerate fit, fallback boundary,
+        failed side, N<min_n). Also on by default: a degenerate fit that is only
+        visible as blank cells is exactly how a bad row survives into a draft.
+    align      : "right" (default) | "left". Numbers right-aligned scan far
+        better down a column.
+    note       : trailing italic note line. None -> auto (a caption if given,
+        plus a legend for whatever flags actually appear). "" -> no note.
+
+    Returns the markdown string. print() it, or write it to a .md file.
+    """
+    registry = registry or COLUMN_REGISTRY
+    columns = columns or DEFAULT_COLUMNS
+    scales = scales or {}
+    colnames = _normalize_columns(columns, registry)
+
+    # ---- build rows ------------------------------------------------------
+    rows = []
+    for s in subsamples:
+        label = str(s.get("label", "?"))
+        if split_label and ": " in label:
+            recipe, side = label.split(": ", 1)
+        else:
+            recipe, side = "", label
+        cells = {}
+        for header, key in colnames:
+            spec = registry[key]
+            fid, lo, hi = spec["get"](s)
+            cells[key] = _fmt_asym_md(fid, lo, hi,
+                                      sig=spec.get("sig", sig),
+                                      scale=scales.get(key, spec["scale"]),
+                                      math=math)
+        rows.append({"recipe": recipe, "side": side,
+                     "n": ("" if s.get("n_gal") is None else str(int(s["n_gal"]))),
+                     "flags": _row_flags(s), "cells": cells})
+
+    any_recipe = any(r["recipe"] for r in rows)
+    any_flags = show_flags and any(r["flags"] for r in rows)
+
+    # ---- header ----------------------------------------------------------
+    head, keys, numeric = [], [], []
+    if split_label and any_recipe:
+        head.append("Recipe"); keys.append("recipe"); numeric.append(False)
+    head.append("Subsample"); keys.append("side"); numeric.append(False)
+    if show_n:
+        head.append("N"); keys.append("n"); numeric.append(True)
+    for header, key in colnames:
+        head.append(_md_header(key, header, registry, scales, math, unit_in_header))
+        keys.append(key); numeric.append(True)
+    if any_flags:
+        head.append("flags"); keys.append("flags"); numeric.append(False)
+
+    sep = [("---:" if (n and align == "right") else ":---") for n in numeric]
+
+    # ---- assemble --------------------------------------------------------
+    lines = ["| " + " | ".join(head) + " |",
+             "|" + "|".join(sep) + "|"]
+    for r in rows:
+        vals = []
+        for k in keys:
+            vals.append(r[k] if k in ("recipe", "side", "n", "flags") else r["cells"][k])
+        lines.append("| " + " | ".join(vals) + " |")
+
+    # ---- note ------------------------------------------------------------
+    if note is None:
+        bits = []
+        if caption:
+            bits.append(caption)
+        seen = sorted({t for r in rows for t in r["flags"].split(", ") if t})
+        if seen:
+            bits.append("flags: " + ", ".join(seen))
+        bits.append("errors are bootstrap 16/84 bounds; `--` = not measured")
+        note = " — ".join(bits)
+    if note:
+        lines += ["", f"*{note}*"]
+    return "\n".join(lines)

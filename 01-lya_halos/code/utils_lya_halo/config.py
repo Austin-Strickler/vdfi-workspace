@@ -39,6 +39,80 @@ DEFAULT_CONT_ORDER = 1                     # polynomial order, used only for 'po
 DEFAULT_CENTROID_METHOD = "flux_median"    # median50; see measure._CENTROID_DISPATCH for options
 
 
+# ---------------------------------------------------------------------
+# PSF standardization (specs/single-galaxy-pipeline.md Part B).
+#
+# This describes the SPECTROSCOPIC (VIRUS fiber) Moffat PSF used by
+# core.extract_core_spectra, fitting.moffat_encircled_energy_fraction, and
+# single.py's leak-aware core+halo split. It is NOT the CFHT-LS UV IMAGING
+# PSF (a different instrument at a very different angular scale) -- that one
+# is handled by uv_profile.py's separate psf_empirical/build_effective_psf_uv
+# machinery and does not go through PSFSpec.
+#
+# Before this (audited 2026-08-04), the Moffat index disagreed across the
+# codebase: core extraction used alpha=3.5 (extract.moffat_psf_integration's
+# own default) while every stack-level fit/measure function used beta=3.0.
+# Resolved 2026-08-04 (single-galaxy-pipeline.md Open Question 1, option a):
+# ONE index, 3.0, everywhere -- extract.moffat_psf_integration's default and
+# injection.fiber_response_independent's default (the latter must track the
+# former or its own cross-check against fiber_response_production stops
+# comparing like PSFs) were both changed to match. This INVALIDATES any
+# previously-extracted core.extract_core_spectra product: it was built under
+# alpha=3.5 and needs re-extraction before being trusted against anything
+# that reads PSFSpec.beta.
+# ---------------------------------------------------------------------
+@dataclass
+class PSFSpec:
+    """
+    One PSF definition, threaded through every call site that needs the
+    VIRUS fiber Moffat PSF, and recorded in output headers/provenance so
+    "which PSF produced this number" is a property of the product rather
+    than something reconstructed from git history (Part B2).
+
+    provenance : 'measured' (default) -- use the real per-exposure VDFI
+        seeing (vdfi['seeing'], HDU 5), wavelength-corrected via
+        extract.wavelength_corrected_seeing ((lambda/4500)**wave_exponent).
+        For single-galaxy work this means each galaxy gets its OWN
+        fiber-weighted seeing (determined by which exposures actually cover
+        it) -- strictly better than a sample-wide constant.
+      | 'fiducial' -- ignore the measured seeing; use ONE fixed analytic
+        Moffat (fwhm_arcsec) for every galaxy/exposure. Used when a single
+        PSF across the whole sample is wanted instead of per-galaxy
+        variation (e.g. a sensitivity/systematics check).
+    beta : Moffat power-law index (astropy Moffat2D's `alpha` parameter --
+        see single-galaxy-pipeline.md Part B3 for why that's confusingly
+        NOT the same "alpha" as injection.py's velocity-asymmetry alpha).
+        3.0 is now the one value used everywhere; see the module comment
+        above.
+    fwhm_arcsec : used ONLY when provenance == 'fiducial'. 1.8" -- picked
+        2026-08-04 as deliberately a slightly POORER seeing than the
+        Niemeyer (2022) 1.2-1.4" fiducial range, on the grounds that 1.8" is
+        more realistic for this dataset (Austin's call). This new default
+        applies to the single-galaxy path ONLY: the existing stack-level
+        functions (measure.measure_psf_corrected_core_luminosity and
+        friends) keep their own 1.3" default UNCHANGED for now -- those
+        numbers are already in presentations, and this dataclass only backs
+        the new single-galaxy machinery, not a retroactive change to the
+        stack (2026-08-04 decision; open question 3 in the spec if that
+        should ever change).
+    wave_exponent : the seeing-vs-wavelength correction exponent,
+        seeing(lambda) = seeing_ref * (lambda/4500)**wave_exponent. -1/5,
+        matching extract.wavelength_corrected_seeing exactly -- duplicated
+        here as an explicit, recorded field (not a bare module constant)
+        so it travels with the product.
+    """
+    provenance: str = "measured"
+    beta: float = 3.0
+    fwhm_arcsec: float = 1.8
+    wave_exponent: float = -1.0 / 5.0
+
+    def __post_init__(self):
+        if self.provenance not in ("measured", "fiducial"):
+            raise ValueError(
+                f"PSFSpec.provenance must be 'measured' or 'fiducial' "
+                f"(got {self.provenance!r})")
+
+
 @dataclass
 class PipelineConfig:
     # --- fixed physical constants (NOT run parameters) -------------------
@@ -291,7 +365,7 @@ class PipelineConfig:
     line_window: Sequence[float] = _field(
         default_factory=lambda: [PipelineConfig.LYA_REST - 3.0,
                                  PipelineConfig.LYA_REST + 3.0]
-    )                                              # +/-4 A about LYA_REST (1211.67-1219.67)
+    )                                              # +/-3 A about LYA_REST (1212.67-1218.67)
     n_bootstrap: int = 2000
     cont_bounds: Sequence = DEFAULT_CONT_BOUNDS    # (blue, red) sidebands, Angstrom
     cont_method: str = DEFAULT_CONT_METHOD         # 'median' | 'poly'
@@ -304,6 +378,28 @@ class PipelineConfig:
     # the FITS header, not read via getattr with a silent default.
     sigma_clip_sigma: float = 3.0                  # clip threshold (sigma)
     sigma_clip_maxiters: int = 5                   # max clip iterations
+
+    # --- Single-galaxy measurement (specs/single-galaxy-pipeline.md Part A) --
+    psf: PSFSpec = _field(default_factory=PSFSpec)  # see PSFSpec above
+    core_boundary_kpc: float = 70.0                # the core/two-halo crossover
+                                         #   radius, in kpc, used as the default
+                                         #   `boundary_kpc` by single.py's
+                                         #   per-galaxy core+halo split. This is
+                                         #   the FITTED expcore core/two-halo
+                                         #   boundary from the STACK (see
+                                         #   fitting.find_core_halo_boundary /
+                                         #   analysis.bootstrap_fit_profile) --
+                                         #   it is a measured number carried
+                                         #   here as a convenience default, NOT
+                                         #   an independently-chosen constant,
+                                         #   and MUST be re-derived (and this
+                                         #   value updated) whenever that stack
+                                         #   fit changes. Every function that
+                                         #   uses it also returns the value it
+                                         #   actually used (boundary_kpc_used),
+                                         #   so a result is self-describing even
+                                         #   if this default later drifts from
+                                         #   the fit that produced it.
 
     # ---------------------------------------------------------------------
     # Helpers
@@ -661,6 +757,11 @@ class PipelineConfig:
             "measure_stack_method": self.measure_stack_method,
             "sigma_clip_sigma": self.sigma_clip_sigma,
             "sigma_clip_maxiters": self.sigma_clip_maxiters,
+            "core_boundary_kpc": self.core_boundary_kpc,
+            "psf_provenance": self.psf.provenance,
+            "psf_beta": self.psf.beta,
+            "psf_fwhm_arcsec": self.psf.fwhm_arcsec,
+            "psf_wave_exponent": self.psf.wave_exponent,
         }
 
     def to_header_dict(self, ngal: int, source_id: str) -> dict:

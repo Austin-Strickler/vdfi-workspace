@@ -334,6 +334,75 @@ Blockers to clear first, in order:
 
 ---
 
+## Hubble-flow line broadening at large radii — a parameter-free prediction and a flux systematic
+
+*Added 2026-07-30, from Austin's geometric argument. Not yet tested against data.*
+
+**The idea.** The Lyα emission around a galaxy is (statistically) spherically symmetric in 3D. A
+measurement at projected radius R integrates along the line of sight, and every LOS offset s carries
+a Hubble velocity H(z)·s. So the observed line at projected R is the intrinsic line convolved with
+the LOS *depth* distribution of the emission, scaled by H(z). At small R the emitting depth is a few
+tens of kpc and the effect is invisible; at Mpc radii the depth is comparable to R itself and the
+contribution becomes larger than the instrumental LSF.
+
+**Why it isn't just "the outer bins are broad."** The effect's size depends on the *shape* of the 3D
+emissivity, and the two candidate outer profiles predict wildly different broadening. Numbers below
+at z = 2.3, where H(z) = 237 km s⁻¹ per proper Mpc and the effective resolution is 1.9 Å rest-frame
+= 469 km s⁻¹ FWHM. `j(r)` is the deprojected 3D emissivity; a projected SB slope α corresponds to
+j ∝ r^−(α+1), so the expcore outer term's α ≈ 0.8 gives j ∝ r^−1.8.
+
+| R (kpc) | FWHM from exponential halo (h = 17 kpc) | FWHM from j ∝ r^−1.8 | total FWHM (LSF ⊕ power law) | flux inside ±3 Å window |
+|---|---|---|---|---|
+| 50 | 17 | 26 | 469 | 100% |
+| 100 | 24 | 51 | 471 | 100% |
+| 200 | 33 | 102 | 480 | 100% |
+| 500 | 52 | 255 | 534 | 99.9% |
+| 1000 | 73 | 511 | 693 | 98.8% |
+| 2000 | 103 | 1022 | 1124 | **87.9%** |
+
+Two things fall out:
+
+**1. It is a discriminator, and a strong one.** At R = 1 Mpc a genuinely 3D-extended clustered
+distribution predicts **511 km s⁻¹ of Hubble broadening — larger than the instrumental LSF itself**,
+for a total 48% wider line than at small radii. A compact, local, or instrumental origin for the
+outer signal predicts **no broadening at all**, and an exponential halo predicts only 73 km s⁻¹.
+Measuring the stacked line *width* vs. radius therefore tests whether the outer flux really sits at
+the 3D distance the two-halo interpretation requires — independent of, and orthogonal to, every
+existing systematics check, none of which use the line width. This is the emission-side analog of
+Rakic et al. 2012's absorption-side FoG/Kaiser anisotropy, which is a good citation hook and an
+argument that it belongs in Paper I rather than a later paper.
+
+**2. It implies a flux systematic nobody has flagged.** `line_window` is rest-frame ±3 Å about
+`LYA_REST` (= ±740 km s⁻¹), applied on the rest-frame resampled grid. A line that broadens with
+radius therefore loses an increasing fraction of its flux out of a *fixed* window — negligible
+inside 500 kpc, ~1% at 1 Mpc, but **~12% at 2 Mpc.** That biases the outermost bins low and steepens
+the measured outer profile, in the same direction as (and confusable with) the correlated-background
+question. Cheap to check: re-measure the outer bins with a widened window and see whether the outer
+flux rises by the predicted amount. If it does, that is *also* evidence for the broadening.
+
+**Caveats before this is quoted.**
+- Peculiar velocities of clustered neighbours (~200–300 km s⁻¹ pairwise) add in quadrature and are
+  not separable from the Hubble term without a model. The *scaling with R* is the discriminating
+  signature, not the absolute width.
+- Random per-galaxy redshift error (~60 km s⁻¹, unverified) also broadens but is radius-independent,
+  so it sets a floor rather than a trend — the same argument already made in
+  `specs/wavelength-zero-point.md` §5 for why random error doesn't shift the centroid.
+- Requires the line width to be measurable at low S/N in the outer bins. Check the achievable width
+  precision before scoping this as a result rather than as a systematic.
+- The table assumes a single representative redshift. H(z) runs 208 → 312 km s⁻¹/Mpc across
+  z = 2 → 3, so the predicted broadening is ~50% stronger in the z~3 bin — **which makes the
+  existing z~2 vs. z~3 comparison a free test of the whole picture.**
+
+**Correction to an earlier claim made in conversation (2026-07-30).** I described the S/N minimum
+near R_vir as the profile being "genuinely faintest where the two components cross." That is wrong.
+Surface brightness declines monotonically — the *signal* at 60–200 kpc is higher than anywhere
+further out. The S/N dip is purely a fiber-count effect: the outer bins coadd 10+× more fibers. This
+matters for binning strategy, because the mid-radius bins are noise-limited by counting statistics
+rather than by the large-scale correlated systematic that limits the outer bins. **They therefore
+improve as √N with the incoming data, where the outer bins largely will not** — an argument for
+keeping fine radial resolution across the transition now even at low per-bin S/N, rather than
+merging it away permanently.
+
 ## See also
 
 - `GOALS.md` — project scope, headline measurements, and the settled/in-progress validation list

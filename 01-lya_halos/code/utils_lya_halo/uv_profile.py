@@ -123,10 +123,9 @@ try:
 except ImportError:  # photutils < 1.0
     from photutils import CircularAperture, CircularAnnulus
 
-from .masking import get_pixscale_arcsec
 from .virial import physical_kpc_to_arcsec
 from .io import load_for_stack
-from .extract import combine_fibers
+from .extract import combine_fibers, get_pixscale_arcsec
 from .fitting import plot_uv_fit, moffat_1d, normalize_psf_flux
 
 

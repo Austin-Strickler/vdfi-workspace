@@ -52,7 +52,7 @@ from utils_lya_halo import extract as _extract
 from utils_lya_halo.extract import (
     radial_bin_edges, combine_fibers, combine_fibers_chunked,
 )
-from utils_lya_halo.smoothing import (
+from utils_lya_halo.background import (
     smooth_interp_then_gauss, smooth_spectrum_nan_safe_adaptive,
 )
 from utils_lya_halo.virial import cosmo
