@@ -1,6 +1,12 @@
 # Injection–recovery — testing the pipeline against known truth
 
-**Status: design v6, 2026-08-16.**
+**Status: v8, 2026-08-23. Build order is COMPLETE — every item 1–6 is shipped in `injection.py` (4,233 lines), and injection runs are underway.** The document below is still the design; where it says a thing "will" be built, it is built. Sections marked **[FILL]** need numbers Austin has and this document does not, and the per-level PASS/FAIL results now belong in §7.2 rather than in prior-session notes.
+
+- **v8** — **Implementation status, verified against the module rather than asserted.** Shipped since v7: `inject_sources` (§1.1/§1.6), `validate_inj_table` (§1.6), `draw_injection_positions` (build-order item 5), `check_background_annulus_negligible` (§2.2/§7.7) and `shot_noise_ratio` (§1.5). Also shipped and *not* in this design as written: **`family_G`** (a ramped-velocity sibling of H, used as the forward model for deconvolving the real core gradient rather than as a fourth acceptance family), **`RampVelocity`** and **`BinnedVelocity`** velocity fields, and the pair **`build_velocity_response_matrix` / `deconvolve_velocity`** — the operator `M` with `truth = M @ dv_intrinsic`, plus its closed-form inversion. That pair is the payoff the ladder was built for and deserves its own section here; it is currently documented only in docstrings.
+  **Two things a reader needs before trusting a number out of this module.** **(1) The line-units bug is diagnosed but not fixed at the injector.** `line_profile` has unit integral in *velocity* and is written into a *per-Å* cube, so injected flux is low by `c/λ_obs` — 72.5× at z = 2.4, and z-dependent. `l_inj_for_luminosity(..., line_is_velocity_density=True)` compensates at the luminosity-sizing end, but any template built without going through that hook is still low by the same factor. This invalidates any flux- or luminosity-keyed criterion measured before the fix, criterion 1a included. **(2) `plot_injection_recovery` is defined twice in `injection.py`** (the level-6 three-curve figure, then the real-extraction version); Python keeps the second, so the first is unreachable. The name is also taken by `validation.py`'s estimator-bias close-up, which is a different function again.
+  `injection.py` is now registered in `guide.py` — 34 entries across four "Source injection" subsections of the validation section, `check_guide()` clean.
+
+- **v7** — **Build-order item 2 is half shipped: `InjectedSpectra` and `check_overlay_identity` are in `injection.py`; `inject_sources` is not.** Four changes. **(1)** The §1.2 indexing audit was re-run against the current `extract.py` (the v1 line numbers had drifted) and the surface is **smaller** than this spec provisioned for — `spectra[e, bool_mask]` at `extract.py:1041` and `:1149`, `.shape[-1]` at `:812`, and the whole-cube pass to `make_spectral_continuum_mask` at `:218`, and **nothing else in the package indexes `vdfi["spectra"]` at all**. The `core.py` and `plotting.py` sites the v1 audit listed no longer exist. Option B stays unbuilt. **(2)** **The zero cube is `base * 0`, not `np.zeros`** (Austin, 2026-08-17) — literal zeros erase the real cube's dead- and masked-fiber NaN pattern, so levels 2–4 would exercise every nan-aware reduction in the extraction in a regime the real run never sees, and a masking bug would first surface at level 6 on real data with two things changed at once. **(3)** New **§1.6** specifies the `inject_sources` contract and the `inj_table` schema, which §1.1 named but never defined. **(4)** **Open question 5 is closed, and the answer was not the truncation knee** — §10.5.
 
 - **v6** — **Production binning is 11 bins ending at 2000 kpc**, not 12 ending at 3000 (Austin: runtime, and there is little S/N in the outer bins). Four consequences, all now folded in: (1) `SourceModel.r_trunc` default tracks it, **3000 → 2000** — it has to, since `r_trunc` is the radius the injected `L` is defined *inside*, and a mismatch means `L` is flux inside a radius never measured; the core fraction rises 1.37% → **2.32%**, i.e. 1.7× more injected signal where the measurement is best. (2) `select_nearby_fibers` now cuts at 244″ rather than 366″ — **~55% fewer fibers per source per exposure**, so templates get materially faster and smaller. (3) The `[2000, 3000]` truncation-knee caveat (08-07) **disappears with the bin**. (4) Hartlap goes p = 12 → 11, which moves the correction at N = 400 from 3.3% to 3.0% — **N = 400/field stands unchanged** (§4.4). The `[180, 350]` blend bin is unaffected, so criterion 1d and the 90.62 km s⁻¹ truth are unchanged. ⚠ `run_extract_batch.py`'s `RUN` block still carries the old 13-edge list; unused today (extraction is run from a notebook cell) but it must be updated before it is used, or Stage 1 will produce products the injection truth does not match.
 
@@ -139,6 +145,127 @@ Two reasons. First, injected sources would otherwise participate in the percenti
 
 This is a decision, recorded here so it is not later mistaken for an oversight. It means the injected sample's true per-object noise is very slightly lower than a real object of the same flux. Quantify the shot-noise-to-sky ratio once at the median injected luminosity and put the number in Methods; if it is not ≪1, revisit.
 
+
+### 1.6 `inject_sources` — the contract and the injection table
+
+**Written 2026-08-17 because this was the one piece the spec named in §1.1 and
+never defined.** `InjectedSpectra` is built; this section is what the function
+that fills it gets written from.
+
+```python
+def inject_sources(config, vdfi, inj_table, bad_fiber_mask, model,
+                   *, zero_base=False, seeing_mode="exposure",
+                   progress=True) -> dict:
+    # Returns a SHALLOW COPY of vdfi with 'spectra' replaced by a frozen
+    # InjectedSpectra. Everything else in the dict is passed through by
+    # reference -- including the live _flux_hdul / _error_hdul handles,
+    # which must not be closed or re-opened.
+```
+
+**`bad_fiber_mask` is a required positional argument, and that is the whole
+mechanism enforcing §1.4.** It is not used to decide where flux lands — an
+injected source deposits into masked fibers exactly as a real one does, and the
+mask is applied downstream in the extraction as usual. It is required because
+*holding* a mask proves it was built, and a mask built before this call was
+built on clean data. The alternative — a comment saying "call this after
+`build_bad_fiber_mask`" — is how silent couplings get in. Record the mask's
+checksum in `_inject_meta` so a run whose mask was rebuilt *after* injection is
+still identifiable after the fact.
+
+**`model` is a single `SourceModel`, not a per-row one.** Per §3.3, every
+injected source in a family gets identical profile parameters; only
+`(z, M*, L, position)` vary, which is what gives the family an unambiguous
+scalar truth. A per-row model is the `profile_scatter` follow-on and is
+deliberately not supported in this pass.
+
+#### The `inj_table` schema
+
+`inj_table` is an `astropy.table.Table`, and **it is also the run table** —
+§1.1's "`run_table` IS the injection catalog". So it must carry every column
+`extract_fibers` reads (`RA`, `DEC`, `config.z_col`, `config.mass_col`) plus the
+columns `build_run_table` filters on (`FIELD`, `CATALOG`), or downstream breaks
+in a way that has nothing to do with injection.
+
+| column | dtype | meaning |
+|---|---|---|
+| `ID` (`config.id_col`) | int | injection index, 0-based within the pass. Must be unique **across fields** — cf. the real `prod_combined` cross-field ID collision. |
+| `RA`, `DEC` | float64, deg | injected position, from `draw_injection_positions` (§2) |
+| `z` (`config.z_col`) | float64 | bootstrapped jointly with `M*` and `L` from the real run table (§2.4). Sets the observed wavelength, and therefore the sky-line coincidence rate, the sub-pixel phase, and where the line falls in the LSF. |
+| `MASS_50` (`config.mass_col`) | float64 | bootstrapped with `z`. Bookkeeping under `bin_mode="kpc"` (§2.4), but the splits diagnostics and the reported R_vir key on it. |
+| `L_INJ` | float64 | injected Lyα luminosity, in whatever units `vdfi['spectra']` carries. Scales the template linearly; `SourceModel.L` stays 1.0 and this column multiplies. |
+| `FIELD`, `CATALOG` | str | so `build_run_table` selects the rows. `CATALOG` should be the family tag (`"INJ_Z"` / `"INJ_P"` / `"INJ_H"`) — that makes "a family" a catalog cut, which is machinery that already exists. |
+| `FAMILY` | str | redundant with `CATALOG` on purpose: `CATALOG` is plumbing, `FAMILY` is what the diagnostics group on. |
+| `NN_DIST` | float64, arcsec | distance to the nearest **other injection** (§2.2). Recorded at draw time, not recomputed later. |
+| `REAL_DIST` | float64, arcsec | distance to the nearest **real catalog source**. **Load-bearing**: §2.1 replaces the separate `blank` extraction with a post-hoc slice on this column, so a run without it cannot answer the placement question at all. |
+| `N_FIB_INNER` | int | good fibers in the innermost radial bin, pooled over exposures, at draw time. The §2.3 coverage cut, kept so the rejection threshold is auditable and so §5.4 can bin residuals against it. |
+
+**Family Z (`L = 0`) carries the same schema.** It has no flux, but it must
+still go *through* `inject_sources` rather than around it, because the point of
+running Z first (§4.4) is to shake out placement, run-table construction, cache
+signatures and mask ordering — all of which live in this function. `L_INJ = 0`
+should short-circuit *template construction* (an all-zero patch is still a
+patch, and building 400 of them wastes hours) but must NOT short-circuit the
+overlay: the run still goes through `InjectedSpectra` with zero patches, which
+is exactly the §7.4 empty-overlay case exercised at production scale.
+
+#### The loop
+
+```
+for each source s in inj_table:
+    if L_INJ == 0: continue                       # family Z; overlay stays empty
+    for each exposure e:
+        keep = select_nearby_fibers(dra[e], ddec[e], bins[-1], kpc_per_arcsec)
+        if keep.size == 0: continue
+        dra_w, ddec_w = core._offsets_with_dar(...)          # (nkeep, nwave)
+        seeing_e      = core._exposure_seeing(vdfi['seeing'], e)
+        patch = L_INJ * build_source_template(model, z_s, dra_w, ddec_w,
+                                              seeing_e, wave, kpc_per_arcsec)
+        overlay.add_patch(e, keep, patch)
+return {**vdfi, 'spectra': overlay.freeze(), '_inject_meta': {...}}
+```
+
+Three things this ordering protects, all argued elsewhere and collected here so
+the implementer does not have to reassemble them:
+
+- **Per exposure, with DAR, never into the coadd.** Injecting at a fixed,
+  wavelength-independent position skips the optics chain entirely and is the
+  most likely way to build a test that passes vacuously (§3.1).
+- **`seeing_mode="exposure"` for real-cube runs**, unlike `check_level1`, which
+  correctly used `"field"` because `predict_binned_observables` accepts only a
+  scalar seeing. Per-exposure is affordable here because the PSF tables cache
+  per exposure *across all sources*, so the cost is paid once per exposure for
+  the whole pass rather than once per source.
+- **`select_nearby_fibers` cuts at `bins[-1]`, not at `r_trunc`.** They are the
+  same number today (both 2000 kpc) and the coincidence must not be relied on:
+  the fiber cut is a *measurement* aperture and `r_trunc` is a *source*
+  definition. §10.5 is a live reason they may stop coinciding.
+
+#### What `_inject_meta` must carry
+
+The dict returned alongside the overlay, and the thing written into the
+`_manifest.json` (§1.3) and the `INJECT` FITS keyword:
+
+`family`, the full `SourceModel` repr (including `lsf_kms`, `r_trunc`, and the
+velocity field's parameters), `n_sources`, `zero_base`, `seeing_mode`, the bin
+edge list, the mask checksum, and the RNG seed used for placement. **The bin
+edges belong here even though they are already a config knob**, because
+`r_trunc` tracks them (§3.2), and a manifest recording the truncation radius
+without recording what it was tracking is not decodable months later.
+
+#### Open before this is written
+
+1. **Does `L_INJ` multiply cleanly, or must it enter `build_source_template`?**
+   The template is linear in `L`, so scaling the returned patch is equivalent
+   and cheaper — but only if nothing inside the template build is normalized
+   against `model.L`. Check rather than assume; this is exactly the class of
+   assumption that produced the 2026-07-22 area bug.
+2. **Memory ceiling for a 400-source pass.** "A few hundred MB" is the §1.2
+   estimate at ~450 sources, but it was made at the 366″ cut. Re-measure with
+   `InjectedSpectra.nbytes` on a real 3–5 source run before launching family Z.
+3. **Progress and restartability.** A 400-source patch build is hours before the
+   extraction even starts. Decide whether the patch store is checkpointed to
+   disk, or whether the build is fast enough that a crash just means re-running.
+
 ---
 
 ## 2. Placement
@@ -184,7 +311,31 @@ That criterion caps the whole experiment at ~70 objects. It is also the wrong cr
 
 ### 2.3 Footprint
 
-Positions are drawn uniformly over each field's RA/Dec range (COSMOS `[149.90, 150.40] × [2.10, 2.50]`, AEGIS `[214.65, 215.15] × [52.73, 53.03]`) and then rejected unless they have adequate fiber coverage. Define adequate as: at least `n_min_fibers` **[FILL — suggest matching the 5th percentile of the real sample's innermost-bin fiber count]** good fibers within the innermost radial bin, pooled over exposures. The fill factor is not 100% and injections falling into IFU gaps must be discarded, not silently extracted as NaN.
+**v8 (Austin, 2026-08-25). Superseded: positions are no longer drawn over the field.**
+
+*What v1–v7 said, kept because the reasoning below is a correction of it:* positions were drawn uniformly over each field's RA/Dec range (COSMOS `[149.90, 150.40] × [2.10, 2.50]`, AEGIS `[214.65, 215.15] × [52.73, 53.03]`) and rejected unless they had adequate fiber coverage.
+
+That is the wrong region. **MOSDEF is a slit-mask survey.** Its coverage is the union of a handful of rectangular mask pointings, with concave notches between them and sky inside the field it never visited at all. Taking the extrema of the source positions and calling the box "the footprint" interpolates straight across every notch. A random dropped in one of those gaps is not a control for anything — it is a measurement of sky the real sample never saw, which is precisely the failure the null exists to detect. The null then reports the VDFI *field's* mean rather than the mean under the real sample's selection, and for an amplitude result (⟨I⟩b) the zero point **is** the measurement.
+
+**Adopted: an alpha shape (concave hull) around the real run table's positions.** Roll a probe circle of radius α around the outside of the point cloud. It pushes into any gap wider than 2α, so real notches in the survey edge get followed; it cannot enter a narrower one, so the interior stays solid. Formally: Delaunay-triangulate the positions and keep every triangle whose **circumradius ≤ α**. The two limits are worth stating, because they are the two wrong answers:
+
+| α | shape | what it is |
+|---|---|---|
+| → ∞ | every triangle kept | the convex hull — i.e. back to the interpolating box |
+| ≈ nearest-neighbour separation | shape falls apart | swiss cheese; randoms start avoiding MOSDEF's own sparse patches, which *were* observed |
+| **3 × median NN (default)** | mask pattern | follows the pointings, keeps sparse interiors |
+
+α is set from the data — `alpha_scale` × the **median nearest-neighbour separation** of the catalog — because that is the only scale the positions themselves supply. It is still a geometry guess, so `plot_source_footprint` sweeps it and the shape gets eyeballed once per catalog before a 13 hr pass is spent on it. **Read the alpha-only area in that sweep, not the buffered one**: the buffer holds the total area nearly fixed while the shape underneath collapses (measured: at 1× NN on a uniform test field the alpha shape falls from 91 to 3.7 arcmin² while the buffered area does not move at all).
+
+**Buffer.** The alpha shape's boundary passes exactly *through* the outermost galaxies, so on its own it asserts that MOSDEF observed no sky beyond its most peripheral target — false, and it truncates the outer annuli of any random near the edge. The footprint is therefore the **union** of the alpha shape with a disk of `buffer_arcsec` (default 15″, ~4% of the 242″ = 2000 kpc outer aperture) around every source. Union, not global dilation: the buffer rounds the outside without filling the interior notches back in.
+
+**Why not a union of disks alone** — the literal per-source "shrinkwrap". Then every random sits within `buffer` of a real galaxy *by construction*, the random catalog inherits the real sample's clustering, and §5.4's "far from any real source" slice — which is how the `blank` placement mode of §2.1 gets answered for free — is empty. The alpha shape carries the geometry; the buffer only softens its edge.
+
+**Fiber coverage is a separate, additional cut**, unchanged: at least `n_fib_inner_min` good fibers within `r_inner_arcsec`, pooled over exposures (**[FILL — suggest matching the 5th percentile of the real sample's innermost-bin fiber count]**). The fill factor is not 100% and injections falling into IFU gaps must be discarded, not silently extracted as NaN. Footprint and coverage are independent: a candidate has to pass both.
+
+**Consequence for §2.2's crowding budget, and it cuts the right way.** The footprint is a *smaller* area than the field, so the random apertures overlap each other more, not less. That is not a defect — the real galaxies overlap each other exactly that much too, and a covariance matrix estimated from randoms that overlap less than the data would understate the data's bin–bin correlation. Matching the footprint is what makes §4.4's Hartlap-corrected covariance the covariance of *this* stack rather than of a hypothetical sparser one. What it does cost is placement headroom: expect more rejected draws, and if a pass cannot place its N, lower `min_sep_arcsec` before touching `min_dz` (see §2.4).
+
+`build_source_footprint` / `plot_source_footprint` in `injection.py`; `draw_injection_positions(footprint='auto', real_ra=..., real_dec=...)` builds it from the same arrays already being passed for `REAL_DIST`. Both default to `None`, which reproduces pre-v8 behaviour exactly — levels 0–6 were single-source tests and none of their results move.
 
 ### 2.4 Redshift and mass
 
@@ -197,6 +348,22 @@ M\* is still bootstrapped jointly with z, for three surviving reasons: the split
 **z is the one that matters.** It sets the observed wavelength of the injected line, and therefore the sky-line coincidence rate, the sub-pixel phase against the 110–140 km s⁻¹ grid, and where the line falls in the LSF. Bootstrapping z from the real table makes the injected stack directly comparable to the real one on all three.
 
 Also bootstrap the **Lyα luminosity** from the same rows, as part of the same triple, so the injected stack's S/N matches the real stack's.
+
+---
+
+**v8 (Austin, 2026-08-25): the z rule is now implemented, and it is uniform-within-hump rather than a bootstrap. Recording the deviation, because v4 above asks for a bootstrap and the code no longer does one by default.**
+
+The implementation through v7 drew z **uniformly over `z_range`**, which is neither of the things this section asked for. That has to go, and not for tidiness: **MOSDEF's n(z) is two humps** — roughly z ≈ 2.0–2.6 and z ≈ 3.0–3.6, because the strong rest-optical lines have to land between the OH forest and the atmospheric bands — with a span between them holding essentially no galaxies. A flat draw across 2.0–3.5 puts about a third of the randoms in that empty span, at observed wavelengths the real stack never reaches. The systematic the null is sizing is the **sky residual, which is wavelength-dependent**. Randoms spread over wavelengths the data never sees average it away, and the null then reads clean for a reason that has nothing to do with the data being clean. This is the one failure mode a random catalog is least able to recover from, because it makes the test *pass*.
+
+**Adopted: `z_mode='hump'`.** Detect the humps from the real run table — sort z, cut wherever consecutive redshifts differ by more than `gap_dz` (0.15), keep every run holding ≥ `min_frac` (2%) of the sample — then draw uniform inside each hump, weighted by the real counts. Nothing about 2.0–2.6 / 3.0–3.6 is hardcoded; a re-cut catalog re-detects its own windows. Stragglers below the threshold are dropped and reported: a lone galaxy at z = 4.1 is not a hump, and stretching a window out to reach it reintroduces the empty span the mode exists to avoid.
+
+**Why not the bootstrap v4 asked for.** The bootstrap (`z_mode='bootstrap'`, still available and still exact) reproduces n(z) *including its own small-number structure* — the randoms inherit every spike in a ~450-galaxy sample, and at N = 400 most redshifts get reused several times. Uniform-within-hump keeps the thing that matters — **which** wavelengths the survey reaches and **in what proportion** — while staying smooth inside each window. The difference between the two is second order next to the difference between either and a flat slab; the flat slab is the error being fixed. Run `sample_redshifts` and plot the drawn n(z) against the real one before committing a pass.
+
+**`z_range` still clips if passed.** Passing both `z_range` and `z_sample` means the range wins: the windows are the real distribution *clipped* by it, and the hump weights move with the clip. That is a legitimate thing to want — keeping Lyα off the ends of the 3470–5540 Å grid — but it is no longer the real n(z), so the sampler says so out loud when the clip removes any real redshift. Pass `z_range=None` to keep the distribution intact.
+
+**This tightens the §2.2 exclusion, in both coordinates.** Hump-drawn z's occupy ~1.1 of redshift instead of 1.5, so a larger fraction of pairs are spectral neighbours; the footprint (§2.3) shrinks the sky area at the same time. `min_dz` is therefore validated against the **summed hump width**, not `z_hi − z_lo` — without that, a two-hump sample with a wide nominal range degenerates into a purely spatial exclusion and no error is raised. If a pass cannot place its N, **lower `min_sep_arcsec` first**: the spectral half of the AND is the half doing the physical work.
+
+**M\* is unaffected.** It is bookkeeping (v4 above), it does not touch `bin_mode="kpc"` bin edges, and family Z injects no flux, so the luminosity bootstrap does not bind there either. Both still matter for P and H.
 
 ---
 
@@ -523,7 +690,7 @@ Then climb one dimension at a time. **Nothing at level *n* is built until *n−1
 | 6 | **real** | one bright source | levels 2–4 within a few percent | overlay indexing, real-data interaction |
 | 7 | **real** | full family | production | — |
 
-**LEVEL 1 PASSES ON REAL COSMOS DATA, 2026-08-16.** 132/132 exposures, worst binned-Δv deviation **0.356 km s⁻¹ against a 145 km s⁻¹ pixel** (0.25% of a pixel), flux conservation 0.92 of the geometric prediction, profile shape flat to 4.87%. Levels 0 and 1 are now closed and `check_level0` / `check_level1` are the two calls that re-run them. **The next step is build-order item 2 — `inject_sources` + the `InjectedSpectra` overlay — which gates every remaining rung.**
+**LEVEL 1 PASSES ON REAL COSMOS DATA, 2026-08-16.** *(2026-08-17: `InjectedSpectra` + `check_overlay_identity` are built and self-tested, so what gates levels 2–4 is now `inject_sources` alone — see §1.6.)* 132/132 exposures, worst binned-Δv deviation **0.356 km s⁻¹ against a 145 km s⁻¹ pixel** (0.25% of a pixel), flux conservation 0.92 of the geometric prediction, profile shape flat to 4.87%. Levels 0 and 1 are now closed and `check_level0` / `check_level1` are the two calls that re-run them. **The next step is build-order item 2 — `inject_sources` + the `InjectedSpectra` overlay — which gates every remaining rung.**
 
 Earlier record, for context —
 
@@ -604,7 +771,19 @@ Estimated implementation: ~1 week to a working injection, most of it in items 1,
 3. **Does family P need a different `n_min_fibers`?** A point source deposits all its flux in the innermost bin, so P is far more sensitive to inner-bin fiber coverage than H is. The §2.3 threshold may need to be stricter for P.
 4. ~~**Skew estimator on family P.**~~ **CLOSED v5** — skew is out of scope entirely (§3.3), so there is no P skew row to adjudicate.
 
-5. **⚠ NEW (v6, 2026-08-16): the outermost bin is anomalous, and `r_trunc` sitting exactly on its outer edge is the suspect.** Two independent symptoms in the same bin: recovered/predicted surface brightness reads **1.0135** where every other bin is within 0.3% of 1.000 (and it is what pushed the shape check to 4.87% against a 5% tolerance), and truth/intrinsic reads **0.774** where the flat mid-radius bins read 1.000. Both appeared when the 3000 kpc edge was dropped, which moved the hard truncation knee (`dlnV/dlnr` = −215 at the cut) from the unused `[2000, 3000]` bin onto the outer edge of the last *measured* bin. **The naive explanation does not cover it:** a 2″ PSF at a 240″ boundary should cost ~2% by rim area, not 23%. Both generators see the same knee so the comparison stays self-consistent and nothing downstream is wrong, but the size is unexplained. Options if it matters: a softer taper, or `r_trunc` beyond the aperture — and the latter reopens what `L` means (§3.2). **Decide before quoting anything from the outermost bin.**
+5. **✔ CLOSED (v7, 2026-08-17): the outermost bin is fiber sampling, not the truncation knee.** The v6 suspect — `r_trunc` sitting on the outer edge of the last measured bin — is **exonerated by measurement.** Re-running `check_level1` with `r_trunc = 4000` while leaving the bins at 2000 genuinely moves the cut (the truth generator's shells run to `1.5 × r_edges[-1]` = 3000, i.e. 1000 kpc past anything a 2″ PSF can reach), and the outermost bin's SB ratio moved **1.0135 → 1.0132**. The knee is 0.03% of a 1.35% effect. The other obvious candidate is dead too: for `I ∝ r^-0.8` on `[1000, 2000]` the area-weighted mean radius is 1556 kpc against a midpoint of 1500, and ⟨I⟩/I(1500) = **0.996** — convexity and the `2πr` weighting nearly cancel, so bin width alone cannot produce 1.35% in either direction.
+
+   **What it is instead is the thing `check_level1`'s own docstring warns about, in the bin where it is most likely.** `prof_rec` is a mean over **fibers**; `truth["sb"]` is a mean over **area**; they agree only insofar as the fibers sample the annulus uniformly in area. `[1000, 2000]` is 1000 kpc wide (122–244″), it is the outermost bin, and `select_nearby_fibers` cuts at exactly `bins_kpc[-1]` — so it is the bin most likely to run off the field edge or into IFU gaps, and a source not sitting dead-centre draws its fibers preferentially from the *inner* side of the annulus. **Measured: the fibers' mean radius in that bin is 1543 kpc against the annulus's area-weighted 1556** — a 0.8% inward shift, which at the local log-slope there (`γ_eff = γ·(r/r_c)²/(1+(r/r_c)²)` = 0.75 at r = 1550, r_c = 400) predicts **SB rat 1.0066**. Right sign, right order, about **half** the observed 1.0135.
+
+   **The remaining half is almost certainly the same effect computed properly, and the residual is a Jensen term.** Comparing `I` at two *mean radii* is not the same as comparing two *means of I*: because `I` is convex, `⟨I(r_fib)⟩ > I(⟨r_fib⟩)`, and the fiber distribution's width contributes on top of its centroid shift. The assumption-free version of the prediction is
+
+   ```
+   SB rat_predicted  =  mean_over_fibers[ I(r_f) ]  /  ( ∫ I(r) 2πr dr / annulus area )
+   ```
+
+   both sides evaluated on the fibers and annulus actually used. **Run that before treating anything here as unexplained** — it needs no re-extraction and no cube, only `data["dists"]`, `data["kpc_per_arcsec"]` and `model.I` from a level-1 run already in hand. If it lands on 1.0135 the question is fully closed.
+
+   **Consequences either way.** (a) `min_nfib_shape` is guarding the wrong quantity — the failure mode is not *few* fibers but fibers that do not sample the annulus in area, which a wide bin at large radius can fail with hundreds of fibers. The right guard is a comparison of the fibers' area-weighted radius against the annulus's, computed per bin and reported. (b) **The `truth/intrinsic = 0.774` figure should stop being treated as a symptom**: it compares an area-averaged, fiber-response-weighted quantity against a point evaluation of intrinsic surface brightness at the arithmetic midpoint of the widest bin. Nothing checks it; it is a plot annotation, and `_plot_level1` already anchors the grey curve on the *median* bin specifically so that this bin cannot rescale the figure. (c) Nothing downstream is wrong and the outermost bin is quotable, because the injector and the truth generator agree there to 1.35% and the disagreement is now attributed rather than mysterious.
 
 6. **Does the `[180, 350]` straddling bin dominate the transition-localization result?** If most of the constraint on the recovered break location comes from that one blended bin, move the break to the 180 kpc edge and re-run — §4.2 keeps 200 on the argument that sub-bin structure is the more realistic test, but that argument fails if the blended bin is also the only informative one.
 

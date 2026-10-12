@@ -11,13 +11,54 @@
             "id": "955084a768d3dca5",
             "type": "leaf",
             "state": {
-              "type": "empty",
-              "state": {},
+              "type": "markdown",
+              "state": {
+                "file": "docs/paper-writing/lya-halos-everything-layout.md",
+                "mode": "source",
+                "source": false
+              },
               "icon": "lucide-file",
-              "title": "New tab"
+              "title": "lya-halos-everything-layout"
+            }
+          },
+          {
+            "id": "76749607235a4e46",
+            "type": "leaf",
+            "state": {
+              "type": "pdf",
+              "state": {
+                "file": "docs/literature/Saldana-Lopez 2026 - LaCOS II - Connection between LyC Escape and LAH in SF Galaxies.pdf"
+              },
+              "icon": "lucide-file-text",
+              "title": "Saldana-Lopez 2026 - LaCOS II - Connection between LyC Escape and LAH in SF Galaxies"
+            }
+          },
+          {
+            "id": "805fa4d17bafded6",
+            "type": "leaf",
+            "state": {
+              "type": "pdf",
+              "state": {
+                "file": "docs/literature/Kozlova 2026 - Two Domains of LAH in MXDF.pdf"
+              },
+              "icon": "lucide-file-text",
+              "title": "Kozlova 2026 - Two Domains of LAH in MXDF"
+            }
+          },
+          {
+            "id": "5b9bec811b4b207e",
+            "type": "leaf",
+            "state": {
+              "type": "pdf",
+              "state": {
+                "file": "docs/literature/Zhang 2026 - Cross-Correlations between CLAMATO and Lya Forest in COSMOS.pdf"
+              },
+              "icon": "lucide-file-text",
+              "title": "Zhang 2026 - Cross-Correlations between CLAMATO and Lya Forest in COSMOS"
             }
           }
-        ]
+        ],
+        "currentTab": 2
       }
     ],
     "direction": "vertical"
@@ -37,7 +78,9 @@
               "type": "file-explorer",
               "state": {
                 "sortOrder": "alphabetical",
-                "autoReveal": false
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
               },
               "icon": "lucide-folder-closed",
               "title": "Files"
@@ -74,7 +117,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300
+    "width": 253.5
   },
   "right": {
     "id": "c9934419cce42a24",
@@ -179,8 +222,24 @@
       "bases:Create new base": false
     }
   },
-  "active": "955084a768d3dca5",
+  "active": "805fa4d17bafded6",
   "lastOpenFiles": [
+    "docs/literature/Saldana-Lopez 2026 - LaCOS II - Connection between LyC Escape and LAH in SF Galaxies.pdf",
+    "docs/literature/Kozlova 2026 - Two Domains of LAH in MXDF.pdf",
+    "docs/literature/Zhang 2026 - Cross-Correlations between CLAMATO and Lya Forest in COSMOS.pdf",
+    "docs/literature/Byrohl 2021 - Physical origins of Lyα halos.pdf",
+    "docs/literature/Zheng 2011 - Extended Lya Emission Simulations around SF Galaxies.pdf",
+    "01-lya_halos/code/utils_lya_halo/__pycache__/config.cpython-310.pyc.132399817665232",
+    "docs/literature/Rakic 2012 - HI Optical Depth near SF Galaxies at z=2.4 in KBSS.pdf",
+    "docs/literature/Chen 2020 - KBSS Kinematics of CGM via Neutral Hydrogen at z=2.pdf",
+    "docs/literature/Leclercq 2017 - Extended Lya Halos from MUSE in Hubble Ultra Deep Fields.pdf",
+    "docs/literature/Leclercq 2020 - MUSE-HUD XIII Spatially Resolved Spectral Properties.pdf",
+    "docs/literature/Wisotzki 2018 - Nearly All the Sky is Covered by Lya Halos.pdf",
+    "docs/paper-writing/lya-halos-everything-layout.md",
+    "docs/halo_gas_correlation_literature_review.md",
+    "docs/paper-writing/three-paper-program.md",
+    "docs/paper-writing/latex-tips.md",
+    "docs/paper-writing/discussion-draft-notes.md",
     "briefings/2026-07-10.md",
     "templates/briefing-template.md",
     "CHANGELOG.md",

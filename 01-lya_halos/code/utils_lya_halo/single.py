@@ -308,8 +308,8 @@ def measure_single_galaxy(sg, *, method="flux_weighted",
         fres = integrated_line_flux(rest_wave, flux_all[r], err=err_all[r],
                                     bounds=b, cont_bounds=cont_bounds)
         if fres["success"]:
-            fx[r]  = fres["flux_sum"]
-            fxe[r] = fres["err_sum"]
+            fx[r]  = fres["flux_integral"]    # x dlambda (2026-09-17; was flux_sum)
+            fxe[r] = fres["err_integral"]
 
     return {"r_edges": r_edges, "centroid_v": cen_v, "flux": fx,
             "flux_err": fxe, "sn": np.asarray(sg["sn"]), "method": method}
@@ -488,8 +488,8 @@ def _psf_weighted_core_luminosity(config: "PipelineConfig", product: "GalaxyProd
                                bounds=bounds, cont_bounds=cont_bounds,
                                cont_method=cont_method, cont_order=cont_order,
                                clip_negative=clip_negative)
-    core_flux = res["flux_sum"] if res["success"] else np.nan
-    core_flux_err = res["err_sum"] if res["success"] else np.nan
+    core_flux = res["flux_integral"] if res["success"] else np.nan   # x dlambda (2026-09-17)
+    core_flux_err = res["err_integral"] if res["success"] else np.nan
     return {"core_flux": core_flux, "core_flux_err": core_flux_err, "unit_info": unit_info}
 
 
@@ -675,8 +675,8 @@ def measure_single_galaxy_core_halo(
                                    cont_method=cm, cont_order=co,
                                    clip_negative=clip_negative)
         if res["success"]:
-            flux_sum[r] = res["flux_sum"]
-            err_sum[r]  = res["err_sum"]
+            flux_sum[r] = res["flux_integral"]   # x dlambda (2026-09-17; was the pixel sum)
+            err_sum[r]  = res["err_integral"]
 
     # per-bin annulus area, kpc^2 (r_lo=0 for the core bin -> full circle --
     # the r_lo=0 special case of the same annulus formula every other bin

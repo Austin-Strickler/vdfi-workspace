@@ -957,7 +957,7 @@ def placebo_wavelengths(
             fr = integrated_line_flux(
                 rest_wave, flux[r], bounds=bounds_c, cont_bounds=cont_c,
                 lya_center=c, cont_method=cont_method, cont_order=cont_order)
-            f_off[ci, r] = fr["flux_sum"]
+            f_off[ci, r] = fr["flux_integral"]   # sum(y) x dlambda, matches pipeline since 09-17 (audit I1)
 
     if block_len is None:
         block_len = int(max(1, np.ceil((foot_hi - foot_lo) / step)))

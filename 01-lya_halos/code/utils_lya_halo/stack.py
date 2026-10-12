@@ -168,42 +168,74 @@ def coadd_galaxies(cube_flux, cube_err, methods, weights=None):
 # 2.0  Full assembly
 # ---------------------------------------------------------------------
 def sample_virial_radius_kpc(config: "PipelineConfig", mass, z,
-                             m_min: float = 7.0, m_max: float = 11.0):
+                             m_min: float = 7.0, m_max: float = 11.0, *,
+                             mass_lo=None, mass_hi=None,
+                             smhm_scatter_dex: float = 0.2,
+                             n_draws: int = 500, seed: int | None = 0,
+                             return_details: bool = False):
     """
     Biweight virial radius (kpc) of the sample -- the factor that converts
-    R/Rvir to kpc for plotting/reporting (VR_biweight_v), plus its biweight
-    scatter across the sample (VR_biweight_e).
+    R/Rvir to kpc for plotting/reporting (VR_biweight_v) -- plus the
+    UNCERTAINTY on that value (VR_biweight_e), which is what the grey band
+    around the R_vir line shows.
 
-    For EACH galaxy, derives its own R200c [kpc] directly from its stellar
-    mass + z via config.smhm_model's SHMR chain (estimate_M200c_R200c_from_Mstar
-    -- the SAME relation virial_to_kpc_bins uses per galaxy when
-    bin_mode='virial'; default Girelli+2020 since 2026-07-27, was Moster+2013),
-    with the same log-mass clipping (m_min/m_max) as virial_to_kpc_bins. Then
-    biweight-combines that per-galaxy R200c array over the sample.
+    VR_biweight_v (unchanged method): for EACH galaxy, R200c [kpc] from its
+    stellar mass + z via config.smhm_model's SHMR chain
+    (estimate_M200c_R200c_from_Mstar -- the SAME relation virial_to_kpc_bins
+    uses; default Girelli+2020), with the same log-mass clipping
+    (m_min/m_max), then the biweight location over the sample. Computed the
+    same way for every config.bin_mode.
 
-    R200c is a physical property of each galaxy (from its mass and z) -- it does
-    NOT depend on how the radial bins themselves are defined, so unlike the old
-    version this is computed the SAME way for every config.bin_mode ('virial',
-    'kpc', or 'arcsec'), not just 'virial'. This lets you ask "what's the
-    biweight virial radius of my sample?" even when you binned in kpc.
+    VR_biweight_e (2026-09-16 -- was the plain population scatter). NOTE:
+    analysis.run_measurement_suite REPLACES this with the bootstrapped
+    band (bootstrap_virial_radius); this value is the quick estimate:
+    uncertainty on the sample's R_vir, because the stack is ONE biweight
+    profile, not N individual ones. Monte Carlo, n_draws realizations per
+    galaxy:
+      1. log M* drawn from a split normal: sigma_lo = mass - mass_lo (16th),
+         sigma_hi = mass_hi - mass (84th). Only one side given -> symmetric.
+         Neither given -> no mass error. NaN / negative widths -> 0.
+      2. clip to [m_min, m_max], invert the SMHM relation (tabulated on
+         the rising branch -- same turnover rule as virial.mhalo_from_mstar).
+      3. add SMHM scatter: log Mh += N(0, smhm_scatter_dex). This is scatter
+         in log Mh AT FIXED M*. 0.2 dex is a PLACEHOLDER, not a value taken
+         from Girelli+2020 -- set it deliberately. 0 turns it off.
+      4. R200c per draw.
+    The pooled per-galaxy draws give a widened scale (population spread +
+    mass errors + SMHM scatter); VR_biweight_e = that biweight scale /
+    sqrt(N_galaxies). NOTE: only per-galaxy RANDOM errors average down like
+    this. A shared systematic (e.g. the SMHM normalization, or the choice of
+    smhm_model) does NOT and is not included here.
+
+    mass, mass_lo, mass_hi : log10(M*/Msun) arrays (e.g. MASS_50/16/84).
+    seed : RNG seed (default 0, so re-running Stage 2 gives the same band).
+    return_details : False -> (VR_biweight_v, VR_biweight_e) as before.
+        True -> dict with those plus scatter_nominal (old VR_biweight_e,
+        population spread, no errors), scatter_mc (widened spread),
+        n_galaxies, smhm_scatter_dex, n_draws, mass_errors_used.
 
     Returns
     -------
     (VR_biweight_v, VR_biweight_e) : (float | None, float | None)
-        Biweight-location and biweight-scale (~1-sigma scatter) of the
-        per-galaxy R200c [kpc] array. VR_biweight_e is None if it cannot be
-        estimated (e.g. fewer than 2 finite galaxies). Both are None if
-        VR_biweight_v itself cannot be computed. Purely informational -- never
-        affects the stacks themselves (build_stacks wraps this in try/except).
+        Both None if VR_biweight_v cannot be computed; VR_biweight_e None if
+        fewer than 2 finite galaxies. Purely informational -- never affects
+        the stacks themselves (build_stacks wraps this in try/except).
     """
     from astropy.stats import biweight_location, biweight_scale
+    from .virial import _FORWARD, R200c_from_M200c
 
     mass = np.asarray(mass, dtype=float)
     z = np.asarray(z, dtype=float)
+    ngal = len(z)
+
+    def _none():
+        if return_details:
+            return {"VR_biweight_v": None, "VR_biweight_e": None}
+        return None, None
 
     model = getattr(config, "smhm_model", "girelli20")
-    rvir = np.full(len(z), np.nan)
-    for i in range(len(z)):
+    rvir = np.full(ngal, np.nan)
+    for i in range(ngal):
         mi, zi = float(mass[i]), float(z[i])
         if not np.isfinite(mi) or not np.isfinite(zi) or zi <= 0:
             continue
@@ -216,20 +248,199 @@ def sample_virial_radius_kpc(config: "PipelineConfig", mass, z,
 
     finite = np.isfinite(rvir)
     if not np.any(finite):
-        return None, None
+        return _none()
     val = biweight_location(rvir, ignore_nan=True)
     if not np.isfinite(val):
-        return None, None
+        return _none()
+    val = float(val)
+    n_fin = int(finite.sum())
 
+    details = {"VR_biweight_v": val, "VR_biweight_e": None,
+               "scatter_nominal": None, "scatter_mc": None,
+               "n_galaxies": n_fin, "smhm_scatter_dex": float(smhm_scatter_dex),
+               "n_draws": int(n_draws),
+               "mass_errors_used": mass_lo is not None or mass_hi is not None}
+    if n_fin < 2:
+        return details if return_details else (val, None)
+    try:
+        s0 = biweight_scale(rvir, ignore_nan=True)
+        details["scatter_nominal"] = float(s0) if np.isfinite(s0) else None
+    except Exception:
+        pass
+
+    # ---- Monte Carlo: mass errors + SMHM scatter --------------------------
+    sig_lo, sig_hi = _mass_error_widths(mass, mass_lo, mass_hi)
+    rng = np.random.default_rng(seed)
+    draws = _r200c_draws(mass, z, sig_lo, sig_hi, model=model, n_draws=int(n_draws),
+                         rng=rng, smhm_scatter_dex=smhm_scatter_dex,
+                         m_min=m_min, m_max=m_max, use=finite)
+
+    pooled = draws[:, finite].ravel()
+    pooled = pooled[np.isfinite(pooled)]
     err = None
-    if int(finite.sum()) > 1:
+    if pooled.size > 1:
         try:
-            e = biweight_scale(rvir, ignore_nan=True)
-            err = float(e) if np.isfinite(e) else None
+            s_mc = biweight_scale(pooled)
+            if np.isfinite(s_mc):
+                details["scatter_mc"] = float(s_mc)
+                err = float(s_mc) / np.sqrt(n_fin)
         except Exception:
             err = None
+    details["VR_biweight_e"] = err
+    return details if return_details else (val, err)
 
-    return float(val), err
+
+def _mass_error_widths(mass, mass_lo=None, mass_hi=None):
+    """(sigma_lo, sigma_hi) in dex from the 16th/84th log-mass percentiles.
+    One side missing -> symmetric from the other; neither -> zeros.
+    NaN or negative widths -> 0 (that galaxy gets no mass error)."""
+    mass = np.asarray(mass, dtype=float)
+
+    def _width(a, sign):
+        if a is None:
+            return None
+        w = sign * (np.asarray(a, dtype=float) - mass)
+        return np.where(np.isfinite(w) & (w > 0), w, 0.0)
+    sig_hi = _width(mass_hi, +1)
+    sig_lo = _width(mass_lo, -1)
+    if sig_hi is None and sig_lo is None:
+        z0 = np.zeros(mass.shape)
+        return z0, z0
+    if sig_hi is None:
+        sig_hi = sig_lo
+    if sig_lo is None:
+        sig_lo = sig_hi
+    return sig_lo, sig_hi
+
+
+def _r200c_draws(mass, z, sig_lo, sig_hi, *, model, n_draws, rng,
+                 smhm_scatter_dex=0.2, m_min=7.0, m_max=11.0, use=None):
+    """
+    (n_draws, ngal) array of R200c [kpc] realizations. For EACH galaxy, ONE
+    value per draw (so a galaxy picked twice in a bootstrap draw carries the
+    same mass both times):
+        log M*  = mass + split-normal(sig_lo, sig_hi)   -> clip [m_min, m_max]
+        log Mh  = SMHM^-1(log M*, z)   (tabulated rising branch, like
+                  virial.mhalo_from_mstar)  + N(0, smhm_scatter_dex)
+        R200c   = R200c_from_M200c(Mh, z)
+    Galaxies with use[i] False (or invalid z) stay NaN.
+    """
+    from .virial import _FORWARD, R200c_from_M200c
+    mass = np.asarray(mass, dtype=float)
+    z = np.asarray(z, dtype=float)
+    ngal = len(z)
+    if use is None:
+        use = np.isfinite(mass) & np.isfinite(z) & (z > 0)
+    f_fwd = _FORWARD[model]
+    grid = np.linspace(9.0, 15.5, 400)            # same range as mhalo_from_mstar
+    out = np.full((int(n_draws), ngal), np.nan)
+    for i in np.flatnonzero(use):
+        zi = float(z[i])
+        g = rng.standard_normal(int(n_draws))
+        lm = mass[i] + np.where(g < 0, g * sig_lo[i], g * sig_hi[i])
+        lm = np.clip(lm, m_min, m_max)
+        logMs = np.log10(f_fwd(10 ** grid, zi))
+        imax = int(np.argmax(logMs))
+        lmh = np.interp(lm, logMs[:imax + 1], grid[:imax + 1],
+                        left=np.nan, right=np.nan)
+        if smhm_scatter_dex:
+            lmh = lmh + smhm_scatter_dex * rng.standard_normal(int(n_draws))
+        out[:, i] = np.atleast_1d(R200c_from_M200c(10 ** lmh, zi))
+    return out
+
+
+def bootstrap_virial_radius(config: "PipelineConfig", mass, z, *,
+                            mass_lo=None, mass_hi=None,
+                            nboot: int = 1000, seed: int = 1,
+                            mass_seed: int | None = None,
+                            smhm_scatter_dex: float = 0.2,
+                            m_min: float = 7.0, m_max: float = 11.0,
+                            verbose: bool = True) -> dict:
+    """
+    Bootstrapped uncertainty on the STACK's virial radius, drawn to match the
+    flux bootstrap (measure.bootstrap_all) so every error bar in a figure uses
+    the same method.
+
+    mass, mass_lo, mass_hi, z must be aligned with the stacked cube's galaxy
+    axis (build_stacks stores them as gal_mass / gal_mass_lo / gal_mass_hi /
+    gal_z). nboot and seed MUST equal the flux bootstrap's: this function
+    replays bootstrap_all's exact index sequence,
+        rng = default_rng(seed); per draw: idx = rng.integers(0, ngal, ngal),
+    so draw b here resamples the SAME galaxies as flux draw b.
+
+    Per draw b:
+        R^(b)_i  : one R200c realization per galaxy (_r200c_draws: mass error
+                   + SMHM scatter), from a SEPARATE rng (mass_seed) so the
+                   index stream stays identical to bootstrap_all's
+        A[b]     = biweight_location(R^(b)[idx_b])   resample + errors
+        B[b]     = biweight_location(R^(b)[all])     errors only (reference)
+    Reported band = 16th/84th percentiles of A.
+
+    mass_seed : None -> derived from `seed` (independent stream, reproducible).
+    smhm_scatter_dex : scatter in log Mh at fixed M*. 0.2 is a PLACEHOLDER.
+
+    Returns dict:
+        VR_fid        nominal biweight R_vir (no errors, no resampling) [kpc]
+        VR_lo, VR_hi  16th / 84th percentile of A [kpc]
+        VR_med        median of A
+        VR_err        (VR_fid - VR_lo, VR_hi - VR_fid)  -> plot band
+        VR_all        A, shape (nboot,)
+        VR_fixed_lo, VR_fixed_hi, VR_fixed_all   same for B
+        meta          every constant used
+    """
+    from astropy.stats import biweight_location
+
+    mass = np.asarray(mass, dtype=float)
+    z = np.asarray(z, dtype=float)
+    ngal = len(z)
+    model = getattr(config, "smhm_model", "girelli20")
+
+    fid = sample_virial_radius_kpc(config, mass, z, m_min=m_min, m_max=m_max,
+                                   smhm_scatter_dex=0.0, n_draws=2)[0]
+    use = np.isfinite(mass) & np.isfinite(z) & (z > 0)
+
+    sig_lo, sig_hi = _mass_error_widths(mass, mass_lo, mass_hi)
+    mrng = np.random.default_rng([int(seed), 7919] if mass_seed is None else mass_seed)
+    Rdraws = _r200c_draws(mass, z, sig_lo, sig_hi, model=model, n_draws=int(nboot),
+                          rng=mrng, smhm_scatter_dex=smhm_scatter_dex,
+                          m_min=m_min, m_max=m_max, use=use)
+
+    rng = np.random.default_rng(seed)          # replays bootstrap_all's stream
+    A = np.full(int(nboot), np.nan)
+    B = np.full(int(nboot), np.nan)
+    for b in range(int(nboot)):
+        idx = rng.integers(0, ngal, ngal)
+        A[b] = biweight_location(Rdraws[b, idx], ignore_nan=True)
+        B[b] = biweight_location(Rdraws[b], ignore_nan=True)
+
+    lo, med, hi = np.nanpercentile(A, [16, 50, 84])
+    flo, fhi = np.nanpercentile(B, [16, 84])
+    out = {
+        "VR_fid": fid, "VR_lo": float(lo), "VR_med": float(med), "VR_hi": float(hi),
+        "VR_err": (None if fid is None else (fid - float(lo), float(hi) - fid)),
+        "VR_all": A,
+        "VR_fixed_lo": float(flo), "VR_fixed_hi": float(fhi), "VR_fixed_all": B,
+        "meta": {"nboot": int(nboot), "seed": seed, "mass_seed": mass_seed,
+                 "smhm_model": model, "smhm_scatter_dex": float(smhm_scatter_dex),
+                 "m_min": m_min, "m_max": m_max, "ngal": ngal,
+                 "ngal_used": int(use.sum()),
+                 "mass_errors_used": mass_lo is not None or mass_hi is not None},
+    }
+    if verbose and fid is not None:
+        print(f"R_vir bootstrap ({int(nboot)} draws, seed={seed}, "
+              f"SMHM scatter {smhm_scatter_dex:g} dex, N={int(use.sum())}):")
+        print(f"  A (resample + errors) : {fid:.2f}  -{fid - lo:.2f} / +{hi - fid:.2f} kpc"
+              f"   [median of draws {med:.2f}]")
+        print(f"  B (errors only)       : {fid:.2f}  -{fid - flo:.2f} / +{fhi - fid:.2f} kpc")
+    return out
+
+
+def _optional_col(cat, name):
+    """Catalog column as a float array, or None if absent (Table or DataFrame)."""
+    try:
+        return np.asarray(cat[name], dtype=float)
+    except (KeyError, ValueError, TypeError):
+        return None
 
 
 def build_stacks(config: "PipelineConfig", product: "GalaxyProduct",
@@ -295,7 +506,18 @@ def build_stacks(config: "PipelineConfig", product: "GalaxyProduct",
         "unit_info": unit_info,
     }
     try:
-        result["VR_biweight_v"], result["VR_biweight_e"] = sample_virial_radius_kpc(config, m, z)
+        # 16th/84th mass percentiles, when the catalog carries them (MASS_50 ->
+        # MASS_16 / MASS_84), feed the R_vir uncertainty band
+        m_lo = m_hi = None
+        if "_50" in config.mass_col:
+            m_lo = _optional_col(cat, config.mass_col.replace("_50", "_16"))
+            m_hi = _optional_col(cat, config.mass_col.replace("_50", "_84"))
+        result["VR_biweight_v"], result["VR_biweight_e"] = sample_virial_radius_kpc(
+            config, m, z, mass_lo=m_lo, mass_hi=m_hi)
+        # per-galaxy inputs, aligned with the cube, for the R_vir bootstrap
+        # (analysis.run_measurement_suite -> bootstrap_virial_radius)
+        result["gal_mass"], result["gal_z"] = m, z
+        result["gal_mass_lo"], result["gal_mass_hi"] = m_lo, m_hi
     except Exception:
         result["VR_biweight_v"] = None   # never let a reporting helper break Stage 2
         result["VR_biweight_e"] = None

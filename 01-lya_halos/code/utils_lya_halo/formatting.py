@@ -651,3 +651,54 @@ def make_subsample_markdown_table(subsamples, columns=None, scales=None, sig=2, 
     if note:
         lines += ["", f"*{note}*"]
     return "\n".join(lines)
+
+
+# =====================================================================
+# FIGURE STYLE -- house tick style (plot style lives here, not plotting.py)
+# =====================================================================
+
+def apply_tick_style(ax, direction="in", right=True, top=False, minor=False,
+                     labelsize=None):
+    """
+    Apply the house tick style to one Axes or an array of Axes.
+
+    Default is the journal convention: ticks point INTO the plot and the
+    y-axis ticks are mirrored on the right spine (ticks only -- no right-side
+    tick labels). Call it on every new figure's axes:
+
+        from utils_lya_halo.formatting import apply_tick_style
+        fig, ax = plt.subplots()
+        ...
+        apply_tick_style(ax)                    # or apply_tick_style(axes)
+
+    Parameters
+    ----------
+    ax        : Axes, or any (nested) list/array of Axes; None entries skipped.
+    direction : "in" (default), "out", or "inout".
+    right     : mirror y ticks on the right spine (default True).
+    top       : mirror x ticks on the top spine (default False -- several of
+                our figures put a secondary R/R_vir axis up there).
+    minor     : turn minor ticks on (default False). Existing minor ticks
+                (e.g. log axes) are styled either way.
+    labelsize : optional major tick-label font size.
+
+    No matplotlib import needed here: it only calls methods on the Axes.
+    """
+    stack = [ax]
+    flat = []
+    while stack:
+        a = stack.pop()
+        if a is None:
+            continue
+        if hasattr(a, "tick_params"):
+            flat.append(a)
+        else:
+            stack.extend(np.asarray(a, dtype=object).ravel().tolist())
+    for a in flat:
+        if minor:
+            a.minorticks_on()
+        a.tick_params(axis="both", which="both", direction=direction,
+                      right=right, top=top)
+        if labelsize is not None:
+            a.tick_params(axis="both", which="major", labelsize=labelsize)
+    return ax

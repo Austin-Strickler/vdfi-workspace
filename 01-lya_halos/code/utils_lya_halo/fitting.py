@@ -619,12 +619,18 @@ def _seed_from_split(r, y, i_mid):
             return fallback
         return max((r1 - r0) / np.log(y0 / y1), 1e-3)
 
+    # Work in peak-normalized units so the 1e-3 amplitude floors below are
+    # RELATIVE (1e-3 of the peak), not absolute. Absolute floors were
+    # harmless on ~1e39 luminosity input but swamped ~1e-18 SB-unit input,
+    # collapsing every seed (2026-10-03). h's are ratio-based -> unaffected.
+    s = _amp_scale(np.asarray(y, dtype=float))
+    y = np.asarray(y, dtype=float) / s
     i_mid = int(np.clip(i_mid, 1, len(r) - 2))
     h1_0 = _h(r[0], r[i_mid], y[0], y[i_mid], fallback=max(r[i_mid] - r[0], 1.0))
     h2_0 = _h(r[i_mid], r[-1], y[i_mid], y[-1], fallback=max(r[-1] - r[i_mid], 1.0))
     A1_0 = max(float(y[0]), 1e-3)
     A2_0 = max(float(y[i_mid]) * 0.5, 1e-3)
-    return [A1_0, h1_0, A2_0, h2_0]
+    return [A1_0 * s, h1_0, A2_0 * s, h2_0]
 
 
 def _default_seeds(r, y):
@@ -634,7 +640,8 @@ def _default_seeds(r, y):
     the same instability speclsf.py's double-Gaussian fit already guards
     against with a multi-seed-then-best-chi2 pattern. Reused here."""
     r = np.asarray(r, dtype=float)
-    y = np.clip(np.asarray(y, dtype=float), 1e-6, None)
+    y = np.asarray(y, dtype=float)
+    y = np.clip(y, 1e-6 * _amp_scale(y), None)   # relative floor (was absolute 1e-6; 2026-10-03)
     n = len(r)
 
     seeds = []
@@ -673,7 +680,7 @@ def estimate_truth_from_profile(r_mid, y, *, i_mid=None, verbose=False):
     y = np.asarray(y, dtype=float)
     if i_mid is None:
         i_mid = len(r_mid) // 2
-    floor = 1e-6 * max(np.max(np.abs(y)), 1.0)   # relative floor -- works at any amplitude scale
+    floor = 1e-6 * _amp_scale(y)   # relative floor (old max(...,1.0) made it absolute for |y|<1; 2026-10-03)
     y_clipped = np.clip(y, floor, None)
     A1_0, h1_0, A2_0, h2_0 = _seed_from_split(r_mid, y_clipped, i_mid)
     if verbose:
@@ -697,7 +704,7 @@ def _data_driven_bounds(r_fit, y_fit):
     largest observed bin. Applied identically to fit_naive and
     fit_psf_aware, so neither is favored by the choice.
     """
-    amp_max = max(50.0 * np.max(np.abs(y_fit)), 1.0)
+    amp_max = 50.0 * _amp_scale(y_fit)   # relative (old max(...,1.0) floor was absolute; 2026-10-03)
     h_max = max(10.0 * (np.max(r_fit) - np.min(r_fit)), 10.0)
     lower = [0.0, 1e-3, 0.0, 1e-3]
     upper = [amp_max, h_max, amp_max, h_max]
@@ -1085,11 +1092,12 @@ def _default_seeds_expcore(r, y, scale, *, gamma_fixed=None, r_c_fixed=400.0,
     f_max caps every f seed at f_max*0.9 (kept strictly inside the [0,f_max]
     bound so no seed starts pinned at the boundary)."""
     r = np.asarray(r, dtype=float)
-    y = np.clip(np.asarray(y, dtype=float), 1e-6, None)
+    y = np.asarray(y, dtype=float)
+    y = np.clip(y, 1e-6 * scale, None)   # relative floor (was absolute 1e-6; 2026-10-03)
     n = len(r)
     i_mid = max(1, n // 2)
     A1_0, h1_0, A2_0, _ = _seed_from_split(r, y, i_mid)
-    A2_0 = max(A2_0, 1e-3)
+    A2_0 = max(A2_0, 1e-3 * scale)   # relative (was absolute 1e-3)
     f_cap = f_max * 0.9
     f_0 = float(np.clip(A2_0 / A1_0 if A1_0 > 0 else 0.05, 1e-4, f_cap))
     if r_c_guess is None:
@@ -1131,7 +1139,7 @@ def _data_driven_bounds_expcore(r_fit, y_fit, scale, *, gamma_fixed=None, r_c_fi
     r_c/gamma bounds are the same data-scaled philosophy as Part 1's
     _data_driven_bounds (see its docstring) when floated; omitted from the
     returned bounds entirely when fixed (r_c_fixed/gamma_fixed not None)."""
-    amp_max = max(50.0 * np.max(np.abs(y_fit)), 1.0)
+    amp_max = 50.0 * _amp_scale(y_fit)   # relative (old max(...,1.0) floor was absolute; 2026-10-03)
     h_max = max(10.0 * (np.max(r_fit) - np.min(r_fit)), 10.0)
     rc_min = max(1e-3, 0.01 * np.min(r_fit))
 
@@ -1913,6 +1921,306 @@ def local_loglog_slope(r, y):
 # testing) and is the preferred model, it belongs in the same pipeline
 # entry point as the two-exponential fit, not a separate one.
 # ---------------------------------------------------------------------
+
+
+def mcmc_fit_expcore(boot, r_edges, r_fine, R, *, r_pivot=1000.0,
+                     bounds=None, slope_range=(400.0, 2000.0),
+                     use_covariance=True, nwalkers=32, nsteps=6000,
+                     burn=None, thin=None, seed=None, init=None,
+                     progress=True, verbose=True):
+    """
+    MCMC (emcee) posterior for the PSF-aware expcore profile with r_c AND
+    gamma both free, so their degeneracy is MAPPED rather than pinned away.
+
+    Model: I(r) = A1*exp(-r/h1) + A2*(1+(r/r_c)^2)^(-gamma/2), forward-modelled
+    through the SAME ring-convolution matrix R as fit_psf_aware_expcore
+    (bin_average_psf_expcore). R is built once, outside this call.
+
+    Sampled vector (chosen so the sampler can walk along the r_c-gamma
+    degeneracy instead of fighting it):
+        log10_A1  -- core amplitude
+        h1        -- core (Lya "halo") scale length [kpc]
+        log10_I2p -- two-halo term's surface brightness AT r_pivot
+                     (what the outer bins constrain directly; A2 is derived:
+                     A2 = I2p * (1+(r_pivot/r_c)^2)^(+gamma/2))
+        log10_rc  -- softening radius [kpc]
+        gamma     -- projected asymptotic slope
+    Priors: FLAT (uniform) inside `bounds` for all five, plus A2 < A1 (the
+    same ordering constraint as the curve_fit path). Flat in log for the
+    three scale quantities, flat in linear for h1 and gamma. With r_c and
+    gamma degenerate, the posterior along the degeneracy is partly set by
+    these bounds -- report bounds with the result.
+
+    Likelihood: Gaussian, chi2 = d^T C^-1 d with C the covariance of
+    boot['total_flux_all'] (bin-bin correlations included), and C^-1 scaled
+    by the Hartlap (2007) factor (N-p-2)/(N-1) for a covariance estimated
+    from N bootstrap draws. use_covariance=False -> diagonal (variances only),
+    for an A/B comparison.
+
+    Parameters
+    ----------
+    boot : Stage-3 summary with total_flux_fid (nrad,) and total_flux_all
+        (nboot, nrad) -- the same dict bootstrap_fit_profile takes.
+    r_edges, r_fine, R : identical to the fiducial PSF-aware fit.
+    r_pivot : kpc radius at which the two-halo amplitude is parametrized;
+        pick one well inside the two-halo-dominated bins.
+    bounds : dict overriding any of the default flat-prior ranges
+        {"log10_A1", "h1", "log10_I2p", "log10_rc", "gamma"} -> (lo, hi).
+        Defaults: h1 (1, 200) kpc, log10_rc (log10 5, log10 5000),
+        gamma (0.3, 3.5) [= _data_driven_bounds_expcore], amplitudes
+        +/- 4 dex around the data.
+    slope_range : (r1, r2) kpc; derived `slope_eff` is the two-halo term's
+        mean log-log slope between these radii (a quantity the data pin
+        down even when r_c and gamma individually are not).
+    nwalkers, nsteps : emcee settings. burn/thin default to 3*tau / tau/2
+        from the measured autocorrelation time (falls back to nsteps//3, 1
+        if tau cannot be estimated -- then the chain is too short).
+    init : where the walker ball starts. Default (None) = a free-r_c /
+        free-gamma curve_fit, falling back to the fixed-default fit. Either
+          * a dict of PHYSICAL values for any subset of
+            {"A1", "h1", "A2", "r_c", "gamma"} (or sampled names
+            {"log10_A1", "log10_I2p", "log10_rc"}); anything you leave out
+            comes from that default fit, e.g. init={"r_c": 100.0,
+            "gamma": 1.0}. A2 is converted to I2p at r_pivot using the
+            final r_c and gamma; or
+          * a full 5-vector in the SAMPLED parametrization (see `labels`).
+        The start must lie inside `bounds` (and have A2 < A1).
+
+    Returns
+    -------
+    dict with
+        samples : (n, 5) flat post-burn chain, columns = `labels`
+        derived : dict of (n,) arrays -- A1, A2, r_c, I2p, slope_eff
+        summary : {name: (median, 16th, 84th)} for sampled + derived
+        chain, lnprob : full (nsteps, nwalkers, ...) arrays
+        tau, acceptance, burn, thin, chi2_best, dof, bounds, meta
+    """
+    try:
+        import emcee
+    except ImportError as exc:
+        raise ImportError("mcmc_fit_expcore needs emcee: pip install emcee") from exc
+
+    r_edges = np.asarray(r_edges, dtype=float)
+    r_fine = np.asarray(r_fine, dtype=float)
+    r_mid = 0.5 * (r_edges[:-1] + r_edges[1:])
+    y = np.asarray(boot["total_flux_fid"], dtype=float)
+    flux_all = np.asarray(boot["total_flux_all"], dtype=float)
+
+    mask = np.isfinite(y) & np.all(np.isfinite(flux_all), axis=0)
+    y_m = y[mask]
+    n_boot, n_bin, n_par = flux_all.shape[0], int(mask.sum()), 5
+
+    cov = np.cov(flux_all[:, mask], rowvar=False)
+    if not use_covariance:
+        cov = np.diag(np.diag(cov))
+    hartlap = (n_boot - n_bin - 2) / (n_boot - 1)
+    if hartlap <= 0:
+        raise ValueError(f"nboot={n_boot} too small for {n_bin} bins (Hartlap <= 0)")
+    icov = hartlap * np.linalg.inv(cov)
+    sigma = np.sqrt(np.diag(cov))
+
+    # ---- flat-prior bounds -------------------------------------------------
+    amp_ref = np.log10(np.nanmax(np.abs(y_m)))
+    out_ref = np.log10(max(np.nanmedian(np.abs(y_m[r_mid[mask] >= 0.5 * r_pivot])),
+                           1e-300)) if np.any(r_mid[mask] >= 0.5 * r_pivot) else amp_ref - 3
+    b = {"log10_A1": (amp_ref - 2.0, amp_ref + 4.0),
+         "h1": (1.0, 200.0),
+         "log10_I2p": (out_ref - 4.0, out_ref + 4.0),
+         "log10_rc": (np.log10(5.0), np.log10(5000.0)),
+         "gamma": (0.3, 3.5)}
+    if bounds:
+        unknown = set(bounds) - set(b)
+        if unknown:
+            raise KeyError(f"unknown bounds keys {unknown}; valid: {list(b)}")
+        b.update(bounds)
+    labels = ["log10_A1", "h1", "log10_I2p", "log10_rc", "gamma"]
+    lo = np.array([b[k][0] for k in labels])
+    hi = np.array([b[k][1] for k in labels])
+
+    def _physical(theta):
+        la1, h1, li2p, lrc, gam = theta
+        A1, I2p, r_c = 10.0 ** la1, 10.0 ** li2p, 10.0 ** lrc
+        A2 = I2p * (1.0 + (r_pivot / r_c) ** 2) ** (gam / 2.0)
+        return A1, h1, A2, r_c, gam
+
+    def _model(theta):
+        A1, h1, A2, r_c, gam = _physical(theta)
+        return bin_average_psf_expcore(R, r_fine, r_edges, A1, h1, A2, r_c, gam)[mask]
+
+    def _lnprob(theta):
+        if np.any(theta < lo) or np.any(theta > hi):
+            return -np.inf, np.nan
+        A1, _, A2, _, _ = _physical(theta)
+        if not (A2 < A1):
+            return -np.inf, np.nan
+        d = y_m - _model(theta)
+        chi2 = float(d @ icov @ d)
+        if not np.isfinite(chi2):
+            return -np.inf, np.nan
+        return -0.5 * chi2, chi2
+
+    # ---- starting point ----------------------------------------------------
+    def _to_theta(res):
+        A1, h1, A2, r_c, gam = res["A1"], res["h1"], res["A2"], res["r_c"], res["gamma"]
+        I2p = A2 * (1.0 + (r_pivot / r_c) ** 2) ** (-gam / 2.0)
+        return np.array([np.log10(A1), h1, np.log10(I2p), np.log10(r_c), gam])
+
+    if isinstance(init, dict):
+        init_overrides, init = dict(init), None
+    else:
+        init_overrides = None
+    if init is None:
+        start = None
+        for kw in ({"gamma_fixed": None, "r_c_fixed": None}, {}):
+            res = fit_psf_aware_expcore(r_mid, y, _full_sigma(mask, sigma, y),
+                                                R, r_fine, r_edges, **kw)
+            if res.get("success") and res["A2"] > 0:
+                cand = np.clip(_to_theta(res), lo + 1e-6 * (hi - lo), hi - 1e-6 * (hi - lo))
+                if np.isfinite(_lnprob(cand)[0]):
+                    start = cand
+                    break
+        if start is None:
+            start = 0.5 * (lo + hi)
+        if init_overrides:
+            start = _apply_init_overrides(start, init_overrides, labels, r_pivot)
+    else:
+        start = np.asarray(init, dtype=float)
+    if not np.isfinite(_lnprob(start)[0]):
+        raise ValueError(f"starting point {start} is outside the prior; pass init=")
+
+    rng = np.random.default_rng(seed)
+    width = 1e-3 * (hi - lo)
+    p0 = []
+    while len(p0) < nwalkers:
+        trial = start + width * rng.standard_normal(n_par)
+        if np.isfinite(_lnprob(trial)[0]):
+            p0.append(trial)
+    p0 = np.array(p0)
+
+    if verbose:
+        print(f"mcmc_fit_expcore: {n_bin} bins, nboot={n_boot}, Hartlap={hartlap:.3f}, "
+              f"{'full' if use_covariance else 'diagonal'} covariance, "
+              f"{nwalkers} walkers x {nsteps} steps, r_pivot={r_pivot} kpc")
+        print("  start:", dict(zip(labels, np.round(start, 4))))
+
+    sampler = emcee.EnsembleSampler(nwalkers, n_par, _lnprob,
+                                    blobs_dtype=[("chi2", float)])
+    if seed is not None:
+        sampler.random_state = np.random.RandomState(seed).get_state()
+    sampler.run_mcmc(p0, nsteps, progress=progress)
+
+    try:
+        tau = sampler.get_autocorr_time(tol=50)
+        tau_ok = True
+    except emcee.autocorr.AutocorrError:
+        tau = sampler.get_autocorr_time(quiet=True)
+        tau_ok = False
+    if burn is None:
+        burn = int(3 * np.nanmax(tau)) if np.all(np.isfinite(tau)) else nsteps // 3
+        burn = min(burn, nsteps // 2)
+    if thin is None:
+        thin = max(1, int(0.5 * np.nanmin(tau))) if np.all(np.isfinite(tau)) else 1
+
+    flat = sampler.get_chain(discard=burn, thin=thin, flat=True)
+    chi2_flat = sampler.get_blobs(discard=burn, thin=thin, flat=True)["chi2"]
+
+    A1s, h1s, A2s, rcs, gams = _physical(flat.T)
+    x1, x2 = (slope_range[0] / rcs) ** 2, (slope_range[1] / rcs) ** 2
+    slope_eff = -(gams / 2.0) * np.log((1 + x2) / (1 + x1)) / np.log(slope_range[1] / slope_range[0])
+    derived = {"A1": A1s, "A2": A2s, "r_c": rcs, "I2p": 10.0 ** flat[:, 2],
+               "slope_eff": slope_eff}
+
+    summary = {}
+    for k, arr in list(zip(labels, flat.T)) + list(derived.items()):
+        q = np.nanpercentile(arr, [50, 16, 84])
+        summary[k] = (float(q[0]), float(q[1]), float(q[2]))
+
+    all_chi2 = sampler.get_blobs()["chi2"]
+    chi2_best = float(np.nanmin(all_chi2))
+    dof = n_bin - n_par
+
+    # how much of the prior box the posterior fills -- a flag for
+    # "bounds, not data, are setting this"
+    frac_width = {k: (summary[k][2] - summary[k][1]) / (b[k][1] - b[k][0]) for k in labels}
+
+    out = {"samples": flat, "labels": labels, "derived": derived, "summary": summary,
+           "chi2_samples": chi2_flat, "chain": sampler.get_chain(),
+           "lnprob": sampler.get_log_prob(), "tau": tau, "tau_converged": tau_ok,
+           "acceptance": float(np.mean(sampler.acceptance_fraction)),
+           "burn": burn, "thin": thin, "chi2_best": chi2_best, "dof": dof,
+           "bounds": b, "prior_fill": frac_width, "start": start,
+           "meta": {"r_pivot": r_pivot, "slope_range": slope_range,
+                    "use_covariance": use_covariance, "hartlap": hartlap,
+                    "nboot": n_boot, "n_bins": n_bin, "nwalkers": nwalkers,
+                    "nsteps": nsteps, "seed": seed}}
+
+    if verbose:
+        print(f"  acceptance {out['acceptance']:.2f} (want ~0.2-0.5); "
+              f"tau = {np.round(tau, 0)} -> burn {burn}, thin {thin}; "
+              f"{'converged' if tau_ok else 'NOT converged: nsteps < 50*tau, run longer'}")
+        print(f"  best chi2 = {chi2_best:.2f} / dof {dof}; {flat.shape[0]} samples kept")
+        for k in labels + list(derived):
+            m, l, h = summary[k]
+            flag = ("   <-- fills >50% of prior" if k in frac_width and frac_width[k] > 0.5
+                    else "")
+            print(f"  {k:>10} = {m:.4g}  [{l:.4g}, {h:.4g}]{flag}")
+    return out
+
+
+def _apply_init_overrides(start, overrides, labels, r_pivot):
+    """Merge a user init dict (physical or sampled names) onto a sampled
+    start vector for mcmc_fit_expcore."""
+    th = dict(zip(labels, np.asarray(start, dtype=float)))
+    A1 = 10.0 ** th["log10_A1"]
+    r_c = 10.0 ** th["log10_rc"]
+    gam = th["gamma"]
+    A2 = 10.0 ** th["log10_I2p"] * (1.0 + (r_pivot / r_c) ** 2) ** (gam / 2.0)
+    valid = {"A1", "h1", "A2", "r_c", "gamma", "log10_A1", "log10_I2p", "log10_rc"}
+    unknown = set(overrides) - valid
+    if unknown:
+        raise KeyError(f"unknown init keys {unknown}; valid: {sorted(valid)}")
+    if "log10_A1" in overrides: A1 = 10.0 ** overrides["log10_A1"]
+    if "log10_rc" in overrides: r_c = 10.0 ** overrides["log10_rc"]
+    A1 = overrides.get("A1", A1)
+    r_c = overrides.get("r_c", r_c)
+    gam = overrides.get("gamma", gam)
+    h1 = overrides.get("h1", th["h1"])
+    if "A2" in overrides:
+        I2p = overrides["A2"] * (1.0 + (r_pivot / r_c) ** 2) ** (-gam / 2.0)
+    elif "log10_I2p" in overrides:
+        I2p = 10.0 ** overrides["log10_I2p"]
+    else:
+        # keep the default fit's AMPLITUDE A2 (not its I2p) when r_c/gamma move
+        I2p = A2 * (1.0 + (r_pivot / r_c) ** 2) ** (-gam / 2.0)
+    return np.array([np.log10(A1), h1, np.log10(I2p), np.log10(r_c), gam])
+
+
+def _full_sigma(mask, sigma_masked, y):
+    """Expand masked-bin sigmas back to full length (NaN where masked) for the
+    curve_fit starting-point call inside mcmc_fit_expcore."""
+    s = np.full(np.shape(y), np.nan)
+    s[mask] = sigma_masked
+    return s
+
+
+def plot_mcmc_expcore(mc, *, params=("h1", "log10_rc", "gamma", "log10_I2p"),
+                      show_slope=True, truths=None):
+    """Corner plot of mcmc_fit_expcore output. `params` picks columns from
+    mc['labels']; show_slope appends the derived slope_eff column (the
+    well-constrained combination). Needs the `corner` package."""
+    import corner
+    cols, names = [], []
+    for p in params:
+        cols.append(mc["samples"][:, mc["labels"].index(p)])
+        names.append(p)
+    if show_slope:
+        cols.append(mc["derived"]["slope_eff"])
+        r1, r2 = mc["meta"]["slope_range"]
+        names.append(f"slope {r1:.0f}-{r2:.0f}")
+    fig = corner.corner(np.column_stack(cols), labels=names, truths=truths,
+                        quantiles=[0.16, 0.5, 0.84], show_titles=True,
+                        title_fmt=".3g")
+    return fig
 
 
 # =======================================================================

@@ -772,8 +772,8 @@ def integrated_line_flux(
     Gaussian under a null (no division by vanishing line flux).
 
     Note: with the standard half-window split, blue_red_side_ratio's
-    (blue_flux + red_flux) equals this flux_sum (lya_center pixel counted once on
-    the red side); flux_integral is that times the pixel width.
+    (blue_flux + red_flux) equals this flux_INTEGRAL (lya_center pixel counted
+    once on the red side). Before 2026-09-17 it equalled flux_sum instead.
 
     Parameters
     ----------
@@ -868,8 +868,13 @@ def blue_red_side_ratio(
     clip_negative=False,
 ):
     """
-    Coarse blue/red asymmetry: sum the continuum-subtracted flux on each side
-    of lya_center within the line window and take the ratio.
+    Coarse blue/red asymmetry: integrate the continuum-subtracted flux on each
+    side of lya_center within the line window and take the ratio.
+
+    blue_flux / red_flux are wavelength INTEGRALS, sum(y) * dlambda, so for a
+    stack in erg/s/A_rest/kpc^2 they are in erg/s/kpc^2 (2026-09-17 fix: they
+    were plain pixel sums, i.e. 1/dlambda = 5x too large on the 0.2 A grid;
+    ratios were never affected).
 
     This is the simple, model-free companion to a (deferred) double-Gaussian
     decomposition -- it does not separate two emission peaks, it just compares
@@ -902,8 +907,9 @@ def blue_red_side_ratio(
                 "blue_over_red": np.nan, "red_over_blue": np.nan,
                 "continuum": cont}
 
-    blue_flux = np.nansum(y[blue_m])
-    red_flux = np.nansum(y[red_m])
+    dw = float(np.nanmedian(np.diff(wave)))      # pixel width (A), 0.2 on the rest grid
+    blue_flux = np.nansum(y[blue_m]) * dw
+    red_flux = np.nansum(y[red_m]) * dw
 
     bor = blue_flux / red_flux if red_flux != 0 else np.nan
     rob = red_flux / blue_flux if blue_flux != 0 else np.nan
@@ -1116,8 +1122,8 @@ def bootstrap_measurements(
             "red_flux_all": rflux,
         })
         # total integrated (windowed) flux per draw = blue + red, so percentiles
-        # are correct (cannot add blue/red percentiles). Matches the SUM
-        # convention of measure.integrated_line_flux (flux_sum).
+        # are correct (cannot add blue/red percentiles). Matches
+        # measure.integrated_line_flux's flux_INTEGRAL (sum x dlambda).
         tot = bflux + rflux
         summary.update({
             "total_flux_med": np.nanmedian(tot, axis=0),
@@ -1412,6 +1418,17 @@ def bootstrap_all(
     return summary
 
 
+def _with_line_flux_unit(unit_info):
+    """Copy of unit_info plus 'line_flux_unit': the unit of total_flux_* etc.
+    (the spectral unit with the per-Angstrom factor integrated out)."""
+    if unit_info is None:
+        return None
+    out = dict(unit_info)
+    y = out.get("y_unit", "")
+    out["line_flux_unit"] = "/".join(p for p in y.split("/") if p not in ("A", "A_rest"))
+    return out
+
+
 def measure_all_bins(config: "PipelineConfig", stacks: dict,
                      stack_method: str = None, compute_stack_error: bool = True,
                      seed: int = None, verbose: bool = True) -> dict:
@@ -1488,7 +1505,7 @@ def measure_all_bins(config: "PipelineConfig", stacks: dict,
     results["rest_wave"] = wave
     results["r_edges"] = np.asarray(stacks["r_edges"])
     results["VR_biweight_v"] = stacks.get("VR_biweight_v")
-    results["unit_info"] = stacks.get("unit_info")
+    results["unit_info"] = _with_line_flux_unit(stacks.get("unit_info"))
     from .config import stamp_provenance
     return stamp_provenance(results, config, "measure_all_bins")
 
@@ -3040,6 +3057,7 @@ def measure_psf_corrected_core_onehalo_luminosity(
     #    looping _bin_flux for cont_method='median' (the pipeline default);
     #    anything else falls back to that slower per-row path unchanged. --
     _fast_path = (cm == "median")
+    _dw = float(np.nanmedian(np.diff(wave)))   # x dlambda, same as blue_red_side_ratio
     if _fast_path:
         cont_mask = np.zeros_like(wave, dtype=bool)
         for lo, hi in cb:
@@ -3068,8 +3086,8 @@ def measure_psf_corrected_core_onehalo_luminosity(
         yfin = np.isfinite(y)
         bm2 = blue_mask[None, :] & yfin
         rm2 = red_mask[None, :] & yfin
-        blue_flux = np.where(bm2, y, 0.0).sum(axis=1)
-        red_flux = np.where(rm2, y, 0.0).sum(axis=1)
+        blue_flux = np.where(bm2, y, 0.0).sum(axis=1) * _dw
+        red_flux = np.where(rm2, y, 0.0).sum(axis=1) * _dw
         with np.errstate(divide="ignore", invalid="ignore"):
             bor = np.where(red_flux != 0, blue_flux / red_flux, np.nan)
         success = bm2.any(axis=1) & rm2.any(axis=1) & np.isfinite(bor)

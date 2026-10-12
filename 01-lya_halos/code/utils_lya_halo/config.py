@@ -164,6 +164,8 @@ class PipelineConfig:
                                           #   composite ('segmap+spec_local') that OR-combines
                                           #   each component's boolean mask (bad in ANY
                                           #   component -> bad in the result). Components:
+                                          #     'none'         no fiber masking (every fiber kept;
+                                          #                    Niemeyer-2022 comparison runs).
                                           #     'segmap'       baked binary mask (seg_mask_path);
                                           #                    ignores every masking knob below
                                           #                    except seg_mask_path.
@@ -253,6 +255,40 @@ class PipelineConfig:
     store_raw_bg: bool = False           # write pre-mask, pre-smooth annulus coadds
     store_spec_nobg: bool = False        # write the un-background-subtracted coadd
     store_bg_halves: bool = False        # azimuthal split of each annulus
+
+    # --- barycentric correction (opt-in, default OFF) -----------------------
+    # When True, extract_fibers moves every fiber of exposure e onto the
+    # barycentric frame (lambda_bary = lambda_obs * (1 + v_bc[e]/c)) AFTER the
+    # per-exposure background subtraction and BEFORE fibers from different
+    # exposures are pooled into a radial bin. It must happen there: a bin mixes
+    # fibers from many nights (v_bc spans ~-27..+29 km/s over the COSMOS season),
+    # so no single post-hoc shift of a finished spectrum can undo it.
+    # v_bc comes from extract.compute_barycentric_velocities: night date from the
+    # per-observation *.h5 filenames + `barycentric_ut_hour` UT the next morning
+    # (time-of-night changes v_bc by < 0.5 km/s), exposure order verified against
+    # all_info HDU 3 == h5 Survey['fwhm']. Hashed into the extraction signature
+    # ONLY when True, so existing caches/FITS names are untouched.
+    barycentric: bool = False
+    barycentric_ut_hour: float = 5.0     # assumed UT (next morning) of every exposure
+
+    # --- injection-recovery (specs/injection-recovery.md sec 1.3) ---------
+    # `inject` is the metadata dict built by injection.inject_sources: family,
+    # source model, n_sources, zero_base, seeing_mode, bins, mask checksum,
+    # placement seed. YOU DO NOT SET THIS BY HAND -- inject_sources returns a
+    # config with it already set, and that returned config is the only one that
+    # produces the right signature. Setting it yourself and forgetting a field
+    # gives a cache key that does not distinguish two different injections.
+    #
+    # None (the default) means "not an injected run" and is OMITTED ENTIRELY
+    # from extract_signature_dict, exactly like the bg_variant flags -- so
+    # adding this field leaves every existing signature bit-identical and no
+    # in-flight cache is orphaned. test_framework asserts that.
+    #
+    # When it IS set it enters the hash, and that is the whole point: spec
+    # sec 7.5 is the one failure mode in the injection plan that would corrupt
+    # EXISTING science products rather than merely produce a wrong test -- an
+    # injected result silently served from, or written over, a fiducial cache.
+    inject: Optional[dict] = None
 
     # --- coaddition ------------------------------------------------------
     # TWO concepts (not three), because the background is SUBTRACTED from the
@@ -460,8 +496,8 @@ class PipelineConfig:
                 "COSMOS separately in Stage 1."
             )
         return {
-            "AEGIS":  "../../../../Hobby-Eberly-Telesco/imaging/candles_egs/groth/groth.fits",
-            "COSMOS": "../../../../HETDEX-Work/vdfi/cosmos/CFHT_COSMOS_image.fits",
+            "AEGIS":  "catalogs/images/groth.fits",
+            "COSMOS": "catalogs/images/cosmos.fits",
         }[nf]
 
     def resolve_seg_mask_path(self) -> Optional[str]:
@@ -589,6 +625,15 @@ class PipelineConfig:
         return bool(self.store_raw_bg or self.store_spec_nobg
                     or self.store_bg_halves or self.bg_variants is not None)
 
+    def injects(self) -> bool:
+        """True if this is an injection-recovery run.
+
+        The single predicate extract_signature_dict and to_header_dict both
+        consult, so "is this injected?" has one definition -- the same shape
+        as stores_bg_products() above.
+        """
+        return self.inject is not None
+
     def galaxy_window(self, n_total: int) -> tuple:
         """
         (start, stop) row range of the run table this run should process --
@@ -681,6 +726,21 @@ class PipelineConfig:
             d["store_raw_bg"] = bool(self.store_raw_bg)
             d["store_spec_nobg"] = bool(self.store_spec_nobg)
             d["store_bg_halves"] = bool(self.store_bg_halves)
+        # Barycentric correction. OMITTED ENTIRELY when off (same contract as
+        # the blocks above), so adding the feature cannot move a fiducial
+        # signature. When on it DOES change SPEC (every fiber is resampled), so
+        # it must get its own cache dir and FITS name.
+        if getattr(self, "barycentric", False):
+            d["barycentric"] = True
+            d["barycentric_ut_hour"] = float(getattr(self, "barycentric_ut_hour", 5.0))
+        # Injection-recovery. OMITTED ENTIRELY when not injecting, so this
+        # field's existence cannot move a fiducial signature (same contract as
+        # the bg_variant block above). When present it is hashed WHOLE: every
+        # key of the meta dict participates, because the thing that must never
+        # collide is "two different injections", and which key differs is not
+        # something this function can be asked to know.
+        if self.injects():
+            d["inject"] = self.inject
         # NOT hashed, deliberately: combine_wave_block, combine_threads,
         # combine_min_fibers -- all provably no-effect on the result, so a cache
         # built at 1 thread stays valid at 8.
@@ -764,6 +824,28 @@ class PipelineConfig:
             "psf_wave_exponent": self.psf.wave_exponent,
         }
 
+    def _inject_header_cards(self) -> dict:
+        """Injection provenance keywords, or INJECT=False and nothing else.
+
+        Kept short on purpose: FITS keywords are 8 characters and the full
+        injection parameter set lives in the cache manifest, which has no such
+        limit. What belongs HERE is only what someone holding the file needs to
+        know without going back to the manifest -- is it injected, which
+        family, how many sources, and was it a zero cube.
+        """
+        m = self.inject
+        if not m:
+            return {"INJECT": False}
+        return {
+            "INJECT":   True,
+            "INJFAM":   str(m.get("family", "")),      # 'Z' | 'P' | 'H'
+            "INJN":     int(m.get("n_sources", 0)),
+            "INJZERO":  bool(m.get("zero_base", False)),   # ladder levels 2-4
+            "INJSEE":   str(m.get("seeing_mode", "")),
+            "INJSEED":  int(m.get("placement_seed", -1)),
+            "INJMODEL": str(m.get("model", ""))[:68],   # truncated; manifest has it whole
+        }
+
     def to_header_dict(self, ngal: int, source_id: str) -> dict:
         """
         Provenance keywords for the galaxy FITS, per the plan's contract.
@@ -823,6 +905,12 @@ class PipelineConfig:
             "NOBG":     bool(self.store_spec_nobg),
             "BGHALVES": bool(self.store_bg_halves),
             **{f"BGVAR{i}": f"{lo:g},{hi:g}" for i, (lo, hi) in enumerate(variants)},
+            # --- injection-recovery (spec sec 1.3) ---------------------------
+            # INJECT is the keyword that makes an injected product identifiable
+            # FROM THE FILE ALONE, not just from its cache path. False on every
+            # fiducial run, so the keyword set stays comparable across an
+            # injected-vs-fiducial A/B.
+            **self._inject_header_cards(),
             "MASSCOL":  self.mass_col,
             "ZCOL":     self.z_col,
             "WAVEMIN":  self.wave_min,

@@ -22,6 +22,8 @@ Optional background-variant HDUs (written only when the corresponding
     BG_NFIB      (ngal, nvar)            fibers pooled per variant
     BG_HALVES    (ngal, nvar, 2, nwave)  each annulus split by azimuth (N, S)
     BG_HALF_NFIB (ngal, nvar, 2)         fibers per half
+    VBC_MEAN     (ngal, nrad)            fiber-weighted mean barycentric velocity
+                                         (km/s) per bin; only when barycentric=True
 
 The distinction that matters: BACKGROUND is post-mask and post-smooth, so any
 Lya feature in the annulus has already been interpolated away in it.
@@ -103,6 +105,7 @@ def write_galaxy_fits(
         ("bg_nfib",      "BG_NFIB",      np.int32),
         ("bg_halves",    "BG_HALVES",    np.float32),
         ("bg_half_nfib", "BG_HALF_NFIB", np.int32),
+        ("vbc_mean",     "VBC_MEAN",     np.float32),
     ):
         if extras.get(key) is not None:
             hdus.append(fits.ImageHDU(np.asarray(extras[key]).astype(dtype), name=name))

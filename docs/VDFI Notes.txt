@@ -384,5 +384,63 @@ Limber Approximation to convert between 3D and 2D Clustering: https://arxiv.org/
 
 Zoom link: https://us06web.zoom.us/j/86860542996
 
--------------------------------------------------------------------------------------------------------------------
-7/29/26: 
+-------------------------------------------------------------------------------------------------------------------88/31/26: 
+
+There are two ways to get a Lyα bias, and they behave differently under background subtraction.
+
+**LAE–LAE clustering** uses a catalog of individually detected Lyα emitters. You count how many LAEs sit within a separation $r$ of each LAE, and how many sit within $r$ of a random position in the same volume.
+
+**The faint diffuse emission measurement** — what my pipeline does — coadds Lyα surface brightness in radial bins around MOSDEF galaxies, without detecting anything. It measures a field, not objects.
+
+Both aim at the same estimator. Around a random position you expect the mean, $\bar n$ or $\bar I$; around a real object you expect $\bar n(1+\xi)$ or $\bar I(1+\xi)$. Divide and you get $1+\xi$, from which the bias follows. The question is whether the mean is still in the data.
+
+For LAE counting it is. Sky subtraction removes what is uniform, but an LAE is a compact overdensity of emission — a bump a few arcseconds and a few Angstroms wide — so subtracting a flat pedestal shifts it down without erasing it. Every LAE survives, in the same place. And once an object is detected, a brightness measurement has become a position measurement, which is immune to everything the sky subtraction did: a catalog is a list of coordinates and carries no memory of the zero point. Count around LAEs to get $\bar n(1+\xi)$, count around randoms to get $\bar n$, divide, and the mean density cancels. The randoms supply the normalization.
+
+For the diffuse measurement it is not. The sky subtraction and the annulus background — mask the line, interpolate across it, smooth on 30 Å — both remove anything smooth in wavelength. A diffuse Lyα background is smooth, not because it is faint but because it is a line at every redshift and therefore a featureless continuum in the observed frame. So $\bar I$ is removed by construction, from the galaxy stack and the random stack alike:
+
+$$\frac{\bar I(1+\xi) - \bar I}{\bar I - \bar I} = \frac{\bar I \xi}{\sim 0}$$
+
+The numerator is real and detected. The denominator is gone. Stacking at random positions returns zero in expectation — not because the randoms are badly built, but because there is no mean left to report. Assuming clean errors and setting aside field-to-field cosmic variance, that zero is the correct answer, and it is what makes the ratio impossible to form.
+
+Subtraction is then the only operation available, and it leaves $\bar I$ multiplying the result instead of cancelling out of it. What survives is the product $\bar I\,b_{\rm Ly\alpha}$; no additional clustering data splits those factors, and recovering $\bar I$ would require absolute surface-brightness photometry with a known zero. The randoms are still worth running — they verify that the zero is zero, which is to say they measure my residual error in removing the mean, not the mean itself.
+
+-------------------------------------------------------------------------------------------------------------------89/2/26: For the future when talking to Chris Byrohl:
+Mention the Lya RT Paper: Simulating realistic Lyman- α emitting galaxies including the effect of radiative transfer
+
+Talk to Wizotski?!?
+Mention MUSEQuBES paper with HI overdensity out to 15 r_vir in 10^10 M_sol galaxies (at z<0.5)
+
+-------------------------------------------------------------------------------------------------------------------89/9/26: PSF and Fitting:
+
+1. Measure stellar flux profile as a function of radius
+2. Measure the flux in some band in the star spectra and inverse-variance weight
+3. Take the bright and faint stars and stitch together an appropriate PSF to achieve wings
+4. Account for wavelength dependence when intrgrating star flux in band
+5. Account for redshift dependence when coadding according to galaxy z distribution
+
+-------------------------------------------------------------------------------------------------------------------99/18/26:
+
+- RERUN STAR PSF EXTRACTION WITH PROPER FIELD BOUNDS
+
+While not estimated directly from SED fitting, we can obtain rest-frame UVJ colours by passing the best-fitting rest-frame FAST SED through U, V, and J filter bandpasses. We use the IRAF (Tody 1986, 1993) routine sbands to obtain rest-frame UVJ colours. The combination of the U−V and V−J colours can distinguish between red quiescent galaxies and dusty star-forming galaxies by breaking the degeneracy for age and reddening (Williams et al. 2009). Quiescent galaxies are located in the upper-left portion of the U−V versus V−J diagram. As stated in the Section 2.1, we remove galaxies that fall in the quiescent region from this study.
+
+
+- Think about and look into the methods of sky subtraction and how it affects Lya halos
+- Also consider how the proposed model of Lya halos would produce different results when sky subtracting
+
+
+-------------------------------------------------------------------------------------------------------------------99/30/26:
+VDFI BOX EXCHANGE:
+https://app.box.com/folder/351426650021?box_source=collabInvite&channel=notification-center
+
+Papers:
+MOSDEF AGN:
+https://ui.adsabs.harvard.edu/abs/2019ApJ...886...11L/abstract
+
+Source to Cite (Gary):
+https://iopscience.iop.org/article/10.3847/1538-4357/ad7a00/pdf
+
+Interesting AGN LAH Work:
+https://arxiv.org/pdf/2604.25127
+
+- Add a second axis that is plotted in cMpc

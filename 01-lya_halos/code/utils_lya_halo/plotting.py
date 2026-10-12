@@ -23,9 +23,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 
-from .config import PipelineConfig
+from .config import PipelineConfig, DEFAULT_CONT_BOUNDS
+from .formatting import apply_tick_style
 
 C_KMS = 299792.458   # speed of light (km/s); wavelength <-> velocity about Lya
+
+
+# sentinel distinguishing "use the auto-generated title" (default) from
+# "no title at all" (title=None, an explicit user choice)
+_AUTO = object()
+
+
+def _resolve_savename(save_name: str | None, default: str) -> str:
+    """
+    Turn a user-supplied `save_name` (with or without an extension, e.g.
+    'Flux_Profile' or 'Flux_Profile.png') into a concrete filename for
+    plt.savefig, falling back to `default` when save_name is None.
+    """
+    if not save_name:
+        return default
+    known_ext = (".png", ".pdf", ".jpg", ".jpeg", ".svg", ".eps", ".tif", ".tiff")
+    return save_name if save_name.lower().endswith(known_ext) else save_name + ".png"
 
 
 def get_ylim_window(wave, flux, err=None, xlim=(1150, 1300), pad=0.20,
@@ -571,14 +589,26 @@ def _get_vr_biweight_v(VR_biweight_v, stacks_result):
     return None
 
 
+def _as_vr_err(e):
+    """float -> symmetric (e, e); (lo, hi) -> (lo, hi) floats; None -> None."""
+    if e is None:
+        return None
+    if np.ndim(e) == 0:
+        return (float(e), float(e))
+    lo, hi = e
+    return (float(lo), float(hi))
+
+
 def _get_vr_biweight_e(VR_biweight_error, stacks_result):
-    """1-sigma scatter (kpc) on the sample's biweight virial radius: explicit
-    arg wins, else stacks_result['VR_biweight_e'] (set by
-    stack.sample_virial_radius_kpc), else None (no error band drawn)."""
+    """Uncertainty (kpc) on the sample's virial radius as (minus, plus):
+    explicit arg wins (a float = symmetric, or a (minus, plus) pair), else
+    stacks_result['VR_biweight_e'] -- the bootstrapped 16/84 band written by
+    analysis.run_measurement_suite (or build_stacks' quick estimate before
+    that) -- else None (no band drawn)."""
     if VR_biweight_error is not None:
-        return float(VR_biweight_error)
+        return _as_vr_err(VR_biweight_error)
     if stacks_result is not None and stacks_result.get("VR_biweight_e") is not None:
-        return float(stacks_result["VR_biweight_e"])
+        return _as_vr_err(stacks_result["VR_biweight_e"])
     return None
 
 
@@ -621,7 +651,8 @@ def _radius_points(radial_bins):
 
 
 def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
-                       vr_ticks, xlims, show_vr=True, VR_biweight_error=None):
+                       vr_ticks, xlims, show_vr=True, VR_biweight_error=None,
+                       tick_direction=None):
     """
     Put the NATIVE bin unit on the bottom axis and the comparison unit on top:
       virial -> bottom R/Rvir, top kpc (if VR_biweight_v known)
@@ -634,14 +665,19 @@ def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
     show_vr           : master toggle for the Rvir line + error band (both
                          off together when False). Does not affect the
                          secondary (top) comparison axis.
-    VR_biweight_error  : 1-sigma scatter on the sample's biweight virial
-                         radius, ALWAYS in kpc (same unit as VR_biweight_v --
-                         see stack.sample_virial_radius_kpc's VR_biweight_e).
+    VR_biweight_error  : uncertainty on the sample's virial radius, a float
+                         (symmetric) or (minus, plus) pair; band spans
+                         [R_vir - minus, R_vir + plus]. ALWAYS in kpc (same
+                         unit as VR_biweight_v); normally the bootstrapped
+                         16/84 from stack.bootstrap_virial_radius.
                          None -> no band drawn. Converted internally to native
                          units: divided by VR_biweight_v for bin_mode='virial'
                          (R/Rvir-space width), used as-is for bin_mode='kpc'.
                          No effect for bin_mode='arcsec' (no clean conversion,
                          same limitation as the Rvir line/top axis there).
+    tick_direction     : None (matplotlib default) or 'in'/'out'/'inout' for
+                         the secondary (top) axis ticks, so it matches the
+                         main axes styled by formatting.apply_tick_style.
     """
     bins, r_mid, xerr = _radius_points(radial_bins)
 
@@ -662,10 +698,13 @@ def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
         ax.text(xpos, 0.95, r"$R_{\rm vir}$", transform=ax.get_xaxis_transform(),
                 ha="right", va="top", fontsize=15, color="0.25")
 
-    def _rvir_band(xpos, half_width):
-        if half_width is None or not np.isfinite(half_width) or half_width <= 0:
+    def _rvir_band(xpos, err):
+        err = _as_vr_err(err)
+        if err is None or not np.all(np.isfinite(err)):
             return
-        lo, hi = xpos - half_width, xpos + half_width
+        lo, hi = xpos - err[0], xpos + err[1]     # = the 16th..84th band
+        if hi <= lo:
+            return
         if lo <= 0:
             lo = xpos * 1e-3   # keep positive for the log x-axis
         ax.axvspan(lo, hi, color="0.35", alpha=0.12, lw=0, zorder=0)
@@ -676,13 +715,16 @@ def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
         if show_vr:
             _rvir_line(1.0)
             if VR_biweight_error is not None and VR_biweight_v:
-                _rvir_band(1.0, VR_biweight_error / VR_biweight_v)
+                _e = _as_vr_err(VR_biweight_error)
+                _rvir_band(1.0, (_e[0] / VR_biweight_v, _e[1] / VR_biweight_v))
         if VR_biweight_v is not None:
             secax = ax.secondary_xaxis(
                 "top", functions=(lambda r: r * VR_biweight_v,
                                   lambda k: k / VR_biweight_v))
             secax.set_xlabel("Radius [kpc]")
             secax.set_xscale("log")
+            if tick_direction:
+                secax.tick_params(which="both", direction=tick_direction)
     elif bin_mode == "kpc":
         rvir_kpc = VR_biweight if VR_biweight is not None else VR_biweight_v
         if show_vr and rvir_kpc is not None:
@@ -695,6 +737,8 @@ def _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v, VR_biweight,
                                   lambda r: r * VR_biweight_v))
             secax.set_xlabel(r"$R/R_{\rm vir}$")
             secax.set_xscale("log")
+            if tick_direction:
+                secax.tick_params(which="both", direction=tick_direction)
             secax.set_xticks(vr_ticks)
             secax.set_xticklabels([str(t) for t in vr_ticks])
     # arcsec: native bottom only -- no Rvir line/band (no clean conversion)
@@ -754,6 +798,8 @@ def plot_centroid_vs_radius(
     add_point=None,
     add_axhline=None,
     plot_literature=False,
+    tick_direction="in",       # house tick style (formatting.apply_tick_style)
+    tick_right=True,
     save_fig=False,
     savename="Figure_centroid_profile.png",
 ):
@@ -795,7 +841,8 @@ def plot_centroid_vs_radius(
     fig, ax = plt.subplots(figsize=figsize)
     r_mid, xerr = _setup_radius_axis(ax, radial_bins, bin_mode, VR_biweight_v,
                                      VR_biweight, vr_ticks, xlims,
-                                     show_vr=show_vr, VR_biweight_error=VR_biweight_error)
+                                     show_vr=show_vr, VR_biweight_error=VR_biweight_error,
+                                     tick_direction=tick_direction)
     eb = ax.errorbar(r_mid, v_fid, xerr=xerr, yerr=yerr, fmt="o",
                      capsize=3.5, ms=6, lw=1.5, label=label)
     if np.any(unstable):
@@ -855,6 +902,7 @@ def plot_centroid_vs_radius(
     if title:
         ax.set_title(title)
     ax.legend(frameon=False, fontsize=10)
+    apply_tick_style(ax, direction=tick_direction, right=tick_right)
     if save_fig:
         plt.savefig(savename, dpi=300, bbox_inches="tight")
     plt.show()
@@ -1031,6 +1079,7 @@ def plot_radial_overlay(
     stacks_result=None, vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5), figsize=(7.6, 4.9),
     ylims=None, xlims=None, ylabel="", title="", jitter=0.04, zero_line=0.0,
     hline=None, legend_title=None, logy=False, save_fig=False, savename=None,
+    show_vr=True, VR_biweight_error=None, tick_direction="in", tick_right=True,
 ):
     """
     Overlay several labelled curves on the standard native-bottom / comparison-top
@@ -1040,11 +1089,18 @@ def plot_radial_overlay(
     series : list of dicts {label, y, [lo], [hi], [fmt]}; lo/hi optional (drawn
              as 16/84 bars when present). Curves are multiplicatively jittered on
              the log axis so error bars stay legible (jitter=0 disables).
+    show_vr, VR_biweight_error : Rvir line / error band, same as the single-sample
+             profile plots (VR_biweight_error None -> auto-read from stacks_result).
+    tick_direction, tick_right : house tick style (formatting.apply_tick_style) --
+             ticks "in", y ticks mirrored on the right; top axis matches.
     """
     bm = _resolve_bin_mode(bin_mode, stacks_result)
     vr = _get_vr_biweight_v(VR_biweight_v, stacks_result)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks_result)
     fig, ax = plt.subplots(figsize=figsize)
-    r_mid, _ = _setup_radius_axis(ax, radial_bins, bm, vr, VR_biweight, vr_ticks, xlims)
+    r_mid, _ = _setup_radius_axis(ax, radial_bins, bm, vr, VR_biweight, vr_ticks, xlims,
+                                  show_vr=show_vr, VR_biweight_error=vr_e,
+                                  tick_direction=tick_direction)
     K = len(series)
     for k, s in enumerate(series):
         y = np.asarray(s["y"], dtype=float)
@@ -1071,6 +1127,7 @@ def plot_radial_overlay(
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.legend(frameon=False, fontsize=9, title=legend_title)
+    apply_tick_style(ax, direction=tick_direction, right=tick_right)
     if save_fig:
         plt.savefig(savename or "Figure_radial_overlay.png", dpi=300, bbox_inches="tight")
     plt.show()
@@ -2360,52 +2417,96 @@ def list_exposures(vdfi, exposures=None, catalog=None, ra_col="RA", dec_col="DEC
 
 def plot_field_coverage(vdfi, catalog=None, *, exposures=None, xc=None, yc=None,
                         radii_arcsec=(100.0, 200.0, 300.0),
+                        radii_kpc=None, z_ref=None, z_col="z",
                         radius_colors=("limegreen", "gold", "crimson"),
+                        band_alpha=0.25, ring_lw=1.4,
                         ra_col="RA", dec_col="DEC",
-                        fiber_size=3.0, fiber_alpha=0.15, background_alpha=0.015,
-                        catalog_kwargs=None, ax=None, title=None):
+                        fiber_size=3.0, fiber_alpha=0.15, fiber_color="0.5",
+                        background_alpha=None,
+                        catalog_kwargs=None, catalog_label="MOSDEF",
+                        extra_catalogs=None, extra_catalog_kwargs=None,
+                        tick_direction="in", tick_right=True, tick_top=False,
+                        tick_minor=False,
+                        ax=None, title=None, verbose=True):
     """
-    Plot the sky footprint of one or more VDFI exposures ("slices"), with
-    concentric radius bands drawn around a center -- green inside
-    radii_arcsec[0], yellow/gold out to radii_arcsec[1], red out to
-    radii_arcsec[2] -- and (optionally) a catalog such as your MOSDEF
-    run_table overplotted on top of everything.
+    Plot the sky footprint of one or more VDFI exposures ("slices") in grey,
+    with concentric radius bands drawn as TRANSPARENT FILLED ANNULI on top of
+    the fibers, plus one or more galaxy catalogs (e.g. MOSDEF run_table, and
+    3D-HST in a second color) overplotted on top of everything.
 
-    exposures=None (default) plots every exposure in the field, which is the
-    simplest way to guarantee full coverage without hand-picking IDs and
-    hoping they happen to fill the mosaic (for AEGIS that's normally the two
-    IFU dither pointings either side of the field; for COSMOS, ~4x that over
-    the bigger footprint). Call list_exposures(vdfi) first if you want to
-    cherry-pick a subset instead -- it reports each exposure's mean position
-    and RA/DEC extent to plan from.
+    Layers, bottom -> top:
+        1. every fiber in the selected exposures, one grey color
+        2. filled annuli [0, r1], [r1, r2], ... (band_alpha), full circles --
+           they are drawn even where they run off the fiber footprint or
+           into a corner, and the axis limits grow to show them whole
+        3. ring outlines at each radius
+        4. extra catalogs (e.g. 3D-HST), then the primary catalog on top
+
+    Radii in kpc
+    ------------
+    Our radial bins are defined in physical kpc, but the sky plot is in
+    angles, so a kpc radius has to be turned into arcsec at SOME redshift.
+    With radii_kpc given, this function does:
+
+        z_ref  = mean(catalog[z_col])            # unless z_ref is passed
+        scale  = arcsec per physical kpc at z_ref (Planck18, via
+                 virial.physical_kpc_to_arcsec -- same as the pipeline)
+        radii_arcsec = radii_kpc * scale
+
+    and prints the conversion. It's a representative ring, not any one
+    galaxy's aperture: each galaxy's real bin edge is at its own z. Around
+    z~2.3 the angular scale is nearly flat in z, so the spread is small.
 
     Parameters
     ----------
     vdfi          : loaded field dict (extract.load_field / load_vdfi_field).
-    catalog       : optional astropy Table (e.g. run_table from
-                    extract.build_run_table), scattered on top of everything.
+    catalog       : primary astropy Table (e.g. MOSDEF run_table). Also the
+                    source of z_ref when radii_kpc is used.
     exposures     : iterable of exposure indices to include; None -> all.
-    xc, yc        : center of the radius bands, in degrees. None (default)
-                    uses the mean fiber position across the selected
-                    exposures (i.e. the field/mosaic center).
-    radii_arcsec  : the three (inner, middle, outer) radii in arcsec.
-    radius_colors : colors for (inner, middle, outer) bands, inside-out.
-    fiber_size / fiber_alpha : styling for fibers inside the outer radius.
-    background_alpha : styling for fibers beyond the outer radius -- kept
-                    very faint so the rest of the field mosaic is still
-                    visible for context without drowning out the bands.
-    catalog_kwargs : dict of scatter() kwargs overriding the catalog's default
-                    marker style (black star, on top of everything).
+    xc, yc        : center of the radius bands, in degrees. None -> mean fiber
+                    position of the selected exposures (the mosaic center).
+    radii_arcsec  : outer radius of each band, in arcsec. Ignored if
+                    radii_kpc is given.
+    radii_kpc     : outer radius of each band, in physical kpc (e.g. your bin
+                    edges). Converted to arcsec at z_ref (see above).
+    z_ref         : redshift for the kpc -> arcsec conversion. None -> mean of
+                    catalog[z_col] (finite values only).
+    z_col         : redshift column in `catalog` (cfg.z_col, default "z").
+    radius_colors : band colors, inside-out. If there are more radii than
+                    colors, colors are drawn from the viridis colormap instead.
+    band_alpha    : transparency of the filled annuli.
+    ring_lw       : line width of the ring outlines (0 -> no outlines).
+    fiber_size / fiber_alpha / fiber_color : styling of the grey fibers.
+    background_alpha : DEPRECATED, ignored (all fibers are now one grey
+                    layer styled by fiber_alpha).
+    catalog_kwargs : scatter() kwargs overriding the primary catalog style.
+    catalog_label : legend label for the primary catalog.
+    extra_catalogs : dict {label: Table} of additional catalogs to overplot
+                    underneath the primary one, e.g. {"3D-HST": t3dhst}.
+                    Each gets its own default color (darkorange, then
+                    deepskyblue, magenta, ...).
+    extra_catalog_kwargs : dict {label: scatter kwargs} to restyle any of the
+                    extra catalogs.
+    tick_direction / tick_right / tick_top / tick_minor : house tick style
+                    (formatting.apply_tick_style).
+    verbose       : print the kpc -> arcsec conversion when used.
 
-    Returns the Axes. (RA axis increases leftward, the usual sky convention,
-    matching selection.plot_sky.)
+    Returns the Axes. (RA increases leftward, matching selection.plot_sky.)
     """
+    from matplotlib.path import Path
+    from matplotlib.patches import PathPatch
+
+    if background_alpha is not None:
+        warnings.warn("plot_field_coverage: background_alpha is deprecated and "
+                      "ignored -- all fibers are one grey layer now; use "
+                      "fiber_alpha.", DeprecationWarning, stacklevel=2)
+
     RA, DEC = vdfi["RA"], vdfi["DEC"]
     nexp = vdfi.get("nexp", RA.shape[0])
     idx = np.arange(nexp) if exposures is None else np.atleast_1d(exposures).astype(int)
 
-    ra_all = np.concatenate([np.asarray(RA[i], dtype=float) for i in idx])
-    dec_all = np.concatenate([np.asarray(DEC[i], dtype=float) for i in idx])
+    ra_all = np.concatenate([np.asarray(RA[i], dtype=float).ravel() for i in idx])
+    dec_all = np.concatenate([np.asarray(DEC[i], dtype=float).ravel() for i in idx])
     good = np.isfinite(ra_all) & np.isfinite(dec_all)
     ra_all, dec_all = ra_all[good], dec_all[good]
 
@@ -2415,58 +2516,961 @@ def plot_field_coverage(vdfi, catalog=None, *, exposures=None, xc=None, yc=None,
         yc = float(np.mean(dec_all))
     cosd = np.cos(np.deg2rad(yc))
 
-    dra = (ra_all - xc) * cosd * 3600.
-    ddec = (dec_all - yc) * 3600.
-    dist = np.hypot(dra, ddec)
+    # ---- radii: kpc -> arcsec at a single representative redshift --------
+    if radii_kpc is not None:
+        from .virial import physical_kpc_to_arcsec
+        if z_ref is None:
+            if catalog is None or z_col not in catalog.colnames:
+                raise ValueError("radii_kpc needs z_ref, or a catalog with a "
+                                 f"'{z_col}' column to average.")
+            zz = np.asarray(catalog[z_col], dtype=float)
+            zz = zz[np.isfinite(zz) & (zz > 0)]
+            z_ref = float(np.mean(zz))
+            z_src = f"mean {z_col} of {zz.size} catalog galaxies"
+        else:
+            z_ref = float(z_ref)
+            z_src = "given"
+        radii_kpc = np.sort(np.atleast_1d(radii_kpc).astype(float))
+        scale = float(physical_kpc_to_arcsec(1.0, z_ref))      # arcsec / kpc
+        radii = radii_kpc * scale
+        labels = [f"{rk:g} kpc ({ra:.0f}\")" for rk, ra in zip(radii_kpc, radii)]
+        if verbose:
+            print(f"kpc -> arcsec at z_ref = {z_ref:.3f} ({z_src}): "
+                  f"{scale:.4f} \"/kpc  ({1/scale:.2f} kpc/\")")
+            for lab in labels:
+                print("   ", lab)
+    else:
+        radii = np.sort(np.atleast_1d(radii_arcsec).astype(float))
+        labels = [f"{r:g}\"" for r in radii]
 
-    r1, r2, r3 = sorted(radii_arcsec)
-    c1, c2, c3 = radius_colors
+    nr = radii.size
+    if len(radius_colors) >= nr:
+        colors = list(radius_colors)[:nr]
+    else:
+        colors = [plt.cm.viridis(v) for v in np.linspace(0.15, 0.9, nr)]
 
     if ax is None:
         _, ax = plt.subplots(figsize=(7.5, 7.0))
 
-    # context: every fiber beyond the outer radius, kept very faint
-    outside = dist > r3
-    ax.scatter(ra_all[outside], dec_all[outside], s=fiber_size, c="0.5",
-              alpha=background_alpha, lw=0, zorder=1,
-              label=f"all fibers ({idx.size} exposure(s))")
+    # 1. all fibers, one grey layer
+    ax.scatter(ra_all, dec_all, s=fiber_size, c=fiber_color, alpha=fiber_alpha,
+               lw=0, zorder=1, rasterized=True,
+               label=f"fibers ({idx.size} exposure(s))")
 
-    # radius bands, drawn outer-to-inner so the innermost sits on top
-    band3 = (dist > r2) & (dist <= r3)
-    band2 = (dist > r1) & (dist <= r2)
-    band1 = dist <= r1
-    ax.scatter(ra_all[band3], dec_all[band3], s=fiber_size * 2, c=c3,
-              alpha=fiber_alpha, lw=0, zorder=2, label=f"<= {r3:g}\"")
-    ax.scatter(ra_all[band2], dec_all[band2], s=fiber_size * 2, c=c2,
-              alpha=fiber_alpha, lw=0, zorder=3, label=f"<= {r2:g}\"")
-    ax.scatter(ra_all[band1], dec_all[band1], s=fiber_size * 2, c=c1,
-              alpha=fiber_alpha, lw=0, zorder=4, label=f"<= {r1:g}\"")
+    # 2+3. filled annuli on top, plus ring outlines. Each annulus is a closed
+    # outer ring + reversed inner ring (a hole), widened in RA by 1/cos(dec)
+    # so it renders as a true circle with aspect = 1/cos(dec).
+    th = np.linspace(0, 2 * np.pi, 361)
 
-    # radius rings: constant angular radius, widened in RA by 1/cos(dec)
-    th = np.linspace(0, 2 * np.pi, 300)
-    for r, c in zip((r1, r2, r3), (c1, c2, c3)):
-        rdeg = r / 3600.
-        ax.plot(xc + rdeg * np.cos(th) / cosd, yc + rdeg * np.sin(th),
-               color=c, lw=1.6, ls="--", zorder=5)
-    ax.plot([xc], [yc], "+", color="k", ms=10, mew=1.6, zorder=6)
+    def _ring(r_as):
+        rdeg = r_as / 3600.
+        return np.column_stack([xc + rdeg * np.cos(th) / cosd,
+                                yc + rdeg * np.sin(th)])
+
+    r_in = 0.0
+    for r_out, c, lab in zip(radii, colors, labels):
+        outer = _ring(r_out)
+        if r_in > 0:
+            inner = _ring(r_in)[::-1]
+            verts = np.vstack([outer, inner])
+            codes = np.concatenate([
+                [Path.MOVETO], np.full(len(outer) - 1, Path.LINETO),
+                [Path.MOVETO], np.full(len(inner) - 1, Path.LINETO)])
+        else:
+            verts, codes = outer, None
+        ax.add_patch(PathPatch(Path(verts, codes), facecolor=c, edgecolor="none",
+                               alpha=band_alpha, zorder=2, label=f"<= {lab}"))
+        if ring_lw:
+            ax.plot(outer[:, 0], outer[:, 1], color=c, lw=ring_lw, zorder=3)
+        r_in = r_out
+    ax.plot([xc], [yc], "+", color="k", ms=10, mew=1.6, zorder=4)
+
+    # 4. catalogs: extras underneath, primary on top
+    default_extra = ["darkorange", "deepskyblue", "magenta", "saddlebrown"]
+    for k, (lab, tab) in enumerate((extra_catalogs or {}).items()):
+        ekw = dict(s=12, marker="o", c=default_extra[k % len(default_extra)],
+                   edgecolors="none", alpha=0.6, zorder=5 + 0.01 * k,
+                   label=f"{lab} ({len(tab)})")
+        ekw.update((extra_catalog_kwargs or {}).get(lab, {}))
+        ax.scatter(np.asarray(tab[ra_col], dtype=float),
+                   np.asarray(tab[dec_col], dtype=float), **ekw)
 
     if catalog is not None:
         ckw = dict(s=26, marker="*", c="k", edgecolors="white", linewidths=0.5,
-                  zorder=7, label=f"catalog ({len(catalog)})")
+                   zorder=7, label=f"{catalog_label} ({len(catalog)})")
         if catalog_kwargs:
             ckw.update(catalog_kwargs)
         ax.scatter(np.asarray(catalog[ra_col], dtype=float),
-                  np.asarray(catalog[dec_col], dtype=float), **ckw)
+                   np.asarray(catalog[dec_col], dtype=float), **ckw)
 
     ax.set_xlabel("RA (deg)")
     ax.set_ylabel("Dec (deg)")
+    ax.autoscale_view()
     if not ax.xaxis_inverted():
         ax.invert_xaxis()
     ax.set_aspect(1.0 / cosd)
+    apply_tick_style(ax, direction=tick_direction, right=tick_right,
+                     top=tick_top, minor=tick_minor)
     ax.legend(loc="best", fontsize=8, frameon=False, markerscale=2)
     ax.set_title(title or
-                f"{vdfi.get('field', '?')}: {idx.size} exposure(s), "
-                f"center=({xc:.4f}, {yc:.4f})")
+                 f"{vdfi.get('field', '?')}: {idx.size} exposure(s), "
+                 f"center=({xc:.4f}, {yc:.4f})")
     return ax
 
 
+# =====================================================================
+# SPECTRAL LINE PANELS (moved from analysis.py, 2026-09-16)
+# =====================================================================
+
+def plot_line_panels(
+    stacks: dict,
+    boot: dict | None = None,
+    stack_method: str = "biweight",
+    bounds=None,
+    config=None,
+    cont_bounds=DEFAULT_CONT_BOUNDS,
+    cont_method: str = "poly",
+    cont_order: int = 1,
+    lya_center: float = PipelineConfig.LYA_REST,
+    xlim: tuple = (1208.0, 1226.0),
+    xunit: str = "wavelength",
+    panel_height: float = 2.6,
+    figwidth: float = 8.0,
+    ncols: int = 1,
+    fill_order: str = "row",
+    show_cont: bool = True,
+    show_window: bool = True,
+    show_sidebands: bool = True,
+    show_centroid: bool = True,
+    stack_color: str = "k",
+    band_color: str = "0.82",
+    band_alpha: float = 1.0,
+    cont_color: str = "tomato",
+    window_color: str = "magenta",
+    window_alpha: float = 0.15,
+    sideband_color: str = "0.55",
+    sideband_alpha: float = 0.25,
+    centroid_color: str = "magenta",
+    lya_line_color: str = "0.7",
+    zero_color: str = "0.7",
+    label_fontsize: float = 9.5,
+    legend_fontsize: float = 9,
+    tick_fontsize: float = 10,
+    tick_direction: str = "in",
+    tick_right: bool = True,
+    tick_top: bool = False,
+    tick_minor: bool = False,
+    xlabel_fontsize: float = 12,
+    ylabel_fontsize: float = 11,
+    title_fontsize: float = 13,
+    xlabel_text: str | None = None,
+    ylabel_text: str = "Flux",
+    title_text: str | None = None,
+    xlabel_y: float = 0.01,
+    ylabel_x: float = 0.01,
+    title_y: float | None = None,
+    legend_y: float = 0.95,
+    top_margin: float = 0.87,
+    band_label: str = "bootstrap 16–84%",
+    stack_label: str | None = None,
+    cont_label: str = "continuum",
+    save_fig: bool = False,
+    savename: str = "Figure_line_panels.png",
+):
+    """
+    The most important per-run diagnostic: one spectral panel per radial bin
+    zoomed to the Lyα region, showing:
+
+      • Bootstrap shaded band (grey; needs boot["stack_error"]): the RAW
+        16th-84th percentiles of the resampled stacks, per pixel -- the same
+        percentile-interval convention as every other error bar in the
+        figure set (flux profile, centroid, R_vir band). The fiducial curve
+        is not forced to be the band's midline (2026-09-16; was re-anchored
+        onto the fiducial before).
+      • Biweight (or chosen method) fiducial stack (black)
+      • Polynomial continuum fit (red dashed; optional)
+      • Line window shaded (magenta by default; optional)
+      • Sideband regions shaded (grey by default; optional)
+      • Centroid marker: vertical dashed line at v_fid, with a short horizontal
+        bar at the top spanning the 16/84 interval (optional; needs boot)
+
+    Every color and font size above is a keyword argument (see below), so the
+    whole figure is restylable without touching the function body.
+
+    This is the visual check that the centroid is landing on the line peak, that
+    the continuum is flat in the sidebands, and that the window captures the
+    emission without clipping the wings.
+
+    Parameters
+    ----------
+    stacks       : Stage-2 dict (keep_cube=True for the boot error band)
+    boot         : Stage-3 bootstrap result; None -> no error band / centroid marker
+    stack_method : which stacks[method] to display
+    bounds       : line window (lo, hi) Å. None -> resolved in priority order:
+                   (1) config.line_window if `config` is given, (2) the
+                   stacks["provenance"]["line_window"] this stacks dict was
+                   actually built with (stamped by build_stacks), (3) only if
+                   neither is available, the hardcoded (lya_center-4,
+                   lya_center+4) fallback. This means the panel's shaded
+                   window always matches the bounds actually used to make the
+                   stack, instead of silently showing a fixed +/-4 Angstrom
+                   box regardless of what config.line_window really was.
+    config       : optional PipelineConfig; only consulted to resolve `bounds`
+                   when bounds=None (see above). Not required -- if omitted,
+                   the stacks dict's own provenance is used instead.
+    xlim         : x-axis range shown in each panel. ALWAYS given in
+                   Angstroms regardless of xunit (same for bounds/cont_bounds/
+                   lya_center) -- these stay the physical, science-facing
+                   inputs; xunit only changes what's DISPLAYED. e.g. the
+                   default xlim=(1208, 1226) Å auto-converts to roughly
+                   (-1890, +2550) km/s when xunit="velocity".
+    xunit        : "wavelength" (default, Å, rest-frame) or "velocity" (km/s
+                   relative to lya_center, via v = c*(wave-lya_center)/lya_center
+                   -- the same convention already used for the centroid). The
+                   vertical dotted rest-frame marker line sits at v=0 in
+                   velocity mode. The x-axis label switches automatically too
+                   ("Velocity [km s$^{-1}$]") unless you set xlabel_text.
+    ncols        : number of grid columns (default 1 = the original single tall
+                   column). For a paper figure with many radial bins, ncols=2
+                   (or more) arranges the panels in a grid instead of one very
+                   tall column. x-axis tick labels are only drawn on the
+                   bottom-most used panel of each column. Try e.g.
+                   ncols=2, figwidth=11, panel_height=2.6, show_centroid=False
+                   for a compact 2x5 print figure with the centroid marker
+                   left out (since that belongs on the separate centroid-vs-
+                   radius plot).
+    fill_order   : "row" (default) -- panels fill left-to-right, then wrap to
+                   the next row (bin 0 top-left, bin 1 top-right, ...).
+                   "col" -- panels fill top-to-bottom within a column, then
+                   continue into the next column (the original grid ordering).
+                   No effect when ncols=1.
+    stack_color, band_color, cont_color, window_color, sideband_color,
+    centroid_color, lya_line_color, zero_color : per-element colors, all
+                   independently overridable. window_color/sideband_color
+                   default to magenta/grey; band_alpha, window_alpha,
+                   sideband_alpha control their fill opacity.
+    label_fontsize, legend_fontsize, tick_fontsize, xlabel_fontsize,
+    ylabel_fontsize, title_fontsize : text sizes for the per-panel bin label,
+                   the legend, the tick labels, the shared x/y axis labels,
+                   and the figure suptitle, respectively.
+    tick_direction, tick_right, tick_top, tick_minor : tick styling, passed
+                   to formatting.apply_tick_style (the house tick style).
+                   Defaults: ticks point INTO the panel ("in"; use "out"
+                   or "inout" for the old look), y ticks mirrored on the
+                   right spine (ticks only, no labels), no top ticks, no
+                   added minor ticks.
+    xlabel_text, ylabel_text, title_text : override the shared x-axis label,
+                   shared y-axis label, and suptitle strings. xlabel_text=None
+                   picks the wavelength/velocity default based on xunit;
+                   title_text=None keeps the auto-generated "Lyα line panels
+                   -- {method} stack". The x-axis label is drawn ONCE for the
+                   whole figure (like the y-axis "Flux" label) via
+                   fig.supxlabel, not repeated under every column.
+    band_label, stack_label, cont_label : legend text for the bootstrap 1σ
+                   band, the fiducial stack line, and the continuum line.
+                   stack_label=None defaults to f"{stack_method} stack" (so
+                   it tracks whichever method you're plotting); the other two
+                   default to "bootstrap 16–84%" and
+                   "continuum".
+    xlabel_y, ylabel_x : figure-fraction position of the shared x-/y-axis
+                   label (passed straight to fig.supxlabel(y=...) /
+                   fig.supylabel(x=...)); nudge these if the label sits too
+                   close to or far from the tick numbers.
+    title_y      : figure-fraction y position of the suptitle. None -> auto
+                   (near the very top for ncols=1, or above the reserved
+                   legend strip for a grid).
+    legend_y     : figure-fraction y position (bbox_to_anchor) of the shared
+                   legend drawn above the grid when ncols>1. No effect when
+                   ncols=1 (legend sits inside the first panel instead).
+    top_margin   : fraction of the figure height given to the panel grid
+                   when ncols>1 (the rest, above it, is reserved for the
+                   legend + title). Lower this (e.g. 0.80) if the legend is
+                   crowding the top row -- this is the fix for a squeezed
+                   legend with many columns or with axes that show a
+                   scientific-notation exponent (e.g. "1e38") above them.
+    """
+    from .measure import get_continuum_model   # lazy: plotting stays import-light
+
+    if xunit not in ("wavelength", "velocity"):
+        raise ValueError("xunit must be 'wavelength' or 'velocity'")
+
+    wave   = np.asarray(stacks["rest_wave"])
+    fid    = np.asarray(stacks["stacks"][stack_method]["flux"])   # (nrad, nwave)
+    edges  = np.round(np.asarray(stacks["r_edges"]), 3)
+    nrad   = fid.shape[0]
+    if bounds is not None:
+        bounds = tuple(bounds)
+    elif config is not None:
+        bounds = tuple(config.line_window)
+    else:
+        prov_window = stacks.get("provenance", {}).get("line_window")
+        bounds = tuple(prov_window) if prov_window is not None else (lya_center - 4, lya_center + 4)
+    bm     = stacks.get("bin_mode", "")
+    stack_label_final = stack_label if stack_label is not None else f"{stack_method} stack"
+
+    # xunit only changes what's DISPLAYED -- bounds/cont_bounds/xlim/lya_center
+    # stay in Angstroms as the science-facing inputs (and the continuum fit
+    # below is always computed in wavelength space); here we just derive the
+    # x-COORDINATES actually handed to the plotting calls, converting to km/s
+    # (same convention as the centroid: v = c*(wave-lya_center)/lya_center)
+    # when xunit="velocity".
+    def _to_velocity(wl):
+        return C_KMS * (np.asarray(wl, dtype=float) - lya_center) / lya_center
+
+    if xunit == "velocity":
+        x_plot      = _to_velocity(wave)
+        bounds_x    = tuple(_to_velocity(bounds))
+        cont_bounds_x = [tuple(_to_velocity(cb)) for cb in cont_bounds]
+        xlim_x      = tuple(_to_velocity(xlim))
+        lya_line_x  = 0.0
+    else:
+        x_plot      = wave
+        bounds_x    = bounds
+        cont_bounds_x = cont_bounds
+        xlim_x      = xlim
+        lya_line_x  = lya_center
+
+    if xlabel_text is None:
+        xlabel_text_final = (r"Velocity [km s$^{-1}$]" if xunit == "velocity"
+                             else r"Rest-frame wavelength [$\AA$]")
+    else:
+        xlabel_text_final = xlabel_text
+
+    # bootstrap error band -- RAW 16th/84th percentiles of the resampled
+    # stacks (percentile interval), the same convention as the flux-profile,
+    # centroid and R_vir error bars. Decided 2026-09-16; the previous version
+    # re-anchored the (median-p16, p84-median) spread onto `fid`. With raw
+    # percentiles the fiducial curve can sit off the band's midline in faint,
+    # small-N bins -- that offset is real information, not a plotting bug.
+    band_lo = band_hi = None
+    if boot is not None and boot.get("stack_error") is not None:
+        band_lo = np.asarray(boot["stack_error"]["p16"])         # (nrad, nwave)
+        band_hi = np.asarray(boot["stack_error"]["p84"])
+
+    ncols = max(1, int(ncols))
+    nrows = int(np.ceil(nrad / ncols))
+    fig, axes_grid = plt.subplots(nrows, ncols,
+                                  figsize=(figwidth, panel_height * nrows),
+                                  sharex=True, squeeze=False)
+
+    # bin index r -> (row, col). "row" fill_order goes left-to-right then
+    # wraps to the next row (bin 0 top-left, bin 1 top-right, ...); "col"
+    # fill_order goes top-to-bottom within a column, then continues into the
+    # next column. With ncols=1 both reduce to the original single-column order.
+    if fill_order == "row":
+        grid_pos = [(r // ncols, r % ncols) for r in range(nrad)]
+    else:
+        grid_pos = [(r % nrows, r // nrows) for r in range(nrad)]
+    axes = [axes_grid[row, col] for row, col in grid_pos]
+
+    # hide any grid cells left empty because nrad doesn't evenly fill nrows*ncols
+    used = set(grid_pos)
+    for row in range(nrows):
+        for col in range(ncols):
+            if (row, col) not in used:
+                axes_grid[row, col].axis("off")
+
+    for r, ax in enumerate(axes):
+        # --- bootstrap band (raw 16th-84th percentiles) ---
+        if band_lo is not None:
+            ax.fill_between(x_plot, band_lo[r], band_hi[r], color=band_color, lw=0,
+                            alpha=band_alpha, zorder=0,
+                            label=band_label if r == 0 else None)
+
+        # --- sideband regions ---
+        if show_sidebands:
+            for (lo, hi) in cont_bounds_x:
+                ax.axvspan(lo, hi, color=sideband_color, alpha=sideband_alpha, lw=0)
+
+        # --- line window ---
+        if show_window:
+            ax.axvspan(bounds_x[0], bounds_x[1], color=window_color, alpha=window_alpha, lw=0)
+
+        # --- fiducial stack ---
+        ax.plot(x_plot, fid[r], color=stack_color, lw=1.1, zorder=3,
+                label=stack_label_final if r == 0 else None)
+
+        # --- continuum (always fit in wavelength space; only the DRAWN curve
+        # is shown on the x_plot axis, whichever unit that is) ---
+        if show_cont:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cont = get_continuum_model(wave, fid[r], cont_bounds=cont_bounds,
+                                           cont_method=cont_method, cont_order=cont_order)
+            ax.plot(x_plot, cont, color=cont_color, lw=1.0, ls="--", zorder=2,
+                    label=cont_label if r == 0 else None)
+
+        # --- centroid marker ---
+        if show_centroid and boot is not None:
+            v_f  = boot["centroid_v_fid"][r]
+            v_lo = boot["centroid_v_lo"][r]
+            v_hi = boot["centroid_v_hi"][r]
+            if xunit == "velocity":
+                # already in km/s -- no need to round-trip through wavelength
+                x_c, x_lo, x_hi = v_f, v_lo, v_hi
+            else:
+                x_c  = lya_center * (1 + v_f  / C_KMS)
+                x_lo = lya_center * (1 + v_lo / C_KMS)
+                x_hi = lya_center * (1 + v_hi / C_KMS)
+            # vertical dashed line
+            ax.axvline(x_c, color=centroid_color, lw=1.1, ls="--", zorder=4,
+                       label=f"centroid {v_f:+.0f} km/s" if r == 0 else None)
+            # 16/84 bar at top of panel (0.92 in axes coords)
+            y_bar = ax.get_ylim()[1] * 0.0   # will be set after ylim below; use transform
+            ax.annotate("", xy=(x_hi, 1.0), xytext=(x_lo, 1.0),
+                        xycoords=("data", "axes fraction"),
+                        textcoords=("data", "axes fraction"),
+                        arrowprops=dict(arrowstyle="|-|", color=centroid_color,
+                                        lw=1.1, mutation_scale=4))
+
+        # axes / labels
+        lbl = f"{edges[r]:g}–{edges[r+1]:g} {bm}"
+        ax.text(0.02, 0.88, lbl, transform=ax.transAxes, fontsize=label_fontsize,
+                color="0.3",
+                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none",
+                          boxstyle="round,pad=0.15"))
+        ax.axhline(0, color=zero_color, lw=0.6)
+        ax.axvline(lya_line_x, color=lya_line_color, lw=0.6, ls=":")
+        ax.set_xlim(xlim_x)
+        ax.grid(alpha=0.12)
+        apply_tick_style(ax, direction=tick_direction, right=tick_right,
+                         top=tick_top, minor=tick_minor, labelsize=tick_fontsize)
+
+        in_xlim = (x_plot >= xlim_x[0]) & (x_plot <= xlim_x[1])
+        yvals = fid[r][in_xlim]
+        if band_lo is not None:
+            # both edges -- the old version only looked at the lower edge
+            # (p16), so the top of the band could silently clip out of view.
+            yvals = np.concatenate([yvals, band_lo[r][in_xlim], band_hi[r][in_xlim]])
+        fin = yvals[np.isfinite(yvals)]
+        if len(fin):
+            lo_, hi_ = np.nanpercentile(fin, [1, 99])
+            pad = 0.25 * (hi_ - lo_)
+            ax.set_ylim(min(lo_ - pad, 0), hi_ + pad)
+
+    if ncols == 1:
+        # single narrow column -- a full-width in-panel legend fits fine,
+        # matches the original look exactly.
+        axes[0].legend(frameon=False, fontsize=legend_fontsize, ncol=3, loc="upper right")
+        title_y_final = title_y if title_y is not None else 1.005
+        reserve_top = None
+    else:
+        # grid mode -- panels are narrower, so an in-panel legend collides
+        # with the bin-range label in the corner. Pull the handles off the
+        # first panel and draw ONE shared legend in a reserved strip above
+        # the panel grid instead. Reserving the strip via subplots_adjust
+        # AFTER tight_layout guarantees the axes grid is pushed down out of
+        # the legend/title's way (tight_layout's own rect= doesn't reliably
+        # leave room for manually-placed fig.legend/suptitle artists).
+        # top_margin/legend_y control how much room that strip gets -- widen
+        # the gap (lower top_margin and/or raise legend_y) if the legend
+        # crowds the top row, which happens easily with many columns or with
+        # axes that draw a scientific-notation exponent (e.g. "1e38") just
+        # above their top spine.
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, frameon=False, fontsize=legend_fontsize,
+                      ncol=len(labels), loc="upper center",
+                      bbox_to_anchor=(0.5, legend_y))
+        title_y_final = title_y if title_y is not None else min(legend_y + 0.04, 0.995)
+        reserve_top = top_margin
+
+    # x-axis tick labels only on the bottom-most USED panel of each column;
+    # hide tick labels on the panels above it so a multi-column grid doesn't
+    # repeat the wavelength axis tick numbers down every row. The x-axis
+    # TITLE itself is drawn once for the whole figure below (fig.supxlabel),
+    # not repeated per column.
+    last_row_in_col = {}
+    for row, col in grid_pos:
+        last_row_in_col[col] = max(last_row_in_col.get(col, -1), row)
+    for row, col in grid_pos:
+        if row != last_row_in_col[col]:
+            axes_grid[row, col].tick_params(labelbottom=False)
+
+    fig.supxlabel(xlabel_text_final, fontsize=xlabel_fontsize, y=xlabel_y)
+    fig.supylabel(ylabel_text, fontsize=ylabel_fontsize, x=ylabel_x)
+    fig.suptitle(title_text if title_text is not None
+                else f"Lyα line panels — {stack_method} stack",
+                fontsize=title_fontsize, y=title_y_final)
+    plt.tight_layout()
+    if reserve_top is not None:
+        fig.subplots_adjust(top=reserve_top)
+    if save_fig:
+        plt.savefig(savename, dpi=300, bbox_inches="tight")
+    plt.show()
+    return fig, axes
+
+
+# =====================================================================
+# RADIAL PROFILE PLOTS (moved from analysis.py, 2026-09-16)
+# =====================================================================
+
+def plot_centroid_profile(
+    boot: dict,
+    stacks: dict | None = None,
+    r_edges=None,
+    bin_mode=None,
+    VR_biweight_v=None,
+    vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    ylims=(-250, 250),
+    xlims=None,
+    z_err_kms: float = 0,
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
+    plot_literature: bool = False,
+    figsize=(7.2, 4.7),
+    title: str | None = r"Bootstrapped Ly$\alpha$ centroid vs. radius",
+    tick_direction: str = "in",
+    tick_right: bool = True,
+    save_fig: bool = False,
+    save_name: str | None = None,
+):
+    """
+    The headline figure: centroid velocity ± bootstrap 16/84 per radial bin.
+    Thin wrapper around plotting.plot_centroid_vs_radius with sane defaults.
+
+    Accepts the full `boot` dict from run_measurement_suite (which also carries
+    r_edges, VR_biweight_v, etc.), so you just call:
+
+        analysis.plot_centroid_profile(boot, stacks)
+
+    title     : axis title; pass None to omit the title entirely.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_centroid_profile.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    tick_direction, tick_right : house tick style (formatting.apply_tick_style):
+                ticks point "in" by default ("out" for the old look);
+                y ticks mirrored on the right spine. The top R/Rvir or
+                kpc axis uses the same direction.
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks['VR_biweight_e'] (set by stack.sample_virial_radius_kpc)
+                if present.
+    """
+    radial_bins = np.asarray(r_edges if r_edges is not None
+                             else boot.get("r_edges",
+                             stacks["r_edges"] if stacks else []))
+    savename = _resolve_savename(save_name, "Figure_centroid_profile.png")
+    return plot_centroid_vs_radius(
+        boot, radial_bins, VR_biweight_v=VR_biweight_v,
+        stacks_result=stacks or boot,
+        bin_mode=bin_mode, z_err_kms=z_err_kms,
+        vr_ticks=vr_ticks, figsize=figsize, title=title,
+        ylims=ylims, xlims=xlims,
+        show_vr=show_vr, VR_biweight_error=VR_biweight_error,
+        plot_literature=plot_literature,
+        tick_direction=tick_direction, tick_right=tick_right,
+        save_fig=save_fig,
+        savename=savename,
+    )
+
+
+def plot_flux_profile(
+    boot: dict,
+    stacks: dict | None = None,
+    r_edges=None,
+    bin_mode=None,
+    VR_biweight_v=None,
+    vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    logy: bool = True,
+    ylims=None,
+    xlims=None,
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
+    figsize=(7.2, 4.7),
+    title: str | None = "Integrated Lyα flux vs. radius",
+    tick_direction: str = "in",
+    tick_right: bool = True,
+    save_fig: bool = False,
+    save_name: str | None = None,
+):
+    """
+    Integrated Lyα flux (total_flux_fid) ± bootstrap 16/84 vs radius.
+    Log-y (the default) is strongly recommended for seeing the faint outer bins;
+    pass logy=False for a linear axis.
+
+    Requires compute_side_ratio=True in the bootstrap (the default), which
+    provides total_flux_fid = blue_flux_fid + red_flux_fid.
+
+    title     : axis title; pass None to omit the title entirely.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_flux_profile.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    tick_direction, tick_right : house tick style (formatting.apply_tick_style):
+                ticks point "in" by default ("out" for the old look);
+                y ticks mirrored on the right spine. The top R/Rvir or
+                kpc axis uses the same direction.
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks['VR_biweight_e'] (set by stack.sample_virial_radius_kpc)
+                if present.
+    """
+    if "total_flux_fid" not in boot:
+        raise KeyError("boot does not contain total_flux_fid; re-run with "
+                       "compute_side_ratio=True (the default).")
+
+    radial_bins = np.asarray(r_edges if r_edges is not None
+                             else boot.get("r_edges",
+                             stacks["r_edges"] if stacks else []))
+    bm  = _resolve_bin_mode(bin_mode, stacks or boot)
+    vr  = _get_vr_biweight_v(VR_biweight_v, stacks or boot)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks or boot)
+
+    y    = np.asarray(boot["total_flux_fid"])
+    y_lo = np.asarray(boot["total_flux_lo"])
+    y_hi = np.asarray(boot["total_flux_hi"])
+
+    fig, ax = plt.subplots(figsize=figsize)
+    r_mid, xerr = _setup_radius_axis(ax, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                     show_vr=show_vr, VR_biweight_error=vr_e,
+                                         tick_direction=tick_direction)
+    yerr, unstable = _safe_yerr(y, y_lo, y_hi)
+    ax.errorbar(r_mid, y, xerr=xerr, yerr=yerr,
+                fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:blue",
+                label="integrated flux (bootstrap 16–84)")
+    if np.any(unstable):
+        ax.scatter(r_mid[unstable], y[unstable], s=70, facecolors="none",
+                   edgecolors="tab:blue", linewidths=1.3, zorder=5,
+                   label="fiducial outside 16–84 band")
+    ax.axhline(0, color="0.7", lw=0.7)
+    if logy:
+        pos = y[y > 0]
+        if len(pos):
+            ax.set_yscale("log")
+            ax.set_ylim(pos.min() * 0.3, y.max() * 3)
+    elif ylims is not None:
+        ax.set_ylim(ylims)
+    _ui = boot.get("unit_info") or (stacks or {}).get("unit_info") or {}
+    unit = _ui.get("line_flux_unit") or "/".join(
+        p for p in _ui.get("y_unit", "").split("/") if p not in ("A", "A_rest"))
+    ax.set_ylabel(f"Integrated Lyα flux [{unit}]" if unit else "Integrated Lyα flux")
+    if title:
+        ax.set_title(title)
+    ax.legend(frameon=False, fontsize=9)
+    ax.grid(alpha=0.15)
+    apply_tick_style(ax, direction=tick_direction, right=tick_right)
+    plt.tight_layout()
+    if save_fig:
+        plt.savefig(_resolve_savename(save_name, "Figure_flux_profile.png"),
+                    dpi=300, bbox_inches="tight")
+    plt.show()
+    return fig, ax
+
+
+def plot_flux_curve_of_growth(
+    cog: dict,
+    stacks: dict | None = None,
+    r_edges=None,
+    bin_mode=None,
+    VR_biweight_v=None,
+    vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    logy: bool = True,
+    xlims=None,
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
+    figsize=None,
+    panels: str = "both",
+    title1: str | None = _AUTO,
+    title2: str | None = "Lyα flux fraction vs. radius",
+    tick_direction: str = "in",
+    tick_right: bool = True,
+    save_fig: bool = False,
+    save_name: str | None = None,
+):
+    """
+    Lyα curve of growth: cumulative luminosity vs radius (center outward), and
+    the same normalized to a flux FRACTION of the total summed out to r_max.
+    Both panels show the bootstrap 16-84 band.
+
+    Takes `cog`, the dict returned by measure.flux_curve_of_growth -- this
+    function only DRAWS it (measure.py computes, analysis.py draws, same split
+    as every other profile here). `stacks` is optional and only used as a
+    fallback for bin_mode / VR_biweight_v (cog itself does not carry them):
+
+        cog = measure.flux_curve_of_growth(boot, stacks)   # r_max_kpc=None ->
+                                                             # drops the last bin
+        analysis.plot_flux_curve_of_growth(cog, stacks)
+
+    The top panel's y-unit is derived from cog['unit_info']['y_unit'] with the
+    '/kpc^2' stripped (multiplying by the fiber area cancels it) -- same
+    fiber-footprint convention as plot_flux_profile's total_flux_fid, not a
+    true annulus-integrated luminosity (see measure.flux_curve_of_growth).
+
+    panels    : "both" (default, two stacked panels) | "cumulative" (top panel
+                only) | "fraction" (bottom panel only). Use the single-panel
+                modes to grab just one of the two images, e.g. to save it on
+                its own with a distinct save_name.
+    title1    : cumulative-luminosity panel title; omitted (_AUTO, the
+                default) auto-generates "Lyα curve of growth (r_max = ... kpc)";
+                pass a string to override, or None for no title.
+    title2    : flux-fraction panel title; pass None for no title.
+    figsize   : None -> (7.2, 8.0) for panels="both", (7.2, 4.5) for a single
+                panel.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_flux_curve_of_growth.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    tick_direction, tick_right : house tick style (formatting.apply_tick_style):
+                ticks point "in" by default ("out" for the old look);
+                y ticks mirrored on the right spine. The top R/Rvir or
+                kpc axis uses the same direction.
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks['VR_biweight_e'] (set by stack.sample_virial_radius_kpc)
+                if present. (cog itself does not carry this -- it comes from
+                `stacks`, same fallback as VR_biweight_v.)
+
+    Returns (fig, (ax1, ax2)) for panels="both", else (fig, ax).
+    """
+    for key in ("flux_cumulative_fid", "flux_fraction_fid"):
+        if key not in cog:
+            raise KeyError(f"cog missing {key!r}; pass the dict returned by "
+                           "measure.flux_curve_of_growth.")
+    if panels not in ("both", "cumulative", "fraction"):
+        raise ValueError("panels must be 'both', 'cumulative', or 'fraction'")
+
+    radial_bins = np.asarray(r_edges if r_edges is not None else cog["r_edges_used"])
+    bm  = _resolve_bin_mode(bin_mode, stacks)
+    vr  = _get_vr_biweight_v(VR_biweight_v, stacks)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks)
+
+    if figsize is None:
+        figsize = (7.2, 8.0) if panels == "both" else (7.2, 4.5)
+
+    if panels == "both":
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    elif panels == "cumulative":
+        fig, ax1 = plt.subplots(figsize=figsize)
+        ax2 = None
+    else:
+        fig, ax2 = plt.subplots(figsize=figsize)
+        ax1 = None
+
+    # panel 1: cumulative luminosity
+    if ax1 is not None:
+        r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                         show_vr=show_vr, VR_biweight_error=vr_e,
+                                         tick_direction=tick_direction)
+        y    = np.asarray(cog["flux_cumulative_fid"])
+        y_lo = np.asarray(cog["flux_cumulative_lo"])
+        y_hi = np.asarray(cog["flux_cumulative_hi"])
+        yerr, unstable = _safe_yerr(y, y_lo, y_hi)
+        ax1.errorbar(r_mid, y, xerr=xerr, yerr=yerr,
+                    fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:green",
+                    label="cumulative flux (bootstrap 16–84)")
+        if np.any(unstable):
+            ax1.scatter(r_mid[unstable], y[unstable], s=70, facecolors="none",
+                       edgecolors="tab:green", linewidths=1.3, zorder=5,
+                       label="fiducial outside 16–84 band")
+        ax1.axhline(0, color="0.7", lw=0.7)
+        if logy:
+            pos = y[y > 0]
+            if len(pos):
+                ax1.set_yscale("log")
+                ax1.set_ylim(pos.min() * 0.3, y.max() * 3)
+        _ui = cog.get("unit_info") or {}
+        base_unit = _ui.get("line_flux_unit") or "/".join(
+            p for p in _ui.get("y_unit", "").split("/") if p not in ("A", "A_rest"))
+        lum_unit = base_unit.replace("/kpc^2", "") if "kpc^2" in base_unit else base_unit
+        ax1.set_ylabel(f"Cumulative Lyα luminosity [{lum_unit}]" if lum_unit
+                       else "Cumulative Lyα luminosity")
+        if title1 is _AUTO:
+            ax1.set_title(f"Lyα curve of growth (r_max = {cog['meta']['r_max_kpc']:g} kpc)")
+        elif title1:
+            ax1.set_title(title1)
+        ax1.legend(frameon=False, fontsize=9)
+        ax1.grid(alpha=0.15)
+
+    # panel 2: flux fraction
+    if ax2 is not None:
+        r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                           show_vr=show_vr, VR_biweight_error=vr_e,
+                                         tick_direction=tick_direction)
+        fy    = np.asarray(cog["flux_fraction_fid"])
+        fy_lo = np.asarray(cog["flux_fraction_lo"])
+        fy_hi = np.asarray(cog["flux_fraction_hi"])
+        fyerr, funstable = _safe_yerr(fy, fy_lo, fy_hi)
+        ax2.errorbar(r_mid2, fy, xerr=xerr2, yerr=fyerr,
+                    fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:orange",
+                    label="flux fraction (bootstrap 16–84)")
+        if np.any(funstable):
+            ax2.scatter(r_mid2[funstable], fy[funstable], s=70, facecolors="none",
+                       edgecolors="tab:orange", linewidths=1.3, zorder=5)
+        ax2.axhline(0.5, color="0.5", lw=0.8, ls="--", label="half-light radius")
+        ax2.axhline(1.0, color="0.7", lw=0.6)
+        ax2.set_ylim(0, 1.1)
+        ax2.set_ylabel(r"Flux fraction  $L(<r) / L(<r_{\rm max})$")
+        if title2:
+            ax2.set_title(title2)
+        ax2.legend(frameon=False, fontsize=9)
+        ax2.grid(alpha=0.15)
+
+    apply_tick_style([ax1, ax2], direction=tick_direction, right=tick_right)
+
+    plt.tight_layout()
+    if save_fig:
+        plt.savefig(_resolve_savename(save_name, "Figure_flux_curve_of_growth.png"),
+                    dpi=300, bbox_inches="tight")
+    plt.show()
+    if panels == "both":
+        return fig, (ax1, ax2)
+    return fig, (ax1 if ax1 is not None else ax2)
+
+
+def plot_asymmetry_profile(
+    boot: dict,
+    stacks: dict | None = None,
+    r_edges=None,
+    bin_mode=None,
+    VR_biweight_v=None,
+    vr_ticks=(0.1, 0.2, 0.5, 1, 2, 5),
+    xlims=None,
+    show_vr: bool = True,
+    VR_biweight_error: float | None = None,
+    figsize=None,
+    panels: str = "both",
+    title1: str | None = "Lyα asymmetry: blue flux fraction",
+    title2: str | None = "Blue and red side flux vs. radius",
+    tick_direction: str = "in",
+    tick_right: bool = True,
+    save_fig: bool = False,
+    save_name: str | None = None,
+):
+    """
+    Asymmetry diagnostic: blue fraction B/(B+R) vs radius with the 16/84
+    bootstrap band, and absolute blue and red flux vs radius on the same axis
+    so you can see which side is driving the asymmetry.
+
+    fraction = blue_flux / (blue_flux + red_flux), bounded to [0, 1]:
+    = 0.5 → symmetric line.
+    > 0.5 → more blue flux (blueshifted / absorption-driven?).
+    < 0.5 → more red flux (the expected resonant scattering signature).
+
+    Replaces the old blue/red ratio (which ran 0→∞ and put the symmetric point
+    at 1). The fraction is computed PER bootstrap draw from blue_flux_all /
+    red_flux_all so the 16/84 band is correct (you cannot divide percentiles).
+
+    panels    : "both" (default, two stacked panels) | "fraction" (blue-fraction
+                panel only) | "flux" (blue/red flux panel only). Use the
+                single-panel modes to grab just one of the two images.
+    title1    : blue-fraction panel title; None for no title.
+    title2    : blue/red-flux panel title; None for no title.
+    figsize   : None -> (7.2, 8.0) for panels="both", (7.2, 4.5) for a single
+                panel.
+    save_name : filename (with or without extension) used when save_fig=True.
+                None -> "Figure_asymmetry_profile.png".
+    show_vr   : draw the dashed Rvir reference line (+ error band, if any).
+    tick_direction, tick_right : house tick style (formatting.apply_tick_style):
+                ticks point "in" by default ("out" for the old look);
+                y ticks mirrored on the right spine. The top R/Rvir or
+                kpc axis uses the same direction.
+    VR_biweight_error : 1-sigma scatter (kpc) on the sample's biweight virial
+                radius, shaded around the Rvir line. None -> auto-read
+                stacks['VR_biweight_e'] (set by stack.sample_virial_radius_kpc)
+                if present.
+
+    Returns (fig, (ax1, ax2)) for panels="both", else (fig, ax).
+    """
+    if "blue_over_red_fid" not in boot:
+        raise KeyError("boot missing blue/red keys; re-run with compute_side_ratio=True.")
+    if panels not in ("both", "fraction", "flux"):
+        raise ValueError("panels must be 'both', 'fraction', or 'flux'")
+
+    radial_bins = np.asarray(r_edges if r_edges is not None
+                             else boot.get("r_edges",
+                             stacks["r_edges"] if stacks else []))
+    bm  = _resolve_bin_mode(bin_mode, stacks or boot)
+    vr  = _get_vr_biweight_v(VR_biweight_v, stacks or boot)
+    vr_e = _get_vr_biweight_e(VR_biweight_error, stacks or boot)
+
+    # --- blue fraction per draw -> correct 16/84 (fall back to fid-only) ---
+    with np.errstate(divide="ignore", invalid="ignore"):
+        bf_fid = np.asarray(boot["blue_flux_fid"], float)
+        rf_fid = np.asarray(boot["red_flux_fid"], float)
+        bfrac_fid = bf_fid / (bf_fid + rf_fid)
+
+        if "blue_flux_all" in boot and "red_flux_all" in boot:
+            ball = np.asarray(boot["blue_flux_all"], float)   # (nboot, nrad)
+            rall = np.asarray(boot["red_flux_all"], float)
+            bfrac_all = ball / (ball + rall)
+            bfrac_lo = np.nanpercentile(bfrac_all, 16, axis=0)
+            bfrac_hi = np.nanpercentile(bfrac_all, 84, axis=0)
+        else:
+            # no per-draw arrays: approximate band from blue/red lo/hi
+            warnings.warn("blue_flux_all/red_flux_all not in boot; approximating "
+                          "B/total error bars from blue_flux_lo/hi.")
+            bl = np.asarray(boot["blue_flux_lo"], float); bh = np.asarray(boot["blue_flux_hi"], float)
+            rl = np.asarray(boot["red_flux_lo"],  float); rh = np.asarray(boot["red_flux_hi"],  float)
+            bfrac_lo = bl / (bl + rh)
+            bfrac_hi = bh / (bh + rl)
+
+    if figsize is None:
+        figsize = (7.2, 8.0) if panels == "both" else (7.2, 4.5)
+
+    if panels == "both":
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True)
+    elif panels == "fraction":
+        fig, ax1 = plt.subplots(figsize=figsize)
+        ax2 = None
+    else:
+        fig, ax2 = plt.subplots(figsize=figsize)
+        ax1 = None
+
+    # panel 1: blue fraction
+    if ax1 is not None:
+        r_mid, xerr = _setup_radius_axis(ax1, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                         show_vr=show_vr, VR_biweight_error=vr_e,
+                                         tick_direction=tick_direction)
+        yerr1, unstable1 = _safe_yerr(bfrac_fid, bfrac_lo, bfrac_hi)
+        ax1.errorbar(r_mid, bfrac_fid, xerr=xerr, yerr=yerr1,
+                     fmt="o", capsize=3.5, ms=6, lw=1.5, color="tab:purple")
+        if np.any(unstable1):
+            ax1.scatter(r_mid[unstable1], bfrac_fid[unstable1], s=70, facecolors="none",
+                        edgecolors="tab:purple", linewidths=1.3, zorder=5,
+                        label="fiducial outside 16–84 band")
+        ax1.axhline(0.5, color="0.5", lw=0.8, ls="--", label="symmetric (B/total = 0.5)")
+        ax1.set_ylim(0, 1)
+        ax1.set_ylabel("Blue fraction  B / (B+R)")
+        if title1:
+            ax1.set_title(title1)
+        ax1.legend(frameon=False, fontsize=9)
+        ax1.grid(alpha=0.15)
+
+    # panel 2: absolute fluxes
+    if ax2 is not None:
+        r_mid2, xerr2 = _setup_radius_axis(ax2, radial_bins, bm, vr, None, vr_ticks, xlims,
+                                           show_vr=show_vr, VR_biweight_error=vr_e,
+                                         tick_direction=tick_direction)
+        bf    = np.asarray(boot["blue_flux_fid"])
+        rf    = np.asarray(boot["red_flux_fid"])
+        bf_lo = np.asarray(boot["blue_flux_lo"]);  bf_hi = np.asarray(boot["blue_flux_hi"])
+        rf_lo = np.asarray(boot["red_flux_lo"]);   rf_hi = np.asarray(boot["red_flux_hi"])
+        dx = (r_mid2[1] - r_mid2[0]) * 0.05 if len(r_mid2) > 1 else 0
+        bf_yerr, bf_unstable = _safe_yerr(bf, bf_lo, bf_hi)
+        rf_yerr, rf_unstable = _safe_yerr(rf, rf_lo, rf_hi)
+        ax2.errorbar(r_mid2 - dx, bf, xerr=xerr2, yerr=bf_yerr,
+                     fmt="o", capsize=3, ms=5, lw=1.3, color="royalblue", label="blue flux")
+        ax2.errorbar(r_mid2 + dx, rf, xerr=xerr2, yerr=rf_yerr,
+                     fmt="s", capsize=3, ms=5, lw=1.3, color="tomato", label="red flux")
+        if np.any(bf_unstable):
+            ax2.scatter((r_mid2 - dx)[bf_unstable], bf[bf_unstable], s=60, facecolors="none",
+                        edgecolors="royalblue", linewidths=1.3, zorder=5)
+        if np.any(rf_unstable):
+            ax2.scatter((r_mid2 + dx)[rf_unstable], rf[rf_unstable], s=60, facecolors="none",
+                        edgecolors="tomato", linewidths=1.3, zorder=5)
+        ax2.axhline(0, color="0.7", lw=0.6)
+        ax2.set_ylabel("Flux")
+        if title2:
+            ax2.set_title(title2)
+        ax2.legend(frameon=False, fontsize=9)
+        ax2.grid(alpha=0.15)
+
+    apply_tick_style([ax1, ax2], direction=tick_direction, right=tick_right)
+
+    plt.tight_layout()
+    if save_fig:
+        plt.savefig(_resolve_savename(save_name, "Figure_asymmetry_profile.png"),
+                    dpi=300, bbox_inches="tight")
+    plt.show()
+    if panels == "both":
+        return fig, (ax1, ax2)
+    return fig, (ax1 if ax1 is not None else ax2)

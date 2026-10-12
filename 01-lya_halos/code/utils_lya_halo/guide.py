@@ -95,10 +95,21 @@ SECTIONS = {
     "validation": ("Prove the centroid is real: nulls, robustness sweeps, "
                    "error cross-checks, injection-recovery, and the dossier. "
                    "This IS the test suite -- there is no separate 'tests' "
-                   "section, by design.",
+                   "section, by design. TWO DIFFERENT injection facilities "
+                   "live here and they are not interchangeable: "
+                   "'Injection-recovery' (validation.py) injects a LINE into "
+                   "an existing stacked spectrum to measure estimator bias, "
+                   "while the 'Source injection' subsections (injection.py) "
+                   "put a synthetic GALAXY into the raw fiber cube and run "
+                   "the whole extract -> stack -> measure chain on it.",
                    ["Nulls", "Robustness sweeps", "Error checks",
                     "Combined significance", "Bin correlation",
-                    "Injection-recovery", "S/N spectrum", "Synthesis",
+                    "Injection-recovery",
+                    "Source injection: model & truth",
+                    "Source injection: template & optics",
+                    "Source injection: run it",
+                    "Source injection: ladder & deconvolution",
+                    "S/N spectrum", "Synthesis",
                     "Method scoring"]),
 
     # ---------------- tracks & toolkits ----------------
@@ -200,6 +211,13 @@ _ENTRIES = [
        "the path implied by config. The in-memory input to extraction and to "
        "the fiber/mask diagnostics.",
        "vdfi = load_field(cfg)"),
+    _e("compute_barycentric_velocities", "extract", "extraction", "Inputs & catalog",
+       "Per-exposure barycentric velocity v_bc (km/s) for a field: night from the "
+       "per-observation *.h5 filenames, exposure order verified against all_info "
+       "HDU 3 == h5 Survey fwhm, astropy radial_velocity_correction at HET. "
+       "Used by extract_fibers when cfg.barycentric=True; call directly to "
+       "inspect the values.",
+       "bc = compute_barycentric_velocities(vdfi['base_path'], vdfi['RA'], vdfi['DEC'])"),
     _e("build_run_table", "extract", "extraction", "Inputs & catalog",
        "Build the per-galaxy run table: read the catalog and select the rows "
        "matching this config's field and catalog tag. This row order defines "
@@ -516,11 +534,11 @@ _ENTRIES = [
        "velocity about Lya on x, radial bin on y, flux as color. The compact "
        "'whole halo in one panel' view.",
        "plot_radius_velocity_map(stacks, method='biweight')"),
-    _e("plot_centroid_profile", "analysis", "plotting", "Radial profiles",
+    _e("plot_centroid_profile", "plotting", "plotting", "Radial profiles",
        "The headline figure: centroid velocity +/- bootstrap 16/84 per radial "
        "bin, on the native + comparison radius axes. The main result plot.",
        "plot_centroid_profile(boot, stacks)"),
-    _e("plot_flux_profile", "analysis", "plotting", "Radial profiles",
+    _e("plot_flux_profile", "plotting", "plotting", "Radial profiles",
        "Integrated Lya flux +/- bootstrap 16/84 vs radius (log-y by default, to "
        "see the faint outer bins). The radial surface-brightness profile.",
        "plot_flux_profile(boot, stacks)"),
@@ -530,13 +548,13 @@ _ENTRIES = [
        "drawing the fitted intrinsic profile and per-component scale lengths on "
        "the measured bins. The figure behind the h1/h2 fit result.",
        "plot_flux_profile_fit(boot, stacks, method='psf')"),
-    _e("plot_flux_curve_of_growth", "analysis", "plotting", "Radial profiles",
+    _e("plot_flux_curve_of_growth", "plotting", "plotting", "Radial profiles",
        "Two-panel curve of growth: cumulative Lya luminosity (top, log-y) and "
        "flux fraction L(<r)/L(<r_max) (bottom) vs radius, with bootstrap "
        "bands. Draws a measure.flux_curve_of_growth result -- the "
        "curve-of-growth companion to plot_flux_profile.",
        "plot_flux_curve_of_growth(cog, stacks)"),
-    _e("plot_asymmetry_profile", "analysis", "plotting", "Radial profiles",
+    _e("plot_asymmetry_profile", "plotting", "plotting", "Radial profiles",
        "Two-panel asymmetry: blue fraction B/(B+R) vs radius (top) and absolute "
        "blue/red flux (bottom), with bootstrap bands. Where the line goes "
        "blue- or red-dominated with radius.",
@@ -572,7 +590,7 @@ _ENTRIES = [
        "Overlay centroid-vs-radius for SEVERAL labelled samples on one axis "
        "(the N-sample generalization). The engine behind multicat.compare_centroids.",
        "plot_centroid_comparison({'lo': boot_a, 'hi': boot_b}, stacks['r_edges'])"),
-    _e("plot_line_panels", "analysis", "plotting", "Diagnostics",
+    _e("plot_line_panels", "plotting", "plotting", "Diagnostics",
        "The most important per-run diagnostic: one Lya-zoom panel per radial "
        "bin showing the continuum fit, line window, sidebands, and measured "
        "centroid. Always eyeball this before trusting a profile.",
@@ -650,11 +668,12 @@ _ENTRIES = [
        "which exposures fill the field, instead of guessing exposure IDs.",
        "list_exposures(vdfi)"),
     _e("plot_field_coverage", "plotting", "plotting", "Fiber & mask visuals",
-       "Sky footprint of one or more VDFI exposures, with green/yellow/red "
-       "radius bands around a center and a catalog (e.g. MOSDEF run_table) "
-       "overplotted on top. exposures=None plots everything, guaranteeing "
-       "full field coverage.",
-       "plot_field_coverage(vdfi, run_table, radii_arcsec=(100, 200, 300))"),
+       "Sky footprint of VDFI exposures (grey fibers) with transparent filled "
+       "annuli drawn on top (radii in arcsec, or radii_kpc converted at the "
+       "catalog's mean z), the primary catalog (MOSDEF run_table) and optional "
+       "extra_catalogs (e.g. 3D-HST) in their own colors. exposures=None plots "
+       "everything.",
+       "plot_field_coverage(vdfi, run_table, radii_kpc=(500, 1000, 2000), extra_catalogs={'3D-HST': t3d})"),
 
     # ===================== VALIDATION =====================
     _e("redshift_scramble_null", "validation", "validation", "Nulls",
@@ -804,6 +823,244 @@ _ENTRIES = [
        "Recovered vs input centroid for one radial bin with the 1:1 line. The "
        "close-up for a specific bin.",
        "plot_injection_recovery(inj, radial_index=0)"),
+
+    # ---- SOURCE INJECTION (injection.py) ----
+    # The cube-level ladder: build a synthetic galaxy, know its answer
+    # analytically, add it to the raw fibers, and run the production chain on
+    # it. Spec: specs/injection-recovery.md. Distinct from the four
+    # "Injection-recovery" entries above, which live in validation.py and
+    # inject a line into an already-stacked spectrum.
+    _e("SourceModel", "injection", "validation", "Source injection: model & truth",
+       "The source itself: f(r, lambda) = L * I(r) * S(lambda | z, dv(r), "
+       "sigma, alpha). NOT separable once dv depends on radius -- it is a "
+       "family of separable products indexed by r. Carries the spatial "
+       "profile (expcore h1/A2_over_A1/r_c/gamma), the line shape, the LSF, "
+       "and a VelocityField.",
+       "model = SourceModel(L=1.0, h1=16.0, sigma_kms=250.0, lsf_kms=200.0)"),
+    _e("family_P", "injection", "validation", "Source injection: model & truth",
+       "Family P -- the point source, and the strongest null in the plan. A "
+       "point convolved with the seeing is by construction the narrowest "
+       "thing the instrument can produce, so any excess width in the recovered "
+       "profile is the pipeline's, not the sky's.",
+       "model = family_P(L=1.0, dv=0.0)"),
+    _e("family_H", "injection", "validation", "Source injection: model & truth",
+       "Family H -- the double halo with a piecewise (step) dv(r). Validates "
+       "the model the paper actually fits: whether the two-component profile "
+       "and a velocity break are recoverable at this S/N and sample size.",
+       "model = family_H(h1=16.0, dv_in=0.0, dv_out=-150.0, r_break=75.0)"),
+    _e("family_G", "injection", "validation", "Source injection: model & truth",
+       "Family G -- same expcore spatial profile as H but with a CORE "
+       "GRADIENT (a ramp) instead of a step. Not a fourth acceptance family: "
+       "this is the forward model used to deconvolve the real core gradient.",
+       "model = family_G(h1=16.0, dv_in=0.0, dv_out=-150.0, r_in=10.0, "
+       "r_out=100.0)"),
+    _e("VelocityField", "injection", "validation", "Source injection: model & truth",
+       "Base class for dv(r) in km/s, r in kpc. Subclass it to define a new "
+       "radial dependence; the four concrete fields below cover the families.",
+       "class MyField(VelocityField): ..."),
+    _e("ConstantVelocity", "injection", "validation", "Source injection: model & truth",
+       "A single dv at all radii (family P). Note a ZERO-velocity injection "
+       "cannot distinguish 'the pipeline measures velocity correctly' from "
+       "'the pipeline returns zero regardless' -- inject a nonzero dv too.",
+       "vel = ConstantVelocity(dv=-100.0)"),
+    _e("StepVelocity", "injection", "validation", "Source injection: model & truth",
+       "dv_in inside r_break, dv_out outside, abrupt and unsmoothed (family "
+       "H). The cleanest probe of radial resolution: the recovered curve is a "
+       "STEP RESPONSE.",
+       "vel = StepVelocity(dv_in=0.0, dv_out=-150.0, r_break=75.0)"),
+    _e("RampVelocity", "injection", "validation", "Source injection: model & truth",
+       "dv_in at small r ramping to dv_out by r_out, flat outside (family G). "
+       "Where StepVelocity asks 'would a transition at 200 kpc have been "
+       "seen?', this asks what a gradual gradient looks like coming back out.",
+       "vel = RampVelocity(dv_in=0.0, dv_out=-150.0, r_in=10.0, r_out=100.0)"),
+    _e("BinnedVelocity", "injection", "validation", "Source injection: model & truth",
+       "dv constant within each radial bin -- the natural basis for the "
+       "INVERSE problem. Parameterising the intrinsic field on the reported "
+       "bin edges makes 'what is the intrinsic dv in bin i' a question with "
+       "exactly as many unknowns as there are measurements.",
+       "vel = BinnedVelocity(edges_kpc=bins_kpc, dv=dv_per_bin)"),
+    _e("apply_lsf", "injection", "validation", "Source injection: model & truth",
+       "Blur an intrinsic line by the instrument, exactly; returns "
+       "(sigma_observed, alpha_observed). An instrument cannot record a line "
+       "narrower than its own resolution, so the injector emits the line AS "
+       "OBSERVED and predict_binned_observables' lsf_kms is only a "
+       "consistency assertion.",
+       "sig_obs, a_obs = apply_lsf(250.0, 0.0, lsf_kms=200.0)"),
+    _e("observed_lya_wavelength", "injection", "validation", "Source injection: model & truth",
+       "Observed Lya wavelength at z IN THE DATA'S OWN FRAME -- the AIR "
+       "wavelength, because that is what vdfi['wave'] is labelled in. Writing "
+       "the line at the vacuum wavelength on an air axis is an ~85 km/s blue "
+       "error; this function is the fix.",
+       "lam0 = observed_lya_wavelength(z)"),
+    _e("l_inj_for_luminosity", "injection", "validation", "Source injection: model & truth",
+       "The L_INJ that gives a source of physical Lya luminosity L_phys "
+       "(erg/s) at redshift z -- what ties the injection's arbitrary "
+       "amplitude to a number the paper can quote. See "
+       "`line_is_velocity_density`, which selects the line-units convention.",
+       "L_INJ = l_inj_for_luminosity(1e43, z=2.4)"),
+    _e("predict_binned_observables", "injection", "validation", "Source injection: model & truth",
+       "THE TRUTH: expected per-bin flux, dv, sigma and skew for a model, "
+       "computed analytically. Every recovery diagnostic compares against "
+       "this and never against a config value, so it is the independent "
+       "second implementation the whole ladder is checked with.",
+       "truth = predict_binned_observables(model, z, bins_kpc, seeing_fwhm, "
+       "kpc_per_arcsec)"),
+
+    _e("build_source_template", "injection", "validation", "Source injection: template & optics",
+       "THE INJECTOR: flux to ADD to each fiber for one exposure, (nfib, "
+       "nwave). Convolves the source's surface brightness with the seeing and "
+       "the fiber aperture. Never hand it a full field's fibers -- pass it "
+       "through select_nearby_fibers first.",
+       "tpl = build_source_template(model, z, dra, ddec, seeing_fwhm, wave, "
+       "kpc_per_arcsec)"),
+    _e("select_nearby_fibers", "injection", "validation", "Source injection: template & optics",
+       "Boolean mask of the fibers an injected source can possibly reach. "
+       "Exists because handing build_source_template every fiber in the "
+       "exposure kills the kernel; this is the guard, not an optimisation.",
+       "near = select_nearby_fibers(dra, ddec, r_max_kpc, kpc_per_arcsec)"),
+    _e("fiber_response_production", "injection", "validation", "Source injection: template & optics",
+       "V(r) via the PRODUCTION optics path (extract.moffat_psf_integration). "
+       "Used by the injector deliberately, so that a PSF-convention error in "
+       "production shows up as agreement rather than hiding behind a second "
+       "independent convolution.",
+       "V = fiber_response_production(r_arcsec, seeing_fwhm)"),
+    _e("fiber_response_independent", "injection", "validation", "Source injection: template & optics",
+       "V(r) via an INDEPENDENT path: analytic Moffat, polar quadrature. The "
+       "cross-check against the production response. alpha tracks "
+       "extract.moffat_psf_integration's own default (3.0).",
+       "V = fiber_response_independent(r_arcsec, seeing_fwhm)"),
+    _e("fiber_response_hybrid", "injection", "validation", "Source injection: template & optics",
+       "Production V inside the Cartesian grid, analytic V outside -- USED BY "
+       "THE INJECTOR. Exists because moffat_psf_integration evaluates the "
+       "Moffat on a finite grid and falls off a cliff beyond it (found at "
+       "ladder level 0).",
+       "V = fiber_response_hybrid(r_arcsec, seeing_fwhm)"),
+    _e("bin_template_radially", "injection", "validation", "Source injection: template & optics",
+       "Radially bin a noiseless template the way extract_fibers bins real "
+       "fibers. The round-trip half of ladder levels 1-4: build on real fiber "
+       "geometry, bin, compare against the analytic truth.",
+       "binned = bin_template_radially(tpl, dists_arcsec, bins_kpc, "
+       "kpc_per_arcsec)"),
+    _e("centroid_from_spectrum", "injection", "validation", "Source injection: template & optics",
+       "50%-flux centroid velocity of one binned spectrum, in km/s, using the "
+       "production convention -- so a recovered value is directly comparable "
+       "to predict_binned_observables.",
+       "dv = centroid_from_spectrum(spec, wave, z)"),
+    _e("time_template_build", "injection", "validation", "Source injection: template & optics",
+       "Cost breakdown for ONE exposure's template. Run it BEFORE the loop; "
+       "per-exposure cost is not constant and the failure mode is a dead "
+       "kernel two hours in.",
+       "time_template_build(model, z, dra, ddec, seeing_fwhm, wave, "
+       "kpc_per_arcsec)"),
+    _e("clear_injection_caches", "injection", "validation", "Source injection: template & optics",
+       "Drop the V-table and ring-kernel caches. Only needed if you "
+       "monkeypatch a response function or edit the module in place "
+       "mid-session -- the cache keys use id(response), which does not notice "
+       "a redefinition.",
+       "clear_injection_caches()"),
+
+    _e("inject_sources", "injection", "validation", "Source injection: run it",
+       "Add fake sources to the real fiber spectra and hand back the objects "
+       "the extraction consumes. The top-level entry point for levels 2 and "
+       "up; `zero_base=True` gives the zero-background run as a config switch "
+       "rather than a 16 GB array.",
+       "spec_inj, tbl = inject_sources(cfg, vdfi, inj_table, bad_fiber_mask, "
+       "model)"),
+    _e("InjectedSpectra", "injection", "validation", "Source injection: run it",
+       "Read-only view of the memmapped cube with sparse additive patches. "
+       "Impersonates the flux memmap and adds the source on the fly, "
+       "supporting exactly the access pattern the extraction uses "
+       "(`spectra[e]` and `spectra[e, bool_mask]`) and raising on everything "
+       "else.",
+       "spectra = InjectedSpectra(vdfi['spectra'], zero_base=False)"),
+    _e("draw_injection_positions", "injection", "validation", "Source injection: run it",
+       "Random (ra, dec, z) with an exclusion around the real galaxies. "
+       "Rejection sampling, seeded and reproducible from `seed` alone -- which "
+       "is what inject_sources(placement_seed=...) records. Pass "
+       "footprint='auto' + z_sample so draws are matched to the real sample's "
+       "sky coverage and n(z); omit both for the pre-v8 field-box behaviour.",
+       "pos = draw_injection_positions(vdfi, n=50, seed=10, real_ra=cat['RA'], "
+       "real_dec=cat['DEC'], footprint='auto', z_sample=cat['z'])"),
+    _e("build_source_footprint", "injection", "validation", "Source injection: run it",
+       "Alpha shape (concave hull) of the real catalog's positions -- the sky "
+       "region MOSDEF actually observed, instead of its RA/Dec bounding box. "
+       "A slit-mask survey is a few rectangular pointings with concave "
+       "notches; the box interpolates across every one of them and drops "
+       "randoms on sky nobody looked at.",
+       "fp = build_source_footprint(cat['RA'], cat['DEC'])"),
+    _e("plot_source_footprint", "injection", "validation", "Source injection: run it",
+       "Sweep the alpha-shape probe radius and look at what each keeps. The "
+       "3x-nearest-neighbour default is a guess about a survey's geometry, and "
+       "geometry guesses get eyeballed once. Watch the SHADED (alpha-only) "
+       "area -- the buffer hides a shape that is coming apart.",
+       "fps = plot_source_footprint(cat['RA'], cat['DEC'], draws=300)"),
+    _e("find_redshift_humps", "injection", "validation", "Source injection: run it",
+       "Split a real n(z) into contiguous windows at its gaps. MOSDEF targets "
+       "two rest-optical windows, so its n(z) is two clumps with an empty span "
+       "between them; randoms drawn flat across the span sit at wavelengths "
+       "the data never sees and average away the sky residual the null exists "
+       "to size.",
+       "humps = find_redshift_humps(cat['z'])"),
+    _e("sample_redshifts", "injection", "validation", "Source injection: run it",
+       "Draw n redshifts matched to a real sample's n(z) -- uniform inside "
+       "each detected hump ('hump'), an exact resample ('bootstrap'), or the "
+       "legacy flat draw ('uniform'). Standalone version of what "
+       "draw_injection_positions does internally, for plotting the drawn n(z) "
+       "against the real one before committing 13 hr of extraction.",
+       "z = sample_redshifts(400, cat['z'], seed=11)"),
+    _e("validate_inj_table", "injection", "validation", "Source injection: run it",
+       "The injection table IS the run table, so it must carry everything "
+       "extract_fibers reads (RA, DEC, the config z and mass columns) plus "
+       "everything build_run_table needs. Check it before the run, not after.",
+       "validate_inj_table(inj_table, cfg)"),
+    _e("check_overlay_identity", "injection", "validation", "Source injection: run it",
+       "An EMPTY overlay must be bit-identical to the raw memmap. PASS A "
+       "SMALL SLAB, NOT THE CUBE -- this tests indexing logic, which does not "
+       "care how big the array is. The one failure here that could corrupt "
+       "real science products rather than just a test.",
+       "check_overlay_identity(vdfi['spectra'][:2, :400])"),
+    _e("check_background_annulus_negligible", "injection", "validation", "Source injection: run it",
+       "Assert that the injected profile really is negligible in the 80-90\" "
+       "background annulus. Unlike with real data this can be PROVEN rather "
+       "than argued, so the spec asks for a printed assertion at setup.",
+       "check_background_annulus_negligible(model, kpc_per_arcsec)"),
+    _e("shot_noise_ratio", "injection", "validation", "Source injection: run it",
+       "Quantify source shot noise against sky, once, for Methods. The error "
+       "array is deliberately NOT injected -- VDFI is sky-dominated at these "
+       "fluxes -- and this is the number that justifies that choice.",
+       "shot_noise_ratio(L_median, sky_variance)"),
+
+    _e("check_level0", "injection", "validation", "Source injection: ladder & deconvolution",
+       "Ladder level 0: no cube, analytic answers only. Five checks in "
+       "increasing order of what they would have caught, aimed at generator "
+       "unit bugs before anything is built on top of them.",
+       "check_level0(model)"),
+    _e("check_level1", "injection", "validation", "Source injection: ladder & deconvolution",
+       "Ladder level 1: the template on REAL fiber geometry against the "
+       "independent truth generator. No cube, no noise, no extraction. "
+       "Replaces the thirteen-cell level-1 notebook with one call.",
+       "check_level1(model, vdfi, z, bins_kpc)"),
+    _e("plot_injection_recovery", "injection", "validation", "Source injection: ladder & deconvolution",
+       "Recovered vs INTRINSIC vs TRUTH for a real injected extraction, with "
+       "error bars -- the figure that answers 'how well does what I measure "
+       "track what I put in?'. NOTE the name is also used by validation.py "
+       "for the estimator-bias close-up; these are different functions.",
+       "plot_injection_recovery(boot, model, z, seeing_fwhm, kpc_per_arcsec, "
+       "bins_kpc=bins_kpc)"),
+    _e("build_velocity_response_matrix", "injection", "validation", "Source injection: ladder & deconvolution",
+       "The PSF+binning operator M, with truth = M @ dv_intrinsic. Binned "
+       "truth dv is a flux-weighted average of shell velocities, so the truth "
+       "generator is LINEAR in dv(r) at fixed spatial profile -- which is "
+       "what makes the inversion below closed-form rather than a fit.",
+       "M = build_velocity_response_matrix(model, z, bins_kpc, seeing_fwhm, "
+       "kpc_per_arcsec)"),
+    _e("deconvolve_velocity", "injection", "validation", "Source injection: ladder & deconvolution",
+       "Invert truth = M @ dv_intrinsic for the intrinsic velocity profile -- "
+       "THE POINT OF THE WHOLE INJECTION EXERCISE. Takes the measured "
+       "centroid table and returns what the gas is actually doing, with "
+       "errors propagated.",
+       "dv_int, err = deconvolve_velocity(M, v_meas, v_err)"),
+
     _e("signal_to_noise_spectrum", "validation", "validation", "S/N spectrum",
        "Per-bin S/N(lambda) = (stack - continuum)/sigma using the empirical "
        "bootstrap per-pixel error. Shows where Lya -- and any other line -- is "
@@ -1078,6 +1335,24 @@ _ENTRIES = [
        "Compare the Lya profile against the PSF curve of growth to test for "
        "extension.",
        "cog = curve_of_growth(prof)"),
+    _e("build_piecewise_psf", "starpsf", "misc", "Star-PSF & line profiles",
+       "Composite PSF from several MAGNITUDE CLASSES of star. Divides each star "
+       "by its Gaia G flux first (radial_continuum_profile combines stars in RAW "
+       "flux, which is wrong across a wide magnitude range), so class agreement "
+       "IS the linearity test and class disagreement at small r IS saturation.",
+       "pw = build_piecewise_psf(prof, star_tbl['G'])"),
+    _e("describe_piecewise_psf", "starpsf", "misc", "Star-PSF & line profiles",
+       "Per-class summary of a build_piecewise_psf result: N stars, valid radius "
+       "range, overlap scale factor and chi2/dof against the reference class.",
+       "describe_piecewise_psf(pw)"),
+    _e("flux_scale_check", "starpsf", "misc", "Star-PSF & line profiles",
+       "Absolute flux-scale check: rebuild each star's total flux from the "
+       "average-fiber product (x A_ann/A_fib, / PSF curve of growth), take its "
+       "synthetic PS1 g mag, and compare with PS1 DR2 g. Median R~1 means the "
+       "stored spectra are per A (flux_unit_scale=1e-17 right); R~2 means per "
+       "2-A pixel. R vs aperture, magnitude, colour and field are the "
+       "diagnostics. Queries VizieR unless ref= is passed.",
+       "fsc = flux_scale_check(star_both, cal)   # cal = psfmodel calibration"),
     _e("blank_sky_centroid_null", "starpsf", "misc", "Star-PSF & line profiles",
        "Stack a blank-sky product and measure the 'Lya' centroid per bin: it "
        "should hug zero. A source-free null for the centroid itself.",
@@ -2122,8 +2397,17 @@ _ENTRIES = [
 # ---------------------------------------------------------------------
 _BACKEND = {
     "pipeline": set(),
+    # injection.py is fully documented -- every public function has an _e()
+    # entry under one of the four "Source injection" subsections, so there is
+    # nothing to exempt. Keep it that way: the module is the validation
+    # evidence base for Methods, and an unregistered helper here scores zero
+    # audit coverage silently.
+    "injection": set(),
     "extract": {"load_vdfi_field", "combine_fibers", "combine_fibers_chunked",
                 "extract_fibers",
+                # barycentric resample internals (front door is
+                # compute_barycentric_velocities + config.barycentric)
+                "barycentric_resample_weights", "apply_barycentric_shift",
                 # combine acceleration (specs/extraction-speedup.md 9)
                 "biweight_fused", "combine_fibers_fused",
                 "combine_fibers_threaded", "get_combine_executor",
@@ -2145,6 +2429,7 @@ _BACKEND = {
     "io": {"write_galaxy_fits"},
     "stack": {"convert_avg_fiber_bin", "rest_grid", "stack_spec_values",
               "coadd_galaxies", "sample_virial_radius_kpc", "build_core_stacks",
+              "bootstrap_virial_radius",   # called by analysis.run_measurement_suite
               "concat_core_prods", "resolve_galaxy_index"},
     "measure": {"stack_galaxies", "measure_centroid", "bootstrap_measurements",
                 "bootstrap_stack_error", "run_header"},   # measure_centroid doc'd? yes -> keep out of backend
@@ -2166,6 +2451,7 @@ _BACKEND = {
     "selection": {"derive", "with_column", "resolve_core_sn_fields"},
     "speclsf": {"instrumental_fwhm", "lsf_line_template", "intrinsic_sigma"},
     "starpsf": {"make_position_run_table", "psf_profiles_for_lines",
+                "plot_piecewise_psf",
                 "plot_radial_profile", "plot_curve_of_growth",
                 "plot_blank_sky_null", "plot_line_sn", "plot_line_sn_radial",
                 "plot_line_profiles"},

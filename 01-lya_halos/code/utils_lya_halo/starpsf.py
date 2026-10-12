@@ -74,6 +74,14 @@ __all__ = [
     "run_positions_extract",
     "radial_continuum_profile",
     "curve_of_growth",
+    "build_piecewise_psf",
+    "describe_piecewise_psf",
+    "plot_piecewise_psf",
+    "fiber_moffat",
+    "fit_psf_moffat",
+    "describe_psf_fit",
+    "plot_psf_composite",
+    "flux_scale_check",
     "plot_radial_profile",
     "plot_curve_of_growth",
     "blank_sky_centroid_null",
@@ -273,8 +281,18 @@ def run_positions_extract(config, table, *, mask="none", custom_mask=None,
     else:
         raise ValueError("mask must be 'none', 'auto', or 'custom'.")
 
-    spec, err, nfib_arr, background, vr = extract.extract_fibers(
-        config, vdfi, table, bad, use_cache=use_cache)
+    # return_extras is driven by the config's own store_* / bg_variants flags
+    # (config.stores_bg_extras()). Without this the flags are honoured inside
+    # extract_fibers and then SILENTLY DISCARDED here -- store_spec_nobg=True
+    # would cost the compute and produce nothing.
+    want_extras = bool(getattr(config, "stores_bg_products", lambda: False)())
+    if want_extras:
+        spec, err, nfib_arr, background, vr, extras = extract.extract_fibers(
+            config, vdfi, table, bad, use_cache=use_cache, return_extras=True)
+    else:
+        spec, err, nfib_arr, background, vr = extract.extract_fibers(
+            config, vdfi, table, bad, use_cache=use_cache)
+        extras = None
     ngal = spec.shape[0]
     catalog = table[:ngal]
     r_edges = np.asarray(config.bins, dtype=float)
@@ -288,15 +306,19 @@ def run_positions_extract(config, table, *, mask="none", custom_mask=None,
         write_galaxy_fits(path, spec=spec, err=err, nfib=nfib_arr,
                           wave=vdfi["wave"], r_edges=r_edges, catalog=catalog,
                           config=config, source_id=source_id,
-                          background=background, overwrite=True)
+                          background=background, extras=extras, overwrite=True)
         if verbose:
             print(f"wrote {path}")
 
     if verbose:
         print(f"extracted {ngal} positions, mask='{mask}', bin_mode={config.bin_mode}")
+    ex = extras or {}
     return GalaxyProduct(
         spec=spec, err=err, nfib=nfib_arr, wave=vdfi["wave"],
         r_edges=r_edges, catalog=catalog, header=None, background=background,
+        spec_nobg=ex.get("spec_nobg"), bg_variants=ex.get("bg_raw"),
+        bg_nfib=ex.get("bg_nfib"), bg_halves=ex.get("bg_halves"),
+        bg_half_nfib=ex.get("bg_half_nfib"),
     )
 
 
@@ -405,6 +427,866 @@ def curve_of_growth(profile: dict, area_weight="nfib") -> dict:
         "r_edges": profile["r_edges"], "r_mid": profile["r_mid"],
         "cog": cog, "cog_norm": cog / total, "weight": w,
     }
+
+
+# =====================================================================
+# 3b. PIECEWISE PSF  (magnitude classes -> one composite curve)
+# =====================================================================
+def build_piecewise_psf(profile, gmag, *, mag_edges=(8, 14, 17, 19, 21),
+                        valid_radius=None, min_stars=3, min_sn=2.0,
+                        ref_class=None, scale_to_ref=False):
+    """
+    Build one PSF curve out of several magnitude classes of star.
+
+    THE NORMALIZATION IS THE WHOLE POINT. `radial_continuum_profile` combines
+    stars in RAW flux, so with a wide magnitude range its cross-star biweight
+    is dominated by (and then rejects) whichever stars happen to be brightest --
+    that is not a PSF. Here every star is divided by its own Gaia G flux first:
+
+        p_i(r) = per_obj[i, r] / 10**(-0.4 * G_i)
+
+    For an unsaturated, uncontaminated point source p_i(r) is the SAME function
+    for every star regardless of magnitude. So:
+
+      * where the classes lie on top of each other, the PSF is measured and the
+        photometry is linear;
+      * where a BRIGHT class falls below the fainter ones at small r, that is
+        saturation, read straight off the plot;
+      * where a FAINT class scatters or turns up at large r, that is its noise /
+        contamination floor.
+
+    The class curves therefore ARE the linearity test -- there is no separate
+    test to run. You read the valid radius range for each class off
+    `plot_piecewise_psf`, pass it back in as `valid_radius`, and the composite
+    is the inverse-variance combine of the classes that are valid in each bin.
+
+    profile      : dict from radial_continuum_profile (needs 'per_obj', 'r_mid').
+                   BACKGROUND-SUBTRACT UPSTREAM -- a sky error is additive and
+                   does not divide out with the Gaia flux, so it breaks the
+                   class agreement at large r and would be absorbed into `scale`.
+    gmag         : (nobj,) Gaia G, aligned to profile['per_obj'] rows, i.e. to
+                   product.catalog order. Carry it through by setting
+                   star_tbl['G'] before extraction.
+    mag_edges    : class boundaries in G (len = nclass + 1).
+    valid_radius : None -> every bin with >= min_stars is used. Otherwise a dict
+                   {class_index: (r_min, r_max)} in the profile's radius unit;
+                   classes not listed keep their full range.
+    min_sn       : a class/bin is only valid at curve/err >= this. A bin a class
+                   cannot actually detect must not enter the composite (its error
+                   alone would down-weight it, but it would still widen `valid`
+                   and pollute the overlap fit). 0 disables.
+    ref_class    : index of the class the composite is tied to. None -> the class
+                   valid in the most bins, ties broken toward the FAINTER class
+                   (the one least likely to be saturated).
+    scale_to_ref : if True, fit one multiplicative factor per class on its
+                   overlap with ref_class before combining. Leave False first:
+                   the UNSCALED agreement is the measurement. Turn it on only to
+                   absorb a known throughput/color offset, and check `scale` is
+                   near 1 and `overlap_chi2_dof` near 1 before believing it.
+
+    Returns dict:
+        r_mid, labels, curves (nclass, nrad), errs, counts, valid (bool),
+        scale (nclass,), overlap_chi2_dof (nclass,), n_overlap (nclass,),
+        psf (nrad,), psf_err (nrad,), n_class_used (nrad,), ref_class
+    """
+    per_obj = np.asarray(profile["per_obj"], dtype=float)
+    r_mid = np.asarray(profile["r_mid"], dtype=float)
+    g = np.asarray(gmag, dtype=float)
+    nobj, nrad = per_obj.shape
+    if g.size != nobj:
+        raise ValueError(f"gmag has {g.size} entries but per_obj has {nobj} rows "
+                         "-- gmag must be aligned to product.catalog order.")
+
+    # normalize each star by its own Gaia flux (arbitrary zero point; only the
+    # RELATIVE scaling between stars matters)
+    p = per_obj / (10.0 ** (-0.4 * g))[:, None]
+
+    edges = np.asarray(mag_edges, dtype=float)
+    ncls = edges.size - 1
+    cls = np.digitize(g, edges) - 1
+
+    labels = [f"G {edges[c]:.0f}-{edges[c+1]:.0f}" for c in range(ncls)]
+    curves = np.full((ncls, nrad), np.nan)
+    errs = np.full((ncls, nrad), np.nan)
+    counts = np.zeros((ncls, nrad), dtype=int)
+
+    for c in range(ncls):
+        sel = (cls == c) & np.isfinite(g)
+        if not np.any(sel):
+            continue
+        blk = p[sel]
+        for r in range(nrad):
+            col = blk[:, r]
+            fin = np.isfinite(col)
+            counts[c, r] = int(fin.sum())
+            if counts[c, r] >= min_stars:
+                curves[c, r] = np.median(col[fin])
+                sd = mad_std(col[fin])
+                errs[c, r] = sd / np.sqrt(counts[c, r]) if np.isfinite(sd) else np.nan
+
+    valid = (counts >= min_stars) & np.isfinite(curves) & np.isfinite(errs) & (errs > 0)
+    if min_sn and min_sn > 0:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            valid &= (curves / errs) >= float(min_sn)
+    if valid_radius:
+        for c, rng in valid_radius.items():
+            ci = int(c)
+            lo, hi = float(rng[0]), float(rng[1])
+            valid[ci] &= (r_mid >= lo) & (r_mid <= hi)
+
+    if ref_class is None:
+        nv = valid.sum(axis=1)
+        # The FAINTEST class with a workable number of valid bins. Faintness is
+        # the criterion, not bin count: the faintest class is the one that
+        # CANNOT be saturated, so it is the only safe anchor. Picking whichever
+        # class has the most valid bins would often anchor on the BRIGHTEST
+        # class -- exactly the one whose photometry is suspect -- and then the
+        # reported `scale` for every other class is measured against a possibly
+        # saturated reference and reads backwards.
+        good = np.flatnonzero(nv >= max(3, int(0.25 * nv.max()))) if nv.max() else np.array([], int)
+        ref = int(good[-1]) if good.size else int(np.argmax(nv))
+    else:
+        ref = int(ref_class)
+
+    scale = np.ones(ncls)
+    chi2_dof = np.full(ncls, np.nan)
+    n_ov = np.zeros(ncls, dtype=int)
+    for c in range(ncls):
+        ov = valid[c] & valid[ref] & (curves[c] > 0) & (curves[ref] > 0)
+        n_ov[c] = int(ov.sum())
+        if c == ref or n_ov[c] == 0:
+            continue
+        # one factor, fitted in log space over ALL overlap bins (not a ratio at
+        # one radius -- that has no leverage and no goodness of fit)
+        lr = np.log(curves[ref][ov] / curves[c][ov])
+        lsig = np.sqrt((errs[ref][ov] / curves[ref][ov]) ** 2
+                       + (errs[c][ov] / curves[c][ov]) ** 2)
+        w = 1.0 / np.where(lsig > 0, lsig ** 2, np.inf)
+        k_log = np.sum(w * lr) / np.sum(w)
+        scale[c] = float(np.exp(k_log))
+        if n_ov[c] > 1:
+            chi2_dof[c] = float(np.sum(w * (lr - k_log) ** 2) / (n_ov[c] - 1))
+
+    use_scale = scale if scale_to_ref else np.ones(ncls)
+    cur_s = curves * use_scale[:, None]
+    err_s = errs * use_scale[:, None]
+
+    psf = np.full(nrad, np.nan)
+    psf_err = np.full(nrad, np.nan)
+    n_used = np.zeros(nrad, dtype=int)
+    for r in range(nrad):
+        m = valid[:, r]
+        n_used[r] = int(m.sum())
+        if n_used[r] == 0:
+            continue
+        w = 1.0 / err_s[m, r] ** 2
+        psf[r] = np.sum(w * cur_s[m, r]) / np.sum(w)
+        psf_err[r] = 1.0 / np.sqrt(np.sum(w))
+
+    return {
+        "r_edges": np.asarray(profile["r_edges"], dtype=float),
+        "r_mid": r_mid, "labels": labels,
+        "curves": curves, "errs": errs, "counts": counts, "valid": valid,
+        "scale": scale, "overlap_chi2_dof": chi2_dof, "n_overlap": n_ov,
+        "psf": psf, "psf_err": psf_err, "n_class_used": n_used,
+        "ref_class": ref, "mag_edges": edges, "scaled": bool(scale_to_ref),
+    }
+
+
+def describe_piecewise_psf(pw):
+    """One-screen summary: per class, how many stars, over what radius range it
+    is valid, and how well it agrees with the reference class."""
+    r = pw["r_mid"]
+    ref = pw["ref_class"]
+    print(f"reference class: {pw['labels'][ref]}"
+          + ("   [class scaling APPLIED]" if pw["scaled"] else "   [unscaled]"))
+    print(f"{'class':>12s} {'Nmax':>5s} {'valid r':>18s} {'scale':>7s} "
+          f"{'chi2/dof':>9s} {'Nov':>4s}")
+    for c, lab in enumerate(pw["labels"]):
+        v = pw["valid"][c]
+        rng = f"{r[v].min():.2f} - {r[v].max():.2f}" if np.any(v) else "none"
+        print(f"{lab:>12s} {pw['counts'][c].max():5d} {rng:>18s} "
+              f"{pw['scale'][c]:7.3f} {pw['overlap_chi2_dof'][c]:9.2f} "
+              f"{pw['n_overlap'][c]:4d}")
+    nb = int(np.isfinite(pw["psf"]).sum())
+    print(f"\ncomposite: {nb}/{len(r)} bins filled, "
+          f"{pw['n_class_used'].max()} classes deep at best")
+
+
+def plot_piecewise_psf(pw, bin_mode="arcsec", figsize=(11.0, 4.6),
+                       title=None, save_fig=False):
+    """Left: the Gaia-normalized class curves (agreement = linearity; a bright
+    class dropping below the others at small r = saturation). Right: each class
+    divided by the composite, which is where you read off the valid ranges."""
+    r = pw["r_mid"]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    colors = plt.cm.viridis(np.linspace(0, 0.9, len(pw["labels"])))
+
+    for c, lab in enumerate(pw["labels"]):
+        cur = pw["curves"][c] * (pw["scale"][c] if pw["scaled"] else 1.0)
+        err = pw["errs"][c] * (pw["scale"][c] if pw["scaled"] else 1.0)
+        ok = np.isfinite(cur)
+        if not np.any(ok):
+            continue
+        ax1.errorbar(r[ok], cur[ok], yerr=err[ok], color=colors[c], marker="o",
+                     ms=3.5, lw=1.2, capsize=0, label=f"{lab} (N={pw['counts'][c].max()})")
+        v = pw["valid"][c]
+        if np.any(v):
+            ax1.plot(r[v], cur[v], color=colors[c], marker="o", ms=6,
+                     lw=0, mfc="none", mew=1.4)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio = cur / pw["psf"]
+            rerr = err / pw["psf"]
+        ax2.errorbar(r[ok], ratio[ok], yerr=rerr[ok], color=colors[c],
+                     marker="o", ms=3.5, lw=1.2, capsize=0, label=lab)
+
+    ax1.set_xscale("log"); ax1.set_yscale("log")
+    ax1.set_xlabel(_radius_label(bin_mode))
+    ax1.set_ylabel("SB / Gaia G flux  [arb.]")
+    ax1.legend(fontsize=8, frameon=False)
+    ax1.set_title("Gaia-normalized class profiles" if title is None else title)
+
+    ok = np.isfinite(pw["psf"])
+    ax2.plot(r[ok], pw["psf"][ok] / pw["psf"][ok], "k-", lw=1.0, zorder=0)
+    ax2.axhline(1.0, color="k", lw=0.8, ls="--")
+    ax2.set_xscale("log")
+    ax2.set_ylim(0.0, 2.0)
+    ax2.set_xlabel(_radius_label(bin_mode))
+    ax2.set_ylabel("class / composite")
+    ax2.set_title("residual (open markers on left = bins used)")
+    fig.tight_layout()
+    if save_fig:
+        fig.savefig(save_fig if isinstance(save_fig, str) else "piecewise_psf.png",
+                    dpi=150, bbox_inches="tight")
+    return fig, (ax1, ax2)
+
+
+# =====================================================================
+# 3c. MOFFAT FIT TO THE COMPOSITE PSF
+# =====================================================================
+def fiber_moffat(r, fwhm, beta=3.0, fiber_radius=0.75, n_s=24, n_phi=48):
+    """
+    A unit-total-flux Moffat, AVERAGED OVER A FIBER APERTURE of radius
+    `fiber_radius`, evaluated at fiber-centre offsets `r`. Units are surface
+    brightness (flux per arcsec^2), which is what a fiber measures and what
+    radial_continuum_profile returns.
+
+    YOU MUST FIT THIS, NOT THE ANALYTIC MOFFAT. Every point in the measured
+    profile is a 1.5"-diameter fiber, so inside ~2" the aperture average is
+    substantially flatter than the analytic profile. Fitting the analytic form
+    to fiber data biases the recovered FWHM high.
+
+    Same operator as extract.moffat_psf_integration (which the galaxy core
+    extraction uses), but vectorised over r and cheap enough for a fit loop:
+    polar Gauss-Legendre quadrature over the aperture instead of a 2-D pixel
+    grid + LinearNDInterpolator. That returns enclosed FLUX; this returns the
+    aperture MEAN, so the two differ by pi*fiber_radius^2 -- a constant that
+    the fitted amplitude absorbs.
+
+    Moffat: I(r) = (beta-1)/(pi gamma^2) * [1 + (r/gamma)^2]^(-beta),
+            gamma = 0.5*fwhm / sqrt(2^(1/beta) - 1).
+    """
+    r = np.atleast_1d(np.asarray(r, dtype=float))
+    fwhm = float(fwhm); beta = float(beta)
+    if fwhm <= 0 or beta <= 1.0:
+        return np.full(r.shape, np.nan)
+    gamma = 0.5 * fwhm / np.sqrt(2.0 ** (1.0 / beta) - 1.0)
+
+    xs, ws = np.polynomial.legendre.leggauss(int(n_s))
+    s = 0.5 * fiber_radius * (xs + 1.0)
+    w_s = 0.5 * fiber_radius * ws
+    phi = (np.arange(int(n_phi)) + 0.5) * (2.0 * np.pi / int(n_phi))
+    w_phi = 2.0 * np.pi / int(n_phi)
+
+    D = r[:, None, None]; S = s[None, :, None]; PH = phi[None, None, :]
+    rr2 = D * D + S * S + 2.0 * D * S * np.cos(PH)
+    I = (beta - 1.0) / (np.pi * gamma ** 2) * (1.0 + rr2 / gamma ** 2) ** (-beta)
+    integ = np.sum(I * S * w_s[None, :, None] * w_phi, axis=(1, 2))
+    return integ / (np.pi * fiber_radius ** 2)
+
+
+def fit_psf_moffat(pw, *, beta_fixed=None, r_max=None, r_min=None,
+                   model="moffat", fiber_radius=0.75, p0=None):
+    """
+    Fit the composite PSF from build_piecewise_psf with a fiber-integrated
+    Moffat. THE FIT IS DONE IN LOG SPACE -- the profile spans decades, so a
+    linear-space fit is a fit to the innermost two bins and nothing else.
+
+    model : 'moffat'   -> A * fiber_moffat(r, fwhm, beta).  3 params (2 if
+                          beta_fixed). This is the pipeline's own PSF form; the
+                          fitted FWHM/beta are directly comparable to what
+                          extract.moffat_psf_integration assumes.
+            'moffat+pl'-> the above PLUS an aureole A_w * (r/10)^(-p), the
+                          standard extended-PSF form (a Moffat falls as
+                          r^(-2 beta), far too steep for real scattered light).
+                          5 params. DO NOT USE THIS until the wings are actually
+                          detected -- with only a handful of significant bins the
+                          wing term is unconstrained and will happily fit noise.
+
+    beta_fixed : hold the Moffat index. Pass 3.0 to compare like-for-like with
+                 the extraction's assumption; leave None to measure it.
+    r_min/r_max: restrict the fitted range (composite bins outside are ignored).
+
+    Returns dict: names, params, errors, cov, chi2, dof, chi2_dof, r, y, yerr,
+    model (at the fitted r), r_fine, model_fine, resid (in sigma).
+    """
+    from scipy.optimize import curve_fit
+
+    r = np.asarray(pw["r_mid"], dtype=float)
+    y = np.asarray(pw["psf"], dtype=float)
+    e = np.asarray(pw["psf_err"], dtype=float)
+    ok = np.isfinite(r) & np.isfinite(y) & np.isfinite(e) & (y > 0) & (e > 0)
+    if r_min is not None:
+        ok &= r >= float(r_min)
+    if r_max is not None:
+        ok &= r <= float(r_max)
+    r, y, e = r[ok], y[ok], e[ok]
+    if r.size < 3:
+        raise ValueError(f"only {r.size} usable composite bins -- nothing to fit. "
+                         "Check pw['psf'] / widen r_min,r_max.")
+
+    ly = np.log(y)
+    lsig = e / y                       # d(log y) = dy / y
+
+    if model == "moffat":
+        if beta_fixed is None:
+            names = ["log_amp", "fwhm", "beta"]
+            def f(rr, la, fw, be):
+                return la + np.log(fiber_moffat(rr, fw, be, fiber_radius))
+            g0 = [ly[0] + 1.0, 1.5, 3.0]
+            bounds = ([-np.inf, 0.2, 1.05], [np.inf, 10.0, 12.0])
+        else:
+            names = ["log_amp", "fwhm"]
+            be0 = float(beta_fixed)
+            def f(rr, la, fw):
+                return la + np.log(fiber_moffat(rr, fw, be0, fiber_radius))
+            g0 = [ly[0] + 1.0, 1.5]
+            bounds = ([-np.inf, 0.2], [np.inf, 10.0])
+    elif model == "moffat+pl":
+        if beta_fixed is None:
+            names = ["log_amp", "fwhm", "beta", "log_amp_wing", "p"]
+            def f(rr, la, fw, be, lw, p):
+                return np.log(np.exp(la) * fiber_moffat(rr, fw, be, fiber_radius)
+                              + np.exp(lw) * (rr / 10.0) ** (-p))
+            g0 = [ly[0] + 1.0, 1.5, 3.0, ly[-1], 2.0]
+            bounds = ([-np.inf, 0.2, 1.05, -np.inf, 0.5],
+                      [np.inf, 10.0, 12.0, np.inf, 6.0])
+        else:
+            names = ["log_amp", "fwhm", "log_amp_wing", "p"]
+            be0 = float(beta_fixed)
+            def f(rr, la, fw, lw, p):
+                return np.log(np.exp(la) * fiber_moffat(rr, fw, be0, fiber_radius)
+                              + np.exp(lw) * (rr / 10.0) ** (-p))
+            g0 = [ly[0] + 1.0, 1.5, ly[-1], 2.0]
+            bounds = ([-np.inf, 0.2, -np.inf, 0.5], [np.inf, 10.0, np.inf, 6.0])
+    else:
+        raise ValueError("model must be 'moffat' or 'moffat+pl'.")
+
+    if p0 is not None:
+        g0 = list(p0)
+    popt, pcov = curve_fit(f, r, ly, p0=g0, sigma=lsig, absolute_sigma=True,
+                           bounds=bounds, maxfev=20000)
+    perr = np.sqrt(np.diag(pcov))
+    resid = (ly - f(r, *popt)) / lsig
+    chi2 = float(np.sum(resid ** 2))
+    dof = int(r.size - len(popt))
+    r_fine = np.logspace(np.log10(max(r.min() * 0.7, 1e-3)),
+                         np.log10(r.max() * 1.4), 200)
+
+    return {
+        "model": model, "names": names, "params": popt, "errors": perr,
+        "cov": pcov, "chi2": chi2, "dof": dof,
+        "chi2_dof": chi2 / dof if dof > 0 else np.nan,
+        "r": r, "y": y, "yerr": e, "resid": resid,
+        "model_y": np.exp(f(r, *popt)),
+        "r_fine": r_fine, "model_fine": np.exp(f(r_fine, *popt)),
+        "beta_fixed": beta_fixed, "fiber_radius": fiber_radius,
+    }
+
+
+def describe_psf_fit(fit):
+    print(f"model = {fit['model']}"
+          + (f"   (beta fixed at {fit['beta_fixed']})" if fit["beta_fixed"] else ""))
+    for n, p, s in zip(fit["names"], fit["params"], fit["errors"]):
+        print(f"  {n:>14s} = {p:10.4f} +/- {s:.4f}")
+    print(f"  {'chi2/dof':>14s} = {fit['chi2_dof']:10.2f}   "
+          f"({fit['chi2']:.1f} / {fit['dof']})")
+    w = np.argmax(np.abs(fit["resid"]))
+    print(f"  worst bin: r = {fit['r'][w]:.2f}  ({fit['resid'][w]:+.1f} sigma)")
+
+
+def plot_psf_composite(pw, fit=None, reference=None, bin_mode="arcsec",
+                       figsize=(7.6, 6.4), title=None, save_fig=False):
+    """
+    The composite PSF on its own, optionally with a fit_psf_moffat model and a
+    `reference` curve (r, y) -- e.g. the pipeline's assumed Moffat at the
+    measured seeing, tied to the composite in the core. Lower panel is the
+    residual in sigma.
+    """
+    r = np.asarray(pw["r_mid"], float)
+    y = np.asarray(pw["psf"], float)
+    e = np.asarray(pw["psf_err"], float)
+    ok = np.isfinite(y) & np.isfinite(e) & (e > 0)
+
+    fig, (ax, axr) = plt.subplots(
+        2, 1, figsize=figsize, sharex=True,
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.06})
+
+    ax.errorbar(r[ok], y[ok], yerr=e[ok], fmt="o", ms=4.5, color="k",
+                lw=1.1, capsize=0, zorder=3, label="composite PSF")
+    if fit is not None:
+        lab = fit["model"] + (f", beta={fit['beta_fixed']:.1f} fixed"
+                              if fit["beta_fixed"] else "")
+        ax.plot(fit["r_fine"], fit["model_fine"], "-", color="crimson", lw=1.6,
+                zorder=2, label=f"{lab}  ($\chi^2$/dof={fit['chi2_dof']:.2f})")
+    if reference is not None:
+        rr, yy = reference
+        ax.plot(rr, yy, "--", color="tab:blue", lw=1.5, zorder=1,
+                label="pipeline Moffat (measured seeing)")
+
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_ylabel("SB / Gaia G flux  [arb.]")
+    ax.legend(fontsize=9, frameon=False)
+    if title:
+        ax.set_title(title)
+
+    if fit is not None:
+        axr.errorbar(fit["r"], fit["resid"], yerr=1.0, fmt="o", ms=4,
+                     color="crimson", lw=1.0, capsize=0)
+    if reference is not None:
+        rr, yy = reference
+        yi = np.interp(r[ok], rr, yy)
+        axr.plot(r[ok], (y[ok] - yi) / e[ok], "s", ms=4, color="tab:blue",
+                 mfc="none")
+    axr.axhline(0, color="k", lw=0.8)
+    axr.axhspan(-1, 1, color="0.85", zorder=0)
+    axr.set_xscale("log")
+    axr.set_ylabel(r"residual [$\sigma$]")
+    axr.set_xlabel(_radius_label(bin_mode))
+    if save_fig:
+        fig.savefig(save_fig if isinstance(save_fig, str) else "psf_composite.png",
+                    dpi=150, bbox_inches="tight")
+    return fig, (ax, axr)
+
+
+# =====================================================================
+# 3d. ABSOLUTE FLUX-SCALE CHECK  (VDFI star total flux vs Pan-STARRS1 g)
+# =====================================================================
+# Question this answers: is the stored spectrum per Angstrom or per 2-A pixel
+# (i.e. is config.flux_unit_scale = 1e-17 right, or should it be 0.5e-17)?
+# More generally: does the WHOLE chain that sets the height of the surface-
+# brightness profile -- flux_unit_scale, the average-fiber convention, the
+# fiber-area bookkeeping, the background subtraction -- reproduce an
+# independently known stellar flux?
+#
+# Recipe, per star:
+#   1. total flux inside R_ap, rebuilt the way the galaxy SB is built:
+#          F(lam) = sum_{bins < R_ap}  spec[bin, lam] * scale * A_ann/A_fib
+#      spec is the average-fiber value; A_ann/A_fib turns one fiber into the
+#      whole annulus (A_fib = pi*(1.5/2)^2, the same area flux_arcsec2 uses).
+#   2. aperture correction: divide by the fraction of a point source's light
+#      inside R_ap, from the calibrated EFFECTIVE Moffat (psfmodel). Using the
+#      effective kernel is right here: it is the fiber-sampled profile, and
+#      convolving with the fiber does not change the total flux.
+#   3. synthetic PS1 g magnitude of F(lam) (photon-counting AB):
+#          m = -2.5 log10[ int F S lam dlam / (c int S/lam dlam) ] - 48.60
+#   4. R = 10**(-0.4*(m_syn - g_PS1)).  R ~ 1: per-A, pipeline right.
+#      R ~ 2: per-2A pixel, use flux_unit_scale = 0.5e-17.
+#
+# PS1 g bandpass: Tonry et al. 2012, ApJ 750, 99, Table 3 (photon capture
+# cross-section incl. 1.2 airmass), 10-A sampling, copied from the
+# astro-sedpy file panstarrs_g.par. Only its SHAPE enters. 0.2% of the
+# band's photon weight lies beyond VIRUS's 5540 A red edge; that sliver is
+# filled with a flat extrapolation and reported as band_extrap_frac.
+_PS1_G_WAVE = np.arange(3890.0, 5671.0, 10.0)
+_PS1_G_S = np.array([
+    0, 0.001, 0.001, 0.001, 0.002, 0.004, 0.007, 0.012, 0.021, 0.035, 0.053,
+    0.073, 0.096, 0.118, 0.135, 0.147, 0.157, 0.163, 0.167, 0.171, 0.175,
+    0.181, 0.186, 0.192, 0.199, 0.204, 0.206, 0.208, 0.211, 0.217, 0.225,
+    0.233, 0.24, 0.246, 0.249, 0.25, 0.25, 0.253, 0.259, 0.268, 0.277,
+    0.286, 0.295, 0.3, 0.302, 0.302, 0.304, 0.309, 0.316, 0.323, 0.33,
+    0.336, 0.34, 0.341, 0.342, 0.344, 0.348, 0.354, 0.361, 0.368, 0.374,
+    0.38, 0.386, 0.392, 0.396, 0.398, 0.398, 0.394, 0.388, 0.384, 0.382,
+    0.384, 0.388, 0.393, 0.396, 0.396, 0.396, 0.397, 0.397, 0.399, 0.4,
+    0.401, 0.402, 0.403, 0.405, 0.408, 0.413, 0.418, 0.424, 0.431, 0.437,
+    0.441, 0.444, 0.446, 0.448, 0.451, 0.453, 0.456, 0.458, 0.46, 0.46,
+    0.459, 0.455, 0.451, 0.45, 0.453, 0.459, 0.463, 0.467, 0.471, 0.472,
+    0.471, 0.468, 0.466, 0.463, 0.459, 0.457, 0.456, 0.455, 0.456, 0.456,
+    0.457, 0.458, 0.459, 0.461, 0.465, 0.469, 0.473, 0.475, 0.476, 0.475,
+    0.473, 0.472, 0.473, 0.473, 0.474, 0.473, 0.472, 0.474, 0.477, 0.483,
+    0.489, 0.495, 0.498, 0.5, 0.501, 0.502, 0.502, 0.502, 0.502, 0.502,
+    0.501, 0.5, 0.496, 0.493, 0.489, 0.486, 0.481, 0.467, 0.438, 0.39,
+    0.323, 0.248, 0.175, 0.113, 0.068, 0.041, 0.025, 0.015, 0.009, 0.006,
+    0.003, 0.002, 0.002, 0.001, 0.001, 0.001, 0.001, 0
+])
+_C_AA = 2.99792458e18          # speed of light [A/s]
+_trapz = getattr(np, "trapezoid", None) or np.trapz   # numpy 1.x / 2.x
+
+
+def _moffat_enclosed(R, fwhm, beta):
+    """Fraction of a unit-flux analytic Moffat's light inside radius R (same
+    units as fwhm). Closed form: 1 - (1 + (R/gamma)^2)^(1-beta)."""
+    fwhm = np.asarray(fwhm, dtype=float)
+    gamma = 0.5 * fwhm / np.sqrt(2.0 ** (1.0 / beta) - 1.0)
+    return 1.0 - (1.0 + (R / gamma) ** 2) ** (1.0 - beta)
+
+
+def _ps1_crossmatch(ra, dec, *, match_radius=1.0, neighbour_radius=10.0,
+                    neighbour_dmag=3.0, chunk=200, verbose=True):
+    """
+    Pan-STARRS1 DR2 mean-PSF photometry for each position (VizieR II/349/ps1,
+    one cone of neighbour_radius per star, batched). Needs network + astroquery.
+
+    Returns dict of arrays aligned with ra/dec:
+      gmag, e_gmag, rmag   nearest PS1 object within match_radius (NaN if none)
+      sep                  its separation [arcsec]
+      n_bright_neighbour   OTHER PS1 objects between max(match_radius, 1.5")
+                           and neighbour_radius with g < g_star + neighbour_dmag
+    """
+    from astroquery.vizier import Vizier
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    ra = np.atleast_1d(np.asarray(ra, float))
+    dec = np.atleast_1d(np.asarray(dec, float))
+    n = ra.size
+    out = {k: np.full(n, np.nan) for k in ("gmag", "e_gmag", "rmag", "sep")}
+    out["n_bright_neighbour"] = np.zeros(n, dtype=int)
+
+    viz = Vizier(columns=["RAJ2000", "DEJ2000", "gmag", "e_gmag", "rmag"],
+                 row_limit=-1)
+    inner = max(float(match_radius), 1.5)
+    for s in tqdm(range(0, n, chunk), disable=not verbose, desc="PS1 query"):
+        idx = np.arange(s, min(s + chunk, n))
+        tc = SkyCoord(ra[idx] * u.deg, dec[idx] * u.deg)
+        res = viz.query_region(tc, radius=neighbour_radius * u.arcsec,
+                               catalog="II/349/ps1")
+        if len(res) == 0:
+            continue
+        t = res[0]
+        q = (np.asarray(t["_q"], int) - 1) if len(idx) > 1             else np.zeros(len(t), int)
+        pc = SkyCoord(np.asarray(t["RAJ2000"], float) * u.deg,
+                      np.asarray(t["DEJ2000"], float) * u.deg)
+        g = np.ma.filled(np.ma.asarray(t["gmag"], float), np.nan)
+        eg = np.ma.filled(np.ma.asarray(t["e_gmag"], float), np.nan)
+        rr = np.ma.filled(np.ma.asarray(t["rmag"], float), np.nan)
+        for j, i in enumerate(idx):
+            m = q == j
+            if not np.any(m):
+                continue
+            sep = tc[j].separation(pc[m]).arcsec
+            k = int(np.argmin(sep))
+            if sep[k] > match_radius:
+                continue
+            gm = g[m]
+            out["gmag"][i], out["e_gmag"][i] = gm[k], eg[m][k]
+            out["rmag"][i], out["sep"][i] = rr[m][k], sep[k]
+            if np.isfinite(gm[k]):
+                nb = (sep > inner) & np.isfinite(gm) & (gm < gm[k] + neighbour_dmag)
+                out["n_bright_neighbour"][i] = int(nb.sum())
+    return out
+
+
+def _synthetic_ps1_g(wave, flam, ferr):
+    """
+    Synthetic PS1 g AB magnitude of each row of flam (nobj, nwave) [erg/s/cm2/A].
+
+    NaN pixels inside the band are interpolated over; their share of the
+    band's photon weight is returned as bad_frac so the caller can reject.
+    Beyond the last finite pixel the spectrum is held flat at the median of
+    its last 100 A (extrap_frac says how much of the band that covers).
+    Returns m, m_err (noise only, pixels treated as independent), bad_frac,
+    extrap_frac.
+    """
+    wave = np.asarray(wave, float)
+    grid = np.arange(_PS1_G_WAVE[0], _PS1_G_WAVE[-1] + 0.5, 1.0)
+    S = np.interp(grid, _PS1_G_WAVE, _PS1_G_S)
+    wgt = S * grid                                     # photon weight / A
+    denom = _C_AA * _trapz(S / grid, grid)
+    dlam = np.gradient(wave)
+    S_nat = np.interp(wave, _PS1_G_WAVE, _PS1_G_S, left=0.0, right=0.0)
+
+    nobj = flam.shape[0]
+    m = np.full(nobj, np.nan); me = np.full(nobj, np.nan)
+    bad = np.ones(nobj); ext = np.full(nobj, np.nan)
+    for i in range(nobj):
+        f, e = flam[i], ferr[i]
+        fin = np.isfinite(f)
+        if fin.sum() < 10:
+            continue
+        in_band = S_nat > 0
+        w_nat = S_nat * wave * dlam
+        bad[i] = w_nat[in_band & ~fin].sum() / w_nat[in_band].sum()
+        wmax = wave[fin].max()
+        tail = fin & (wave > wmax - 100.0)
+        f_ext = np.nanmedian(f[tail])
+        fg = np.interp(grid, wave[fin], f[fin], right=f_ext)
+        num = _trapz(fg * wgt, grid)
+        ext[i] = wgt[grid > wmax].sum() / wgt.sum()
+        if not num > 0:
+            continue
+        m[i] = -2.5 * np.log10(num / denom) - 48.60
+        ev = np.where(np.isfinite(e) & fin, e, 0.0) * w_nat
+        me[i] = 1.0857 * np.sqrt(np.sum(ev ** 2)) / num
+    return m, me, bad, ext
+
+
+def flux_scale_check(star_product, cal=None, *, fwhm=None, beta=None,
+                     r_ap=6.0, r_ap_list=(3.0, 4.5, 6.0, 9.0), ref=None,
+                     mag_col="G", mag_range=(15.0, 19.0),
+                     match_radius=1.0, neighbour_radius=10.0,
+                     neighbour_dmag=3.0, flux_unit_scale=1e-17,
+                     fiber_diam_arcsec=1.5, use_nobg=False, max_bad_frac=0.10,
+                     field_col="FIELD", n_boot=2000, seed=0, plot=True,
+                     figsize=(10.5, 8.0), tick_direction="in", tick_right=True,
+                     save_fig=False, verbose=True):
+    """
+    Absolute flux-scale check: VDFI star total flux vs Pan-STARRS1 g, star by
+    star. Tells per-A (R~1) from per-2A-pixel (R~2) and, more generally,
+    tests every step that sets the height of the SB profile. Method in the
+    section header above.
+
+    star_product : the arcsec-binned, mask='none' star GalaxyProduct (bins
+                   must start at 0 and reach r_ap). catalog needs RA, DEC.
+    cal          : psfmodel.PSFCalibration (FWHM(lam) and beta for the
+                   aperture correction). Or pass cal=None with scalar
+                   fwhm= [arcsec, EFFECTIVE] and beta=.
+    r_ap         : fiducial aperture [arcsec]; snapped to the nearest bin
+                   edge. r_ap_list: apertures for the stability diagnostic --
+                   if R drifts with aperture, the aperture correction or the
+                   area bookkeeping is wrong, not the unit.
+    ref          : None -> query PS1 (VizieR, needs network + astroquery).
+                   Else a dict/Table aligned with the catalog rows holding
+                   'gmag', 'e_gmag', and optionally 'rmag',
+                   'n_bright_neighbour' (so you can query once and rerun
+                   offline: pass res['ref'] back in).
+    mag_col      : catalog column for the brightness cut (Gaia G). Falls back
+                   to PS1 g if absent. mag_range: (bright, faint) limits.
+    flux_unit_scale : the value under test -- leave at the pipeline's 1e-17.
+    use_nobg     : use spec_nobg (no background subtraction) instead of spec.
+
+    Returns dict: R, R_err, m_syn, g_ps1, mag, gr, field, sel, reasons,
+    R_med, R_med_err (bootstrap over stars), R_biweight, R_by_aperture,
+    R_by_field, slope_dlogR_dmag, r_ap_used, cog_fid (per wavelength),
+    band_extrap_frac, dlam, ref, fig, axes.
+    """
+
+    cat = star_product.catalog
+    spec = star_product.spec_nobg if use_nobg else star_product.spec
+    if spec is None:
+        raise ValueError("use_nobg=True but star_product.spec_nobg is None "
+                         "(extract with store_spec_nobg=True).")
+    spec = np.asarray(spec, float)
+    err = np.asarray(star_product.err, float)
+    wave = np.asarray(star_product.wave, float)
+    edges = np.asarray(star_product.r_edges, float)
+    nobj = spec.shape[0]
+    if edges[0] != 0:
+        raise ValueError("r_edges must start at 0 (need the full aperture).")
+    if edges[-1] < r_ap:
+        raise ValueError(f"bins stop at {edges[-1]:g}, inside r_ap={r_ap:g}.")
+
+    # --- PSF for the aperture correction ---
+    if cal is not None:
+        fwhm_lam = np.asarray(cal.fwhm(wave), float)
+        beta_use = float(cal.beta if beta is None else beta)
+    else:
+        if fwhm is None or beta is None:
+            raise ValueError("pass cal=PSFCalibration, or both fwhm= and beta=.")
+        fwhm_lam = np.full(wave.shape, float(fwhm))
+        beta_use = float(beta)
+
+    a_fib = np.pi * (0.5 * fiber_diam_arcsec) ** 2
+    a_ann = np.pi * (edges[1:] ** 2 - edges[:-1] ** 2)
+    dlam = float(np.nanmedian(np.diff(wave)))
+
+    def _total(R_req):
+        k = int(np.argmin(np.abs(edges - R_req)))
+        k = max(k, 1)
+        fac = (a_ann[:k] / a_fib)[None, :, None]
+        f = np.sum(spec[:, :k, :] * fac, axis=1) * flux_unit_scale   # NaN-propagating
+        e = np.sqrt(np.sum((err[:, :k, :] * fac) ** 2, axis=1)) * flux_unit_scale
+        cog = _moffat_enclosed(edges[k], fwhm_lam, beta_use)
+        return edges[k], f / cog, e / cog, cog
+
+    # --- reference photometry ---
+    if ref is None:
+        if verbose:
+            print(f"querying PS1 DR2 (VizieR II/349/ps1) for {nobj} stars ...")
+        ref = _ps1_crossmatch(cat["RA"], cat["DEC"], match_radius=match_radius,
+                              neighbour_radius=neighbour_radius,
+                              neighbour_dmag=neighbour_dmag, verbose=verbose)
+    g_ps1 = np.asarray(ref["gmag"], float)
+    e_ps1 = np.asarray(ref["e_gmag"], float)
+    r_ps1 = np.asarray(ref["rmag"], float) if "rmag" in ref else np.full(nobj, np.nan)
+    nnb = (np.asarray(ref["n_bright_neighbour"], int)
+           if "n_bright_neighbour" in ref else np.zeros(nobj, int))
+    if g_ps1.size != nobj:
+        raise ValueError("ref is not aligned with the star catalog.")
+
+    if mag_col in cat.colnames:
+        mag = np.asarray(cat[mag_col], float); mag_name = mag_col
+    else:
+        mag = g_ps1; mag_name = "PS1 g"
+    field = (np.asarray(cat[field_col]).astype(str) if field_col in cat.colnames
+             else np.full(nobj, "all"))
+
+    # --- fiducial aperture ---
+    r_used, F, Fe, cog_fid = _total(r_ap)
+    m_syn, m_err, bad_frac, ext_frac = _synthetic_ps1_g(wave, F, Fe)
+    R = 10 ** (-0.4 * (m_syn - g_ps1))
+    R_err = R * 0.9210 * np.hypot(m_err, np.where(np.isfinite(e_ps1), e_ps1, 0.0))
+
+    # --- selection, with a reason for every rejection (first failing cut) ---
+    cuts = OrderedDict([
+        ("no PS1 g match", ~np.isfinite(g_ps1)),
+        (f"{mag_name} outside {mag_range}", ~((mag >= mag_range[0]) & (mag <= mag_range[1]))),
+        (f"PS1 neighbour < +{neighbour_dmag:g} mag within {neighbour_radius:g}\"", nnb > 0),
+        (f"> {max_bad_frac:.0%} of band missing inside {r_used:g}\"",
+         ~(bad_frac <= max_bad_frac)),
+        ("non-positive synthetic flux", ~np.isfinite(R)),
+    ])
+    sel = np.ones(nobj, bool); reasons = OrderedDict()
+    for name, fail in cuts.items():
+        reasons[name] = int(np.sum(sel & fail))
+        sel &= ~fail
+
+    rng = np.random.default_rng(seed)
+
+    def _med_boot(x):
+        x = x[np.isfinite(x)]
+        if x.size < 3:
+            return np.nan, np.nan
+        bs = np.median(rng.choice(x, size=(n_boot, x.size)), axis=1)
+        return float(np.median(x)), float(np.std(bs))
+
+    R_med, R_med_err = _med_boot(R[sel])
+    R_bw = float(biweight_location(R[sel])) if sel.sum() >= 3 else np.nan
+
+    R_by_ap = []
+    for Rq in r_ap_list:
+        ru, Fq, Feq, _ = _total(Rq)
+        mq, _, bq, _ = _synthetic_ps1_g(wave, Fq, Feq)
+        Rq_star = 10 ** (-0.4 * (mq - g_ps1))
+        ok = sel & (bq <= max_bad_frac)
+        med, me = _med_boot(Rq_star[ok])
+        R_by_ap.append({"r_ap": ru, "R_med": med, "R_med_err": me,
+                        "n": int(ok.sum()),
+                        "cog": float(np.nanmedian(_moffat_enclosed(ru, fwhm_lam, beta_use)))})
+
+    R_by_field = OrderedDict()
+    for fld in np.unique(field[sel]):
+        med, me = _med_boot(R[sel & (field == fld)])
+        R_by_field[fld] = {"R_med": med, "R_med_err": me,
+                           "n": int(np.sum(sel & (field == fld)))}
+
+    slope = (np.nan, np.nan)
+    ok = sel & np.isfinite(mag) & (R > 0)
+    if ok.sum() >= 5:
+        p, cov = np.polyfit(mag[ok] - np.median(mag[ok]), np.log10(R[ok]), 1, cov=True)
+        slope = (float(p[0]), float(np.sqrt(cov[0, 0])))
+    gr = g_ps1 - r_ps1
+
+    res = {"R": R, "R_err": R_err, "m_syn": m_syn, "g_ps1": g_ps1, "mag": mag,
+           "mag_name": mag_name, "gr": gr, "field": field, "sel": sel,
+           "reasons": reasons, "R_med": R_med, "R_med_err": R_med_err,
+           "R_biweight": R_bw, "R_by_aperture": R_by_ap,
+           "R_by_field": R_by_field, "slope_dlogR_dmag": slope,
+           "r_ap_used": r_used, "cog_fid": cog_fid, "beta": beta_use,
+           "band_extrap_frac": float(np.nanmedian(ext_frac)), "dlam": dlam,
+           "flux_unit_scale": flux_unit_scale, "ref": ref,
+           "fig": None, "axes": None}
+
+    if verbose:
+        _describe_flux_scale(res, nobj)
+    if plot:
+        res["fig"], res["axes"] = _plot_flux_scale(
+            res, figsize=figsize, tick_direction=tick_direction,
+            tick_right=tick_right, save_fig=save_fig)
+    return res
+
+
+def _describe_flux_scale(res, nobj):
+    print(f"flux-scale check  (flux_unit_scale = {res['flux_unit_scale']:g}, "
+          f"wavelength step = {res['dlam']:g} A)")
+    print(f"  aperture {res['r_ap_used']:g}\"  -> median CoG = "
+          f"{np.nanmedian(res['cog_fid']):.4f}  (beta = {res['beta']:.3f})")
+    print(f"  PS1 g band beyond last VIRUS pixel: {res['band_extrap_frac']:.2%} "
+          f"of photon weight (flat extrapolation)")
+    print(f"  stars: {nobj} in, {int(res['sel'].sum())} kept")
+    for k, v in res["reasons"].items():
+        if v:
+            print(f"     - {v:4d}  {k}")
+    print(f"  R = F_VDFI / F_PS1 :  median {res['R_med']:.3f} +/- "
+          f"{res['R_med_err']:.3f}   (biweight {res['R_biweight']:.3f})")
+    if np.isfinite(res["R_med"]):
+        l2 = np.log2(res["R_med"])
+        near = "1  (per A: pipeline scale is right)" if abs(l2) < abs(l2 - 1)             else "2  (per 2-A pixel: flux_unit_scale should be 0.5e-17)"
+        print(f"  -> closer to {near}")
+    print("  by aperture   : " + "   ".join(
+        f"{d['r_ap']:g}\": {d['R_med']:.3f}+/-{d['R_med_err']:.3f}"
+        for d in res["R_by_aperture"]))
+    print("  by field      : " + "   ".join(
+        f"{k}: {v['R_med']:.3f}+/-{v['R_med_err']:.3f} (N={v['n']})"
+        for k, v in res["R_by_field"].items()))
+    s, se = res["slope_dlogR_dmag"]
+    print(f"  linearity     : dlog10(R)/d({res['mag_name']}) = {s:+.4f} +/- {se:.4f}"
+          " per mag  (0 = linear)")
+
+
+def _plot_flux_scale(res, figsize, tick_direction, tick_right, save_fig):
+    from .formatting import apply_tick_style
+
+    sel = res["sel"]; R = res["R"]
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    (a0, a1), (a2, a3) = axes
+
+    lr = np.log2(R[sel & (R > 0)])
+    if lr.size:
+        lo, hi = min(-0.6, np.nanmin(lr)), max(1.6, np.nanmax(lr))
+        a0.hist(lr, bins=np.linspace(lo, hi, 30), color="0.55", edgecolor="k", lw=0.5)
+    for x, lab, c in ((0, "per Å", "tab:blue"), (1, "per 2 Å", "tab:red")):
+        a0.axvline(x, color=c, ls="--", lw=1.4, label=lab)
+    if np.isfinite(res["R_med"]):
+        a0.axvline(np.log2(res["R_med"]), color="k", lw=1.6, label="median")
+    a0.set_xlabel(r"$\log_2 R$"); a0.set_ylabel("N stars")
+    a0.legend(frameon=False, fontsize=9)
+
+    fields = list(res["R_by_field"].keys())
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for j, fld in enumerate(fields):
+        m = sel & (res["field"] == fld)
+        kw = dict(fmt="o", ms=3.5, lw=0.6, alpha=0.8, color=colors[j % len(colors)],
+                  label=f"{fld} (N={m.sum()})")
+        a1.errorbar(res["mag"][m], R[m], yerr=res["R_err"][m], **kw)
+        a2.errorbar(res["gr"][m], R[m], yerr=res["R_err"][m], **kw)
+    for ax, xl in ((a1, res["mag_name"]), (a2, "PS1 g - r")):
+        ax.axhline(1, color="tab:blue", ls="--", lw=1.2)
+        ax.axhline(2, color="tab:red", ls="--", lw=1.2)
+        ax.set_xlabel(xl); ax.set_ylabel(r"$R = F_{\rm VDFI}/F_{\rm PS1}$")
+        ax.legend(frameon=False, fontsize=8)
+
+    ap = res["R_by_aperture"]
+    x = [d["r_ap"] for d in ap]
+    a3.errorbar(x, [d["R_med"] for d in ap], yerr=[d["R_med_err"] for d in ap],
+                fmt="ko-", ms=5, capsize=3, label="median R")
+    a3.axhline(1, color="tab:blue", ls="--", lw=1.2)
+    a3.axhline(2, color="tab:red", ls="--", lw=1.2)
+    a3.set_xlabel("aperture radius [arcsec]"); a3.set_ylabel("median R")
+    a3b = a3.twinx()
+    a3b.plot(x, [d["cog"] for d in ap], "s:", color="0.5", ms=4)
+    a3b.set_ylabel("aperture correction (CoG)", color="0.4")
+    a3.legend(frameon=False, fontsize=9, loc="upper left")
+
+    if tick_direction:
+        apply_tick_style([a0, a1, a2], direction=tick_direction, right=tick_right)
+        apply_tick_style(a3, direction=tick_direction, right=False)
+        a3b.tick_params(which="both", direction=tick_direction)
+    fig.tight_layout()
+    if save_fig:
+        fig.savefig(save_fig if isinstance(save_fig, str) else "flux_scale_check.png",
+                    dpi=150, bbox_inches="tight")
+    return fig, axes
 
 
 # =====================================================================

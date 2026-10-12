@@ -139,6 +139,142 @@ def load_field(config: "PipelineConfig") -> dict:
     )
 
 
+# ---------------------------------------------------------------------
+# 1.0b  Barycentric correction  (opt-in: config.barycentric)
+# ---------------------------------------------------------------------
+# HET site (McDonald Observatory). Explicit numbers so no site-registry download.
+HET_LON_DEG, HET_LAT_DEG, HET_HEIGHT_M = -104.014722, 30.681444, 2026.0
+C_KMS = 299792.458
+
+
+def compute_barycentric_velocities(base_path, RA, DEC, ut_hour=5.0,
+                                   verify_order=True):
+    """
+    Barycentric velocity correction v_bc (km/s) for every exposure of a field.
+
+    Where the inputs come from (all_info.fits carries NO timestamps):
+      * The field directory holds one `YYYYMMDD_NNNNNNN.h5` per observation
+        (Remedy quick_reduction output), 3 dithered exposures each. Sorted
+        filenames are chronological, and exposure-axis row i of all_info /
+        all_flux_final is (file i // 3, dither i % 3).
+      * verify_order=True PROVES that mapping before using it: all_info HDU 3
+        is Remedy's per-exposure seeing, identical to the h5 Survey['fwhm']
+        column, so the two must agree row by row (exactly 0.0 for COSMOS).
+      * Time = night date (from the filename) + 1 day + `ut_hour` UT. HET
+        observes at fixed altitude, so the true time is within ~1.5 h of
+        transit; any time within the night moves v_bc by < 0.5 km/s, and the
+        3-dither set spans ~20 min (< 0.1 km/s).
+      * Pointing = mean fiber RA/DEC of the exposure (v_bc varies < 0.1 km/s
+        across the field).
+
+    astropy's SkyCoord.radial_velocity_correction does the physics: Earth's
+    orbital velocity about the barycenter (~30 km/s) + HET's rotational
+    velocity (~0.4 km/s), projected onto the line of sight. Sign: v_bc > 0
+    when HET moves TOWARD the target, and lambda_bary = lambda_obs*(1+v_bc/c).
+
+    Returns {'v_bc': (nexp,) km/s, 'obs_ids': (nexp,) str, 't_obs': Time}.
+    """
+    import glob
+    import h5py
+    from astropy.time import Time
+    from astropy.coordinates import EarthLocation
+
+    nexp = RA.shape[0]
+    h5s = sorted(glob.glob(os.path.join(str(base_path), "2*_*.h5")))
+    if len(h5s) * 3 != nexp:
+        raise ValueError(
+            f"barycentric: found {len(h5s)} observation h5 files in {base_path} "
+            f"but the field has {nexp} exposures (expected 3 per observation). "
+            "Cannot map exposures to observing nights.")
+
+    if verify_order:
+        hdu3 = np.asarray(fits.getdata(os.path.join(str(base_path), "all_info.fits"), 3),
+                          dtype=float)
+        fwhm = []
+        for fn in h5s:
+            with h5py.File(fn, "r") as f:
+                s = np.asarray(f["Survey"]["fwhm"][:], dtype=float)
+            if s.size != 3:
+                raise ValueError(f"barycentric: {os.path.basename(fn)} has {s.size} "
+                                 "exposures in Survey, expected 3.")
+            fwhm.extend(s)
+        dev = np.nanmax(np.abs(hdu3 - np.asarray(fwhm)))
+        if not np.isfinite(dev) or dev > 1e-4:
+            raise ValueError(
+                f"barycentric: exposure order check FAILED (max |all_info HDU3 - "
+                f"h5 Survey fwhm| = {dev:.3g}). Sorted h5 files do not match the "
+                "exposure axis; refusing to assign nights.")
+
+    stems = [os.path.basename(fn)[:16] for fn in h5s]          # YYYYMMDD_NNNNNNN
+    nights = [s[:8] for s in stems]
+    t_night = Time([f"{d[:4]}-{d[4:6]}-{d[6:]}T00:00:00" for d in nights], scale="utc")
+    t_night = t_night + (1.0 + float(ut_hour) / 24.0) * u.day
+    t_obs = Time(np.repeat(t_night.jd, 3), format="jd", scale="utc")
+    obs_ids = np.repeat(np.array(stems), 3)
+
+    het = EarthLocation.from_geodetic(lon=HET_LON_DEG * u.deg, lat=HET_LAT_DEG * u.deg,
+                                      height=HET_HEIGHT_M * u.m)
+    coords = SkyCoord(np.nanmean(RA, axis=1) * u.deg, np.nanmean(DEC, axis=1) * u.deg)
+    v_bc = coords.radial_velocity_correction(
+        "barycentric", obstime=t_obs, location=het).to_value(u.km / u.s)
+    return {"v_bc": np.asarray(v_bc, dtype=float), "obs_ids": obs_ids, "t_obs": t_obs}
+
+
+def barycentric_resample_weights(wave, v_bc):
+    """
+    Per-exposure linear-interpolation weights that move a spectrum from the
+    observed frame onto the barycentric frame, ON THE SAME wavelength grid.
+
+    The barycentric spectrum at grid point wave[j] is the observed spectrum at
+    wave[j] / (1 + v/c). That position falls between pixels j0 and j0+1 at
+    fraction alpha:  f_bary[j] = (1-alpha) f[j0] + alpha f[j0+1].
+    Every fiber of one exposure shares (j0, alpha), so this is computed nexp
+    times, not once per fiber. |v| <= 30 km/s is a shift of <= ~0.27 pixel on
+    the 2 A VIRUS grid (alpha near 0 for v < 0, near 1 for v > 0). Positions
+    that fall off the grid end are flagged invalid.
+
+    Returns j0 (nexp, nwave) int32, alpha (nexp, nwave) float32,
+            valid (nexp, nwave) bool.
+    """
+    wave = np.asarray(wave, dtype=float)
+    v_bc = np.atleast_1d(np.asarray(v_bc, dtype=float))
+    nexp, nwave = v_bc.size, wave.size
+    pix = np.arange(nwave, dtype=float)
+    j0 = np.zeros((nexp, nwave), dtype=np.int32)
+    alpha = np.zeros((nexp, nwave), dtype=np.float32)
+    valid = np.zeros((nexp, nwave), dtype=bool)
+    for e in range(nexp):
+        x = np.interp(wave / (1.0 + v_bc[e] / C_KMS), wave, pix,
+                      left=np.nan, right=np.nan)
+        ok = np.isfinite(x)
+        jj = np.zeros(nwave, dtype=np.int64)
+        jj[ok] = np.minimum(np.floor(x[ok]).astype(np.int64), nwave - 2)
+        j0[e] = jj
+        alpha[e, ok] = (x[ok] - jj[ok]).astype(np.float32)
+        valid[e] = ok
+    return j0, alpha, valid
+
+
+def apply_barycentric_shift(block, j0, alpha, valid, is_error=False):
+    """
+    Apply one exposure's (j0, alpha, valid) to a (nfib, nwave) block.
+    Flux:  (1-a) f[j0] + a f[j0+1].
+    Error: sqrt(((1-a) e[j0])^2 + (a e[j0+1])^2)  (independent pixels).
+    alpha == 0 returns the j0 pixel exactly (no NaN leakage from j0+1).
+    Off-grid pixels -> NaN. Keeps float32 in, float32 out.
+    """
+    lo = block[:, j0]
+    hi = block[:, j0 + 1]
+    a = alpha[np.newaxis, :]
+    if is_error:
+        mix = np.sqrt(((1.0 - a) * lo) ** 2 + (a * hi) ** 2)
+    else:
+        mix = (1.0 - a) * lo + a * hi
+    out = np.where(a > 0, mix, lo)
+    out[:, ~valid] = np.nan
+    return out.astype(block.dtype, copy=False)
+
+
 def _detect_catalog_format(path) -> str:
     """'fits' for a .fits/.fit/.fz extension (case-insensitive), else 'ascii'."""
     suffix = os.path.splitext(str(path))[1].lower()
@@ -196,6 +332,12 @@ def _dispatch_single_mask_method(method: str, config: "PipelineConfig",
     field = config.normalized_field()
     RA, DEC = vdfi_data["RA"], vdfi_data["DEC"]
 
+    if method == "none":
+        # No fiber masking at all (Niemeyer-2022-style comparison runs). Every
+        # fiber is kept; continuum is removed downstream by the stack-level
+        # continuum subtraction in measure.integrated_line_flux.
+        return np.zeros(np.shape(RA), dtype=bool)
+
     if method == "segmap":
         seg_path = config.resolve_seg_mask_path()
         if seg_path is None:
@@ -223,7 +365,7 @@ def _dispatch_single_mask_method(method: str, config: "PipelineConfig",
         )
 
     raise ValueError(f"unknown mask_method component {method!r}; must be one of "
-                      "'segmap', 'image', 'spec_global', 'spec_local'")
+                      "'none', 'segmap', 'image', 'spec_global', 'spec_local'")
 
 
 def build_bad_fiber_mask(config: "PipelineConfig", vdfi_data: dict,
@@ -727,7 +869,9 @@ def _write_cache_manifest(run_cache_dir: str, config: "PipelineConfig") -> None:
                                             or config.store_bg_halves) else [])
                          + (["bg_halves", "bg_half_nfib"]
                             if config.store_bg_halves else [])
-                         + (["spec_nobg"] if config.store_spec_nobg else [])),
+                         + (["spec_nobg"] if config.store_spec_nobg else [])
+                         + (["vbc_mean"] if getattr(config, "barycentric", False)
+                            else [])),
             "bg_variants": [list(p) for p in config.resolved_bg_variants()],
             "knobs": config.extract_signature_dict(),
         }
@@ -901,6 +1045,41 @@ def extract_fibers(
     SPEC_NOBG = (np.full((ngal, nrad, nwave), np.nan)
                  if store_spec_nobg else None)
 
+    # ---- barycentric correction (opt-in; see config.barycentric) ----
+    # Precompute, once per call, the per-exposure resample weights. Applied in
+    # the gather loop below: AFTER the per-exposure background subtraction (sky
+    # and instrument residuals live in the telescope frame, as does the annulus
+    # background, so they subtract cleanly there) and BEFORE fibers from
+    # different nights are pooled. VBC_MEAN[gal, r] records the fiber-weighted
+    # mean v_bc of each bin -- the centroid shift the correction should produce,
+    # i.e. the prediction an on-vs-off comparison is checked against.
+    BARY = bool(getattr(config, "barycentric", False))
+    VBC_MEAN = None
+    if BARY:
+        if store_spec_nobg:
+            raise ValueError(
+                "barycentric=True is incompatible with store_spec_nobg=True: SPEC "
+                "is resampled to the barycentric frame but the re-added background "
+                "is in the telescope frame, so SPEC_NOBG = SPEC + bg would no "
+                "longer be exact.")
+        if getattr(config, "inject", None) is not None:
+            raise ValueError(
+                "barycentric=True is not supported on injection runs: the injector "
+                "writes sources in the telescope frame with no Earth motion, so the "
+                "correction would ADD a spurious per-exposure shift to them.")
+        v_bc = vdfi_data.get("v_bc")
+        if v_bc is None:
+            v_bc = compute_barycentric_velocities(
+                vdfi_data["base_path"], RA, DEC,
+                ut_hour=float(getattr(config, "barycentric_ut_hour", 5.0)))["v_bc"]
+        v_bc = np.asarray(v_bc, dtype=float)
+        if v_bc.shape != (nexp,):
+            raise ValueError(f"v_bc has shape {v_bc.shape}, expected ({nexp},)")
+        bary_j0, bary_alpha, bary_valid = barycentric_resample_weights(wave, v_bc)
+        VBC_MEAN = np.full((ngal, nrad), np.nan)
+        print(f"Barycentric correction ON: v_bc {v_bc.min():.1f} .. {v_bc.max():.1f} "
+              f"km/s (mean {v_bc.mean():.1f}) over {nexp} exposures")
+
     # Which arrays a cache entry for THIS config must contain. Checked on every
     # cache hit: a hit that predates one of these products is recomputed rather
     # than loaded, so turning a product on can never leave a silent NaN row in
@@ -914,6 +1093,8 @@ def extract_fibers(
         _cache_keys += ["bg_halves", "bg_half_nfib"]
     if store_spec_nobg:
         _cache_keys += ["spec_nobg"]
+    if BARY:
+        _cache_keys += ["vbc_mean"]
     _stale_cache_warned = False
 
     # One directory per signature: cache/<sig>/gal_<i>.npz. The old layout put
@@ -983,6 +1164,8 @@ def extract_fibers(
                     BG_HALF_NFIB[cnt] = g["bg_half_nfib"]
                 if SPEC_NOBG is not None:
                     SPEC_NOBG[cnt] = g["spec_nobg"]
+                if VBC_MEAN is not None:
+                    VBC_MEAN[cnt] = g["vbc_mean"]
                 continue
             if not _stale_cache_warned:
                 missing = [k for k in _cache_keys if k not in g.files]
@@ -1121,11 +1304,18 @@ def extract_fibers(
         # fiber count per bin, in one pass over the (in-RAM) index array -- no
         # fiber-data reads, so this is essentially free and gives the exact
         # pool size to preallocate.
+        vbc_sum = np.zeros(nrad) if VBC_MEAN is not None else None
         for e in range(nexp):
             v = bin_idx_all[e]
             v = v[v >= 0]
             if v.size:
-                NFIB[cnt] += np.bincount(v, minlength=nrad).astype(np.int32)
+                counts_e = np.bincount(v, minlength=nrad)
+                NFIB[cnt] += counts_e.astype(np.int32)
+                if vbc_sum is not None:
+                    vbc_sum += counts_e * v_bc[e]
+        if vbc_sum is not None:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                VBC_MEAN[cnt] = np.where(NFIB[cnt] > 0, vbc_sum / NFIB[cnt], np.nan)
 
         # ---- 3. gather + combine ONE BIN AT A TIME ----
         # Each bin's pool is preallocated to its exact size (no list+concatenate
@@ -1146,12 +1336,22 @@ def extract_fibers(
                 if k == 0:
                     continue
                 # float32 - float32 stays float32 (bg_per_exp is float32)
-                pool_spec[off:off + k] = spectra[e, sel] - bg_per_exp[e][np.newaxis, :]
+                d = spectra[e, sel] - bg_per_exp[e][np.newaxis, :]
+                if BARY:
+                    # background removed in the telescope frame; now move this
+                    # exposure's fibers to the barycentric frame before pooling
+                    d = apply_barycentric_shift(d, bary_j0[e], bary_alpha[e],
+                                                bary_valid[e])
+                pool_spec[off:off + k] = d
                 if needs_err:
-                    pool_err[off:off + k] = np.sqrt(
+                    de = np.sqrt(
                         error[e, sel].astype(np.float32) ** 2
                         + bg_err_per_exp[e][np.newaxis, :] ** 2
                     )
+                    if BARY:
+                        de = apply_barycentric_shift(de, bary_j0[e], bary_alpha[e],
+                                                     bary_valid[e], is_error=True)
+                    pool_err[off:off + k] = de
                 off += k
 
             if use_fast:
@@ -1198,6 +1398,8 @@ def extract_fibers(
                 extra_arrays["bg_half_nfib"] = BG_HALF_NFIB[cnt]
             if SPEC_NOBG is not None:
                 extra_arrays["spec_nobg"] = SPEC_NOBG[cnt]
+            if VBC_MEAN is not None:
+                extra_arrays["vbc_mean"] = VBC_MEAN[cnt]
             _save_cache_atomic(cache_path, spec=Spec[cnt], err=Err[cnt],
                                nfib=NFIB[cnt], bg=Background[cnt], vr=VR[cnt],
                                **extra_arrays)
@@ -1215,6 +1417,8 @@ def extract_fibers(
         extras["bg_half_nfib"] = BG_HALF_NFIB
     if SPEC_NOBG is not None:
         extras["spec_nobg"] = SPEC_NOBG
+    if VBC_MEAN is not None:
+        extras["vbc_mean"] = VBC_MEAN
     return Spec, Err, NFIB, Background, VR, extras
 
 

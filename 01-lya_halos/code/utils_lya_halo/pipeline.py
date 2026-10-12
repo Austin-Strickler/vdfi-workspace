@@ -24,9 +24,31 @@ from .io import write_galaxy_fits, read_galaxy_fits, load_for_stack, apply_finit
 
 
 def run_extract(config: PipelineConfig, table=None, use_cache: bool = True,
-                descriptive_name: bool = True, write: bool = True):
+                descriptive_name: bool = True, write: bool = True,
+                inject: dict | None = None):
     """
     Stage 1 -- EXTRACT. Returns the path to the written galaxy FITS.
+
+    `inject` turns this into an injection-recovery pass
+    (specs/injection-recovery.md). It is a dict:
+
+        inject = {"model": <SourceModel>,       # required
+                  "zero_base": False,           # ladder levels 2-4 zero cube
+                  "seeing_mode": "field",       # "field" for every ladder rung
+                  "placement_seed": -1}         # recorded, for the manifest
+
+    and `table` is then the INJECTION TABLE -- the run table IS the injection
+    catalog (spec sec 1.1), so one table serves both roles. See spec sec 1.6
+    for its schema; injection.validate_inj_table checks it.
+
+    **Injection has to happen here rather than in the notebook**, because the
+    ordering is load -> run table -> MASK (on clean data, spec sec 1.4) ->
+    inject -> extract, and a notebook that assembles that by hand can silently
+    get it wrong by re-running one cell. It also means the galaxy FITS is
+    actually written, with the injected signature in its name and INJECT=True
+    in its header -- calling extract_fibers directly produces arrays in memory
+    and no file, which is a real trap because everything downstream reads a
+    file.
 
     `table` optionally passes an already-cut catalog (e.g. your z<2.75 cut)
     straight through to build_run_table for manual/stage-by-stage runs.
@@ -48,7 +70,34 @@ def run_extract(config: PipelineConfig, table=None, use_cache: bool = True,
 
     vdfi_data = extract.load_field(config)
     run_table = extract.build_run_table(config, table=table)
+
+    # THE MASK IS BUILT BEFORE INJECTION, ALWAYS (spec sec 1.4).
+    # build_bad_fiber_mask with a spec_global/spec_local component consumes the
+    # WHOLE cube, so on injected data the fake sources would enter the
+    # percentile statistics that define the mask and change it for the REAL
+    # fibers too -- a global perturbation from a local addition.
     bad_fiber_mask = extract.build_bad_fiber_mask(config, vdfi_data, run_table=run_table)
+
+    if inject is not None:
+        from . import injection
+        if "model" not in inject:
+            raise ValueError("inject must carry a 'model' (a SourceModel)")
+        if table is None:
+            raise ValueError(
+                "an injected run needs table=<inj_table>: the run table IS the "
+                "injection catalog (spec sec 1.1), so reading the real "
+                "science catalog off disk would inject at real galaxy "
+                "positions, which is not what any family in the plan is.")
+        # inject_sources returns the config to USE -- it carries the injection
+        # metadata that makes extract_signature() differ from the fiducial one.
+        # Rebinding `config` here is what guarantees the cache directory, the
+        # output filename and the FITS header all agree (spec sec 7.5).
+        config, vdfi_data = injection.inject_sources(
+            config, vdfi_data, run_table, bad_fiber_mask, inject["model"],
+            zero_base=inject.get("zero_base", False),
+            seeing_mode=inject.get("seeing_mode", "field"),
+            placement_seed=inject.get("placement_seed", -1),
+        )
 
     # return_extras=True always: the dict is empty unless this config asked for
     # background-variant products, so there is nothing to gate on and one code

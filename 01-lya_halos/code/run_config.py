@@ -25,8 +25,8 @@ cfg = PipelineConfig(
                                           #   catalog_path's extension (.fits/.fit/.fz -> fits, else
                                           #   ascii); set explicitly only if the extension is misleading
     cont_image_path = "auto",             # LEGACY (mask_method='image' only) -- kept for A/B
-                                          # "../../../../Hobby-Eberly-Telesco/imaging/candles_egs/groth/groth.fits",
-                                          #   COSMOS: "../../../../HETDEX-Work/vdfi/cosmos/CFHT_COSMOS_image.fits"
+                                          #   "auto" -> catalogs/images/groth.fits (AEGIS) /
+                                          #   catalogs/images/cosmos.fits (COSMOS), same folder as the fibermasks
     seg_mask_path   = "auto",             # REQUIRED when mask_method='segmap'. "auto" -> the per-field
                                           #   baked mask resolved in config.resolve_seg_mask_path()
                                           #   (set the two paths there). Or give an explicit path:

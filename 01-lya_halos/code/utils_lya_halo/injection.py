@@ -169,6 +169,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.special import erf
+from scipy.spatial import Delaunay, cKDTree
 
 # Shared DEFINITIONS only -- see the module docstring on what may be shared.
 from .fitting import intrinsic_profile_expcore
@@ -192,6 +193,64 @@ C_KMS = 299792.458
 # which was correct but undocumented; it now has a derivation attached.
 LSF_SIGMA_KMS = 200.0
 
+
+# --- THE WAVELENGTH FRAME OF THE DATA -----------------------------------
+# VIRUS's observed axis (vdfi['wave'], 3470-5540 A) is AIR. HETDEX's public
+# data release says so and star_lines.py's Gaia-anchored stellar test measured
+# it directly (Austin, 2026-07-30). config.LYA_REST = 1215.67 is VACUUM, which
+# is the only valid convention for a rest-UV line -- air is not even defined
+# below ~2000 A.
+#
+# So the observed wavelength a real Lya line lands at is NOT lya_rest*(1+z):
+# that is the VACUUM prediction, and the axis it is being compared against is
+# air. The difference is ~1.16 A at z = 2.4, i.e. **~85 km/s**.
+#
+# WHY THE INJECTOR MUST CARE (found at ladder level 2, 2026-08-17).
+# The injector writes onto the raw air axis; Stage 2 (stack.stack_spec_values)
+# then does air_to_vac(wave) / (1+z) before anything is measured. Writing the
+# line at lya_rest*(1+z) therefore emits it ~85 km/s redward of where a real
+# source at that redshift would be, and the whole chain faithfully recovers
+# the +85 -- the FIRST level-2 run came back at +73 km/s in every radial bin
+# where 0 was injected.
+#
+# That is not a tolerable known offset. Spec sec 4.3 extracts the additive
+# velocity bias `b` from family H's core dv = 0, and criterion 2 reads a
+# nonzero `b` as the absolute zero point surviving the air->vacuum fix. An
+# injector with its own frame error makes `b` measure ME instead of the
+# pipeline, which kills criterion 2 outright.
+#
+# ONE definition, used by every injection-side site that touches the RAW
+# observed axis -- the injector, the centroid estimator, and the pixel-scale
+# report. Anything working on the pipeline's REST grid (which is already
+# vacuum) keeps using LYA_REST directly. Same discipline as the LSF: set in
+# one place, because the two-places version survived a week undetected.
+DATA_WAVELENGTHS_ARE_AIR = True
+
+
+def observed_lya_wavelength(z, lya_rest=None):
+    """Observed wavelength of Lya at redshift z, IN THE DATA'S OWN FRAME.
+
+    Returns the AIR wavelength (what vdfi['wave'] is labelled in), so a line
+    written here is found by the production chain at exactly dv = 0 after its
+    air_to_vac + rest-framing. Set DATA_WAVELENGTHS_ARE_AIR = False if the
+    fiber data is ever re-reduced onto a vacuum axis, and every call site
+    follows.
+
+    Uses specutils' vac_to_air -- the exact inverse of the air_to_vac that
+    stack.stack_spec_values applies -- rather than a second formula. A
+    hand-rolled Edlen/Ciddor here would be a SECOND convention in the
+    codebase, and the entire point of this module is that two implementations
+    of the same quantity are for CHECKING each other, never for quietly
+    disagreeing.
+    """
+    lya_rest = LYA_REST if lya_rest is None else float(lya_rest)
+    lam_vac = lya_rest * (1.0 + float(z))
+    if not DATA_WAVELENGTHS_ARE_AIR:
+        return lam_vac
+    from specutils.utils.wcs_utils import vac_to_air
+    import astropy.units as _u
+    return float(vac_to_air(lam_vac * _u.AA).to(_u.AA).value)
+
 __all__ = [
     "fiber_response_hybrid", "PSF_GRID_VALID_ARCSEC", "LSF_SIGMA_KMS",
     "VelocityField", "ConstantVelocity", "StepVelocity", "apply_lsf",
@@ -202,6 +261,9 @@ __all__ = [
     "predict_binned_observables",
     "check_level0", "check_level1",
     "check_background_annulus_negligible", "shot_noise_ratio",
+    "DATA_WAVELENGTHS_ARE_AIR", "observed_lya_wavelength",
+    "InjectedSpectra", "check_overlay_identity",
+    "inject_sources", "validate_inj_table", "INJ_REQUIRED_COLS",
 ]
 
 
@@ -275,6 +337,117 @@ class StepVelocity(VelocityField):
     def __repr__(self):
         return (f"StepVelocity({self.dv_in:+.1f} -> {self.dv_out:+.1f} km/s "
                 f"at {self.r_break:.0f} kpc)")
+
+
+class RampVelocity(VelocityField):
+    """Family G: dv_in at small r, ramping to dv_out by r_out, flat outside.
+
+    Added 2026-08-20 for the STEP-RESPONSE DECONVOLUTION run. StepVelocity
+    answers "would a transition at 200 kpc have been seen?"; this answers the
+    different question the real data poses -- "the measured core gradient is
+    +196 -> +67 over 0-24 kpc, is the INTRINSIC gradient steeper than that?"
+
+    It has to be a separate field rather than a StepVelocity with a small
+    r_break because the two effects that dilute a core gradient (PSF blending
+    across the gradient, and flux-weighting inside a wide bin) both act on the
+    LOCAL SLOPE, which a step does not have. You cannot infer the response to
+    a ramp from the response to a step without assuming linearity of the
+    binning+PSF operator, and the whole point of the exercise is to measure
+    that operator, not assume it.
+
+    shape:
+      "log"    dv linear in log10(r) between r_in and r_out. THE DEFAULT, and
+               the right one for this target: the measured real curve is very
+               close to linear in log r (bin centres 5/13/20/30 kpc read
+               196/132/67/45, i.e. -194 km/s per dex, extrapolating to ~+330
+               at 1 kpc and crossing zero near 50 kpc), and the bins are
+               log-spaced so a log-linear ramp is resolved evenly across them.
+      "linear" dv linear in r. Kept because a physical outflow decelerating
+               with radius is closer to this, and the pair of shapes brackets
+               the systematic from the assumed form.
+
+    r_in must be > 0 for shape="log". dv is CLAMPED outside [r_in, r_out] --
+    dv_in inside, dv_out outside -- so the field is bounded everywhere and
+    r=0 is well defined. That flat inner core is deliberate: below ~1 kpc the
+    seeing (1.3-2.0 arcsec = 11-16 kpc) means nothing is resolved anyway, and
+    an unbounded log ramp would put arbitrary velocity on the r->0 shells that
+    build_source_template integrates over.
+    """
+
+    def __init__(self, dv_in=300.0, dv_out=0.0, r_in=1.0, r_out=100.0,
+                 shape="log", n_steps=8):
+        if shape not in ("log", "linear"):
+            raise ValueError("shape must be 'log' or 'linear'")
+        if r_out <= r_in:
+            raise ValueError("r_out must exceed r_in")
+        if shape == "log" and r_in <= 0:
+            raise ValueError("r_in must be > 0 for shape='log'")
+        if n_steps is not None and int(n_steps) < 2:
+            raise ValueError("n_steps must be >= 2, or None for continuous")
+        self.dv_in = float(dv_in)
+        self.dv_out = float(dv_out)
+        self.r_in = float(r_in)
+        self.r_out = float(r_out)
+        self.shape = shape
+        self.n_steps = None if n_steps is None else int(n_steps)
+
+    def __call__(self, r):
+        r = np.asarray(r, dtype=float)
+        if self.shape == "log":
+            x = ((np.log10(np.clip(r, self.r_in, self.r_out))
+                  - np.log10(self.r_in))
+                 / (np.log10(self.r_out) - np.log10(self.r_in)))
+        else:
+            x = ((np.clip(r, self.r_in, self.r_out) - self.r_in)
+                 / (self.r_out - self.r_in))
+        if self.n_steps is not None:
+            x = np.round(x * (self.n_steps - 1)) / (self.n_steps - 1)
+        return self.dv_in + (self.dv_out - self.dv_in) * x
+
+    def __repr__(self):
+        st = "continuous" if self.n_steps is None else f"{self.n_steps} steps"
+        return (f"RampVelocity({self.dv_in:+.1f} -> {self.dv_out:+.1f} km/s, "
+                f"{self.r_in:g}-{self.r_out:g} kpc, {self.shape}, {st})")
+
+
+class BinnedVelocity(VelocityField):
+    """dv constant within each radial bin. The natural basis for the INVERSE
+    problem: the pipeline reports one velocity per bin, so parameterising the
+    intrinsic field on the same edges makes "what is the intrinsic dv in bin
+    i" a question with exactly as many unknowns as there are measurements.
+
+    Also the CHEAP one. `build_source_template` loops over
+    `np.unique(shell_dv)`, so cost is set by the number of DISTINCT shell
+    velocities, not by the number of shells -- see the guard there. A binned
+    field on the 11 production edges costs 11 groups; a continuous field on a
+    0.25" shell grid costs one group per shell.
+
+    edges_kpc : (n+1,) bin edges. dv_kpc : (n,) velocity in each bin.
+    Outside the last edge dv is `dv_out` (default: the last bin's value).
+    """
+
+    def __init__(self, edges_kpc, dv, dv_out=None):
+        self.edges = np.asarray(edges_kpc, dtype=float)
+        self.dv = np.asarray(dv, dtype=float)
+        if self.dv.size != self.edges.size - 1:
+            raise ValueError(f"dv has {self.dv.size} values but edges_kpc "
+                             f"defines {self.edges.size - 1} bins")
+        if np.any(np.diff(self.edges) <= 0):
+            raise ValueError("edges_kpc must be strictly increasing")
+        self.dv_out = float(self.dv[-1] if dv_out is None else dv_out)
+
+    def __call__(self, r):
+        r = np.asarray(r, dtype=float)
+        i = np.searchsorted(self.edges, r, side="right") - 1
+        out = np.full(r.shape, self.dv_out, dtype=float)
+        inside = (i >= 0) & (i < self.dv.size)
+        out[inside] = self.dv[i[inside]]
+        return out
+
+    def __repr__(self):
+        return (f"BinnedVelocity({self.dv.size} bins, "
+                f"{self.dv.min():+.0f}..{self.dv.max():+.0f} km/s, "
+                f"outside {self.dv_out:+.0f})")
 
 
 DEFAULT_R_TRUNC_KPC = 2000.0        # the outermost production bin edge
@@ -652,6 +825,41 @@ def family_H(L=1.0, h1=17.0, A2_over_A1=0.02, r_c=400.0, gamma=0.8,
                        label="H")
 
 
+def family_G(L=1.0, h1=17.0, A2_over_A1=0.02, r_c=400.0, gamma=0.8,
+             sigma_kms=250.0, alpha=0.0, lsf_kms=LSF_SIGMA_KMS,
+             dv_in=300.0, dv_out=0.0, r_in=1.0, r_out=100.0, shape="log",
+             n_steps=8, velocity=None):
+    """Family G -- same expcore spatial profile as H, but a CORE GRADIENT.
+
+    Added 2026-08-20. Not a fourth acceptance-test family: G is the forward
+    model used to DECONVOLVE the real core gradient. The loop is
+
+        guess an intrinsic dv(r) -> inject -> extract -> compare the recovered
+        table against the REAL table -> adjust the guess
+
+    and the answer is the dv(r) whose recovered table matches. Comparing
+    against `predict_binned_observables` still checks the pipeline; comparing
+    against the REAL run is what estimates the intrinsic profile.
+
+    `velocity=` overrides the ramp entirely -- pass a `BinnedVelocity` to
+    parameterise the intrinsic field on radial bins instead, which is both
+    cheaper (cost is set by the number of DISTINCT shell velocities) and the
+    natural basis for the inverse problem.
+
+    It doubles as the strongest outer null available: with dv_out = 0 and
+    r_out = 100 kpc, EIGHT bins (100-180 outward) have truth exactly 0, so a
+    single extraction gives both the gradient response and an 8-bin null with
+    known truth -- versus the two H bins that carried the null before.
+    """
+    return SourceModel(L=L, profile="expcore", h1=h1, A2_over_A1=A2_over_A1,
+                       r_c=r_c, gamma=gamma, sigma_kms=sigma_kms, alpha=alpha,
+                       lsf_kms=lsf_kms,
+                       velocity=(velocity if velocity is not None else
+                                 RampVelocity(dv_in, dv_out, r_in, r_out,
+                                              shape=shape, n_steps=n_steps)),
+                       label="G")
+
+
 # =====================================================================
 # 2.  FIBER RESPONSE -- two implementations, deliberately
 # =====================================================================
@@ -936,7 +1144,8 @@ def _radius_interp_grid(r_lo, r_hi, seeing_fwhm, n=400, extra=()):
 def build_source_template(model, z, dra, ddec, seeing_fwhm, wave,
                           kpc_per_arcsec, grid_max_arcsec=None,
                           grid_step_arcsec=0.25, response=None,
-                          n_r_interp=400, dtype=np.float32):
+                          n_r_interp=400, dtype=np.float32,
+                          max_dv_groups=16):
     """Flux to ADD to each fiber, for one exposure: (nfib, nwave).
 
     This is the injector. It answers "how much of this source's flux lands
@@ -992,7 +1201,12 @@ def build_source_template(model, z, dra, ddec, seeing_fwhm, wave,
     nfib = dra.shape[0]
 
     r_fib = np.sqrt(dra ** 2 + ddec ** 2)          # (nfib, nwave), arcsec
-    v_grid = C_KMS * (wave - LYA_REST * (1.0 + z)) / (LYA_REST * (1.0 + z))
+    # The line goes where a REAL source at this z would land on this axis --
+    # the AIR wavelength, not the vacuum prediction. See
+    # observed_lya_wavelength; getting this wrong emits every source ~85
+    # km/s redward and poisons the additive-bias term (spec criterion 2).
+    lam0_obs = observed_lya_wavelength(z)
+    v_grid = C_KMS * (wave - lam0_obs) / lam0_obs
 
     if response is None:
         response = fiber_response_hybrid   # see its docstring on the 6.25" edge
@@ -1060,6 +1274,35 @@ def build_source_template(model, z, dra, ddec, seeing_fwhm, wave,
     ])
     shell_dv = model.velocity(s_kpc)
 
+    # COST GUARD -- added 2026-08-20 after a continuous RampVelocity turned a
+    # 0.74 s/exp source into 7.15 s/exp and an ETA of 21 hours.
+    #
+    # The accumulation loop below runs once per DISTINCT shell velocity, and
+    # every iteration pays a full np.interp over (nfib, nwave) plus an
+    # (nfib, nwave) multiply-accumulate. That design is correct and fast for
+    # ConstantVelocity (1 group) and StepVelocity (2 groups). A CONTINUOUS
+    # dv(r) gives every shell its own velocity: at the 0.25" default step a
+    # ramp out to 100 kpc (12.2" at z=2.4) is ~50 groups, i.e. 25x the work
+    # AND 25x the large temporaries per exposure -- which is what turns a
+    # linear slowdown into an apparently exponential one once the allocator
+    # starts thrashing.
+    #
+    # Failing loudly beats discovering it from a moving ETA. Use
+    # RampVelocity(n_steps=...) or BinnedVelocity to quantize the field, or
+    # raise max_dv_groups deliberately if a run really needs it.
+    n_groups = int(np.unique(shell_dv).size)
+    if n_groups > int(max_dv_groups):
+        raise ValueError(
+            f"velocity field yields {n_groups} distinct shell velocities "
+            f"(max_dv_groups={max_dv_groups}); the template loop costs one "
+            f"full (nfib, nwave) interpolation per DISTINCT velocity, so this "
+            f"run would be ~{n_groups / 2:.0f}x slower per exposure than a "
+            f"StepVelocity one.\n"
+            f"  fix: RampVelocity(..., n_steps=8) or BinnedVelocity(edges, dv)\n"
+            f"  or:  build_source_template(..., max_dv_groups={n_groups}) to "
+            f"accept the cost."
+        )
+
     # For each fiber and each shell, the fraction of that shell's flux
     # entering the fiber = azimuthal average of V over the shell.
     #
@@ -1095,6 +1338,7 @@ def build_source_template(model, z, dra, ddec, seeing_fwhm, wave,
     return out
 
 
+_TRUTH_KERNEL_CACHE = {}   # predict_binned_observables' ring kernel
 _V_TAB_CACHE = {}       # (response, seeing, d_max, n_phi) -> (d_tab, V_tab)
 _KERNEL_CACHE = {}      # (response, seeing, grid bounds) -> K  (nr, nshell)
 
@@ -1109,6 +1353,7 @@ def clear_injection_caches():
     """
     _V_TAB_CACHE.clear()
     _KERNEL_CACHE.clear()
+    _TRUTH_KERNEL_CACHE.clear()
 
 
 def _separation_table(d_max, n_near=100, n_far=500,
@@ -1354,8 +1599,24 @@ def predict_binned_observables(model, z, bins_kpc, seeing_fwhm,
     shell_dv = model.velocity(s_kpc)
 
     # --- ring-spread: independent aperture response, in arcsec ---
-    K = _shell_to_fiber_kernel(r_obs / kpc_per_arcsec, s_kpc / kpc_per_arcsec,
-                               seeing_fwhm, fiber_response_independent)
+    # CACHED 2026-08-20. This is the same ~140M-interpolation ring kernel that
+    # build_source_template caches, and it was the ONLY uncached copy -- so
+    # every call to the truth generator rebuilt it from scratch. That is
+    # tolerable once and intolerable 11 times, which is exactly what building
+    # the response matrix for the deconvolution needs. The kernel depends only
+    # on the two radius grids, the seeing and the response, all of which are
+    # fixed across a basis sweep, so caching turns 11 slow calls into 1.
+    _t_key = (id(fiber_response_independent), round(float(seeing_fwhm), 4),
+              round(float(kpc_per_arcsec), 6),
+              (r_obs / kpc_per_arcsec).tobytes(),
+              (s_kpc / kpc_per_arcsec).tobytes())
+    K = _TRUTH_KERNEL_CACHE.get(_t_key)
+    if K is None:
+        K = _shell_to_fiber_kernel(r_obs / kpc_per_arcsec, s_kpc / kpc_per_arcsec,
+                                   seeing_fwhm, fiber_response_independent)
+        if len(_TRUTH_KERNEL_CACHE) > 4:      # each is large; keep a couple
+            _TRUTH_KERNEL_CACHE.clear()
+        _TRUTH_KERNEL_CACHE[_t_key] = K
 
     # --- velocity grid; every bin's line profile is built as a genuine
     #     superposition over the shells contributing to it ---
@@ -1597,7 +1858,8 @@ def centroid_from_spectrum(spec, wave, z, window_kms=1500.0):
     that pixel scale" concern in spec sec 5.5, and it is cheap to test.
     """
     wave = np.asarray(wave, dtype=float)
-    lam0 = LYA_REST * (1.0 + z)
+    # RAW observed axis -> the line's AIR position, matching the injector.
+    lam0 = observed_lya_wavelength(z)
     v = C_KMS * (wave - lam0) / lam0
     sel = np.isfinite(spec) & (np.abs(v) <= window_kms)
     if sel.sum() < 5:
@@ -1821,6 +2083,787 @@ def _pick_covered_position(RA, DEC, rng=None, r_inner_arcsec=4.0):
     return ra_i, dec_i, n_in
 
 
+def l_inj_for_luminosity(L_phys, z, line_is_velocity_density=True):
+    """`L_INJ` giving a source of Lya luminosity `L_phys` (erg/s) at redshift z.
+
+    Spec sec 2.4 asks for L to be bootstrapped alongside z, which only means
+    anything once L_INJ can be tied to a physical luminosity. This is that
+    tie, and it is the ONLY place the conversion should live.
+
+    Why it is needed even for a fixed-brightness test: `total_flux_fid` is a
+    LUMINOSITY surface density, so at fixed `L_INJ` a source at z = 2.5 reads
+    2.16x brighter than one at z = 2.0. A fixed-L_INJ sample drawn over
+    z = 2.0-2.5 is therefore inhomogeneous in luminosity by more than a
+    factor of two and its stack is dominated by the high-z end. Fixing the
+    PHYSICAL luminosity and deriving L_INJ per source is what makes every
+    injected source contribute equally, which in turn is what makes one
+    `predict_binned_observables` call at the mean z a valid stack truth.
+
+    line_is_velocity_density : the `c / lambda_obs` term, and the flag exists
+        because it corrects a REAL BUG rather than a convention choice.
+        `SourceModel.line_profile` has unit integral in VELOCITY (km/s), and
+        `build_source_template` multiplies it straight into a cube whose
+        values are a flux density per OBSERVED ANGSTROM. So the flux actually
+        injected is `lambda_obs / c` times L_INJ -- 72.5x smaller at z = 2.4,
+        and z-dependent, which is the part that matters: it puts a
+        REDSHIFT-DEPENDENT scale error into any family with a spread in z.
+
+        Traced 2026-08-19 by predicting `total_flux_fid / L_INJ` from first
+        principles: the measured constant goes as (1+z)^5 and a genuine
+        wavelength density would give (1+z)^4, with the closed form
+        5.719e35 * (1+z)^5 matching the data to 0.1% at z = 2.40.
+
+        Leave True while `build_source_template` is unfixed. Once it
+        multiplies its template by `C_KMS / lam0_obs`, set this False (or
+        change the default) and L_INJ becomes simply "total observed flux in
+        cube units", i.e. x1e-17 erg/s/cm^2.
+
+    Ladder levels 0-6 are unaffected by that bug either way -- every rung is
+    a shape, a velocity, or a comparison against the same generator, and a
+    constant scale on L cancels in all of them. What it breaks is criterion
+    1a (the sensitivity statement, which needs physical units) and the sec
+    2.4 luminosity bootstrap.
+    """
+    from astropy.cosmology import Planck18 as _cosmo
+    import astropy.units as _u
+    z = np.asarray(z, dtype=float)
+    DL = _cosmo.luminosity_distance(z).to(_u.cm).value
+    L = np.asarray(L_phys, dtype=float) / (4.0 * np.pi * DL ** 2) / 1e-17
+    if line_is_velocity_density:
+        L = L * C_KMS / (LYA_REST * (1.0 + z))
+    return L
+
+
+# =====================================================================
+#  2.3  Placement footprint -- the concave hull of the real catalog
+# =====================================================================
+
+class SourceFootprint:
+    """The sky region a real catalog actually covers -- an ALPHA SHAPE.
+
+    Spec sec 2.3, v8 (Austin, 2026-08-25). The old footprint was each field's
+    RA/Dec min-max box. That box is wrong in a way that matters: MOSDEF is a
+    SLIT-MASK survey, so its coverage is a union of a few rectangular mask
+    pointings with concave notches between them, and the bounding box
+    interpolates straight across every one of them. Randoms drawn in the box
+    land in sky MOSDEF never observed, which is precisely the failure the
+    randoms test exists to detect -- the null then measures the VDFI field's
+    mean rather than the mean under the real sample's selection.
+
+    THE CONSTRUCTION. Roll a probe circle of radius `alpha_arcsec` around the
+    outside of the point cloud. It pushes into any gap wider than 2*alpha, so
+    real notches in the survey edge get followed; it cannot enter a narrower
+    one, so the interior stays solid. Formally: Delaunay-triangulate the
+    positions and keep every triangle whose CIRCUMRADIUS is <= alpha. As
+    alpha -> infinity every triangle survives and the shape degenerates to the
+    convex hull, i.e. back to the big interpolating box; as alpha -> 0 the
+    shape evaporates. This is the one parameter, and it has an unambiguous
+    physical reading in arcsec.
+
+    THE BUFFER. The alpha shape's boundary passes exactly THROUGH the
+    outermost galaxies, so on its own it says MOSDEF observed no sky beyond
+    its most peripheral target -- false, and it truncates the outer annuli of
+    any random placed near the edge. `buffer_arcsec` fixes that by taking the
+    union with a disk of that radius around every source. The union is taken,
+    not a global dilation, so the buffer rounds the OUTSIDE without filling
+    the interior notches back in.
+
+    WHY NOT A UNION OF DISKS ALONE. Because then every random sits within
+    `buffer` of a real galaxy by construction, the random catalog inherits the
+    real sample's clustering, and sec 5.4's "far from any real source" slice --
+    which is how the `blank` placement mode gets answered for free -- is empty.
+    The alpha shape carries the geometry; the buffer only softens its edge.
+
+    Attributes
+    ----------
+    alpha_arcsec, buffer_arcsec : the two radii, in arcsec.
+    area_arcmin2 : Monte-Carlo area of the footprint (buffer included).
+    area_alpha_arcmin2 : the same with the buffer switched off. Reported
+                   alongside because the buffer hides what alpha is doing --
+                   at a small enough alpha the shape is falling apart while
+                   the buffered area barely moves.
+    fill_frac    : area / bounding-box area, i.e. the acceptance rate a
+                   rejection sampler drawing in `bbox` will see.
+    n_src        : number of finite catalog positions the shape was built on.
+    """
+
+    def __init__(self, ra, dec, *, alpha_arcsec, buffer_arcsec, tri, keep,
+                 tree, ra0, dec0, cs, area_arcmin2, fill_frac,
+                 area_alpha_arcmin2=np.nan):
+        self.ra = ra
+        self.dec = dec
+        self.alpha_arcsec = float(alpha_arcsec)
+        self.buffer_arcsec = float(buffer_arcsec)
+        self.area_arcmin2 = float(area_arcmin2)
+        self.area_alpha_arcmin2 = float(area_alpha_arcmin2)
+        self.fill_frac = float(fill_frac)
+        self.n_src = int(ra.size)
+        self._tri = tri
+        self._keep = keep
+        self._tree = tree
+        self._ra0 = float(ra0)
+        self._dec0 = float(dec0)
+        self._cs = float(cs)
+
+    # -- tangent-plane helpers ------------------------------------------
+    def _xy(self, ra, dec):
+        """(ra, dec) in degrees -> local tangent-plane arcsec about the centre."""
+        ra = np.asarray(ra, dtype=float)
+        dec = np.asarray(dec, dtype=float)
+        x = (ra - self._ra0) * self._cs * 3600.0
+        y = (dec - self._dec0) * 3600.0
+        return x, y
+
+    @property
+    def bbox(self):
+        """(ra_lo, ra_hi, dec_lo, dec_hi) in degrees, buffer included.
+
+        The rectangle a rejection sampler should draw in. Buffer is added in
+        arcsec on both axes, with the RA one divided by cos(dec) so it is a
+        true angular margin rather than a coordinate one.
+        """
+        pad_dec = self.buffer_arcsec / 3600.0
+        pad_ra = pad_dec / self._cs
+        return (float(self.ra.min()) - pad_ra, float(self.ra.max()) + pad_ra,
+                float(self.dec.min()) - pad_dec, float(self.dec.max()) + pad_dec)
+
+    def contains(self, ra, dec):
+        """Boolean mask: is each (ra, dec) inside the footprint?
+
+        Vectorised, and the only membership test anything should use. Scalars
+        in give a 0-d array out, so `bool(fp.contains(r, d))` works.
+        """
+        x, y = self._xy(ra, dec)
+        p = np.column_stack([np.atleast_1d(x).ravel(),
+                             np.atleast_1d(y).ravel()])
+        inside = np.zeros(p.shape[0], dtype=bool)
+        s = self._tri.find_simplex(p)
+        ok = s >= 0
+        if ok.any():
+            inside[ok] = self._keep[s[ok]]
+        if self.buffer_arcsec > 0:
+            d, _ = self._tree.query(p)
+            inside |= (d <= self.buffer_arcsec)
+        return inside.reshape(np.shape(x))
+
+    def __repr__(self):
+        return (f"SourceFootprint(n_src={self.n_src}, "
+                f"alpha={self.alpha_arcsec:.1f}\", "
+                f"buffer={self.buffer_arcsec:.1f}\", "
+                f"area={self.area_arcmin2:.1f} arcmin^2, "
+                f"fill={self.fill_frac:.2f})")
+
+
+def _triangle_circumradii(pts):
+    """Circumradius of every triangle in `pts`, shape (nt, 3, 2). R = abc/4A.
+
+    Collinear triangles (A = 0) get inf, which the alpha filter then rejects --
+    the right answer, since a sliver's circumcircle is unbounded.
+    """
+    a = np.linalg.norm(pts[:, 0] - pts[:, 1], axis=1)
+    b = np.linalg.norm(pts[:, 1] - pts[:, 2], axis=1)
+    c = np.linalg.norm(pts[:, 2] - pts[:, 0], axis=1)
+    u = pts[:, 1] - pts[:, 0]
+    v = pts[:, 2] - pts[:, 0]
+    area = 0.5 * np.abs(u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        R = np.where(area > 0, a * b * c / (4.0 * np.maximum(area, 1e-300)),
+                     np.inf)
+    return R
+
+
+def build_source_footprint(ra, dec, *, alpha_arcsec=None, alpha_scale=3.0,
+                           buffer_arcsec=15.0, area_samples=200_000,
+                           area_seed=0, verbose=True):
+    """Spec sec 2.3. Alpha-shape footprint of a real catalog's positions.
+
+    Pass the RA/Dec of the REAL run table (`extract.build_run_table(cfg)`
+    sliced by `cfg.galaxy_slice()`) -- the same rows the real stack uses, so
+    the randoms inherit exactly that selection's geometry.
+
+    alpha_arcsec : probe radius. None (default) sets it to `alpha_scale` x the
+        MEDIAN NEAREST-NEIGHBOUR separation of the catalog, which is the only
+        scale the data itself supplies. 3x is loose enough that MOSDEF's own
+        sparse interior patches stay inside the footprint -- they were
+        observed, they just held few targets, and punching holes there would
+        make the randoms avoid the real sample's low-density regions. Sweep it
+        with `plot_source_footprint` before trusting the default on a new
+        catalog; it is a geometry choice and it should be eyeballed once.
+    buffer_arcsec : outward margin, unioned as a disk per source. 15" is ~4%
+        of the 2000 kpc (242") outer aperture -- enough that the boundary does
+        not slice through the outermost galaxies, small enough that it cannot
+        manufacture coverage.
+
+    Returns a `SourceFootprint`. See that class for what the shape is and why
+    it is not a bounding box.
+    """
+    ra = np.asarray(ra, dtype=float).ravel()
+    dec = np.asarray(dec, dtype=float).ravel()
+    ok = np.isfinite(ra) & np.isfinite(dec)
+    ra, dec = ra[ok], dec[ok]
+    if ra.size < 3:
+        raise ValueError(f"need at least 3 finite positions to build a "
+                         f"footprint, got {ra.size}")
+
+    ra0 = float(np.median(ra))
+    dec0 = float(np.median(dec))
+    cs = float(np.cos(np.radians(dec0)))
+    x = (ra - ra0) * cs * 3600.0
+    y = (dec - dec0) * 3600.0
+    pts = np.column_stack([x, y])
+
+    tree = cKDTree(pts)
+    nn = tree.query(pts, k=2)[0][:, 1]
+    nn_med = float(np.median(nn))
+    if alpha_arcsec is None:
+        alpha_arcsec = float(alpha_scale) * nn_med
+
+    tri = Delaunay(pts)
+    keep = _triangle_circumradii(pts[tri.simplices]) <= float(alpha_arcsec)
+    if not keep.any():
+        raise RuntimeError(
+            f"alpha = {alpha_arcsec:.1f}\" keeps no triangles (median "
+            f"nearest-neighbour separation is {nn_med:.1f}\"); the shape "
+            f"would be empty. Raise alpha_scale.")
+
+    fp = SourceFootprint(ra, dec, alpha_arcsec=alpha_arcsec,
+                         buffer_arcsec=buffer_arcsec, tri=tri, keep=keep,
+                         tree=tree, ra0=ra0, dec0=dec0, cs=cs,
+                         area_arcmin2=np.nan, fill_frac=np.nan)
+
+    # Monte-Carlo area. The buffer union has no closed form worth writing, and
+    # the acceptance rate is the number the sampler actually needs anyway.
+    rng = np.random.default_rng(int(area_seed))
+    r_lo, r_hi, d_lo, d_hi = fp.bbox
+    cand_ra = rng.uniform(r_lo, r_hi, int(area_samples))
+    cand_dec = rng.uniform(d_lo, d_hi, int(area_samples))
+    fill = float(np.mean(fp.contains(cand_ra, cand_dec)))
+    buf, fp.buffer_arcsec = fp.buffer_arcsec, 0.0
+    fill_alpha = float(np.mean(fp.contains(cand_ra, cand_dec)))
+    fp.buffer_arcsec = buf
+    box_arcmin2 = ((r_hi - r_lo) * cs * 60.0) * ((d_hi - d_lo) * 60.0)
+    fp.fill_frac = fill
+    fp.area_arcmin2 = fill * box_arcmin2
+    fp.area_alpha_arcmin2 = fill_alpha * box_arcmin2
+
+    if verbose:
+        hull_frac = float(keep.sum()) / float(keep.size)
+        print(f"    footprint: {fp.n_src} sources, median NN {nn_med:.1f}\", "
+              f"alpha {alpha_arcsec:.1f}\" ({alpha_arcsec / nn_med:.1f}x NN), "
+              f"buffer {buffer_arcsec:.1f}\"")
+        print(f"    area {fp.area_arcmin2:.1f} arcmin^2 "
+              f"({fp.area_arcmin2 / 3600.0:.4f} deg^2, "
+              f"{fp.area_alpha_arcmin2:.1f} before the buffer) | "
+              f"{fill:.1%} of its bounding box | "
+              f"kept {keep.sum()}/{keep.size} Delaunay triangles "
+              f"({1 - hull_frac:.1%} of the convex hull carved away)")
+    return fp
+
+
+def plot_source_footprint(ra, dec, *, alpha_scales=(1.0, 1.5, 2.0, 3.0, 5.0),
+                          buffer_arcsec=15.0, draws=0, draw_seed=0,
+                          figsize=None, verbose=True):
+    """Sweep the alpha-shape probe radius and look at what each one keeps.
+
+    The default `alpha_scale = 3` in `build_source_footprint` is a guess about
+    a survey's geometry, and geometry guesses should be looked at rather than
+    believed. One panel per scale: kept triangles filled, sources on top, area
+    and bounding-box fill in the title. Pick the smallest scale whose shape
+    still looks like the mask pattern rather than like swiss cheese.
+
+    draws : if > 0, also scatter that many accepted random positions per panel,
+        which is the actual question ("where would my randoms land?") rather
+        than a proxy for it.
+
+    Returns the list of `SourceFootprint`s, one per scale, so the chosen one
+    can be reused instead of rebuilt.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import PolyCollection
+
+    scales = list(alpha_scales)
+    n = len(scales)
+    if figsize is None:
+        figsize = (4.0 * n, 4.2)
+    fig, axes = plt.subplots(1, n, figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+
+    fps = []
+    for ax, sc in zip(axes, scales):
+        fp = build_source_footprint(ra, dec, alpha_scale=sc,
+                                    buffer_arcsec=buffer_arcsec,
+                                    verbose=False)
+        fps.append(fp)
+        pts = fp._tri.points
+        polys = pts[fp._tri.simplices[fp._keep]]
+        ax.add_collection(PolyCollection(polys, facecolors="C0", alpha=0.25,
+                                         edgecolors="C0", linewidths=0.2))
+        ax.plot(pts[:, 0], pts[:, 1], ".k", ms=2.0, zorder=3)
+        if draws > 0:
+            rng = np.random.default_rng(int(draw_seed))
+            r_lo, r_hi, d_lo, d_hi = fp.bbox
+            got_r, got_d = [], []
+            while len(got_r) < int(draws):
+                cr = rng.uniform(r_lo, r_hi, int(draws) * 3)
+                cd = rng.uniform(d_lo, d_hi, int(draws) * 3)
+                m = fp.contains(cr, cd)
+                got_r.extend(cr[m][: int(draws) - len(got_r)])
+                got_d.extend(cd[m][: int(draws) - len(got_d)])
+            gx, gy = fp._xy(np.asarray(got_r), np.asarray(got_d))
+            ax.plot(gx, gy, ".", color="C3", ms=2.5, zorder=4, alpha=0.7)
+        ax.set_aspect("equal")
+        ax.set_title(f"alpha = {sc:g}x NN = {fp.alpha_arcsec:.0f}\"\n"
+                     f"{fp.area_alpha_arcmin2:.0f} arcmin$^2$ "
+                     f"(+buffer {fp.area_arcmin2:.0f}), "
+                     f"{fp.fill_frac:.0%} of box", fontsize=9)
+        ax.set_xlabel('$\\Delta$RA (")')
+    axes[0].set_ylabel('$\\Delta$Dec (")')
+    fig.tight_layout()
+    if verbose:
+        print("    shaded = alpha shape only; the buffer is what the +column "
+              "adds. Watch the SHADED area, not the buffered one -- the "
+              "buffer hides a shape that is coming apart.")
+        for sc, fp in zip(scales, fps):
+            print(f"    {sc:>4g}x NN -> alpha {fp.alpha_arcsec:6.1f}\"  "
+                  f"alpha-only {fp.area_alpha_arcmin2:7.1f}  "
+                  f"+buffer {fp.area_arcmin2:7.1f} arcmin^2  "
+                  f"fill {fp.fill_frac:5.1%}")
+    return fps
+
+
+# =====================================================================
+#  2.4  Redshift sampling -- the real n(z), not a uniform slab
+# =====================================================================
+
+def find_redshift_humps(z, *, gap_dz=0.15, min_frac=0.02, pad_dz=0.0,
+                        verbose=True):
+    """Split a real redshift distribution into contiguous humps at its gaps.
+
+    MOSDEF targets two rest-optical windows -- the strong lines have to land
+    between the OH forest and the atmospheric bands -- so its n(z) is two
+    clumps near z ~ 2.0-2.6 and z ~ 3.0-3.6 with a hole between them that
+    contains essentially no galaxies. A random catalog drawn uniformly across
+    the full span puts a third of its sources in that hole, at observed
+    wavelengths the real stack never samples. That matters because the
+    systematic the null is trying to size -- the sky residual -- is
+    WAVELENGTH-dependent: randoms spread over wavelengths the data never sees
+    average it away, and the null then reads clean for a reason that has
+    nothing to do with the data being clean.
+
+    Humps are found from the data, not hardcoded: sort z, cut wherever
+    consecutive redshifts differ by more than `gap_dz`, and keep every run
+    holding at least `min_frac` of the sample. Stragglers below that threshold
+    are dropped and reported -- a lone galaxy at z = 4.1 is not a hump, and
+    stretching a hump out to reach it would reintroduce the empty span.
+
+    Returns a list of (z_lo, z_hi, n, weight), z-ordered.
+    """
+    z = np.asarray(z, dtype=float).ravel()
+    z = np.sort(z[np.isfinite(z)])
+    if z.size == 0:
+        raise ValueError("no finite redshifts")
+    n_min = max(1, int(np.ceil(float(min_frac) * z.size)))
+    cuts = np.nonzero(np.diff(z) > float(gap_dz))[0]
+    runs = np.split(np.arange(z.size), cuts + 1)
+
+    humps, n_drop = [], 0
+    for ii in runs:
+        if ii.size < n_min:
+            n_drop += int(ii.size)
+            continue
+        humps.append([float(z[ii[0]]) - pad_dz, float(z[ii[-1]]) + pad_dz,
+                      int(ii.size)])
+    if not humps:
+        raise RuntimeError(
+            f"no run of >= {n_min} galaxies survives gap_dz = {gap_dz}; the "
+            f"sample is too sparse for hump detection -- lower min_frac, "
+            f"raise gap_dz, or use mode='bootstrap'.")
+
+    tot = float(sum(h[2] for h in humps))
+    out = [(h[0], h[1], h[2], h[2] / tot) for h in humps]
+    if verbose:
+        print(f"    n(z): {len(out)} hump(s) from {z.size} real redshifts"
+              + (f", {n_drop} straggler(s) dropped" if n_drop else ""))
+        for lo, hi, k, w in out:
+            print(f"      z {lo:.4f}-{hi:.4f}  n = {k:4d}  weight {w:.3f}")
+    return out
+
+
+def _make_z_sampler(rng, *, z_sample=None, z_range=None, z_mode=None,
+                    gap_dz=0.15, min_frac=0.02, pad_dz=0.0, verbose=True):
+    """Return (draw_z(), span, label) for `draw_injection_positions`.
+
+    `span` is the TOTAL redshift measure the sampler can reach -- the summed
+    hump width, not (z_hi - z_lo) -- because that is what the min_dz exclusion
+    has to be compared against. Getting this wrong is how a two-hump sample
+    with a wide nominal range silently degenerates into a purely spatial
+    exclusion.
+
+    `z_mode=None` resolves to 'hump' when a real sample was handed over and to
+    'uniform' when it was not, so a pre-v8 call that passes only `z_range`
+    keeps its old behaviour instead of erroring on a mode it never asked for.
+    """
+    if z_mode is None:
+        z_mode = "hump" if z_sample is not None else "uniform"
+    mode = str(z_mode).lower()
+    if z_sample is None:
+        if mode != "uniform":
+            raise ValueError(
+                f"z_mode = {mode!r} needs z_sample (the real run table's "
+                f"redshifts); pass z_mode='uniform' to keep the legacy "
+                f"uniform-over-z_range draw.")
+        if z_range is None:
+            raise ValueError("z_mode='uniform' with no z_sample needs z_range")
+        lo, hi = float(z_range[0]), float(z_range[1])
+        if verbose:
+            print(f"    z: uniform over {lo:.3f}-{hi:.3f} (no real n(z) "
+                  f"matched -- randoms will sample wavelengths the data does "
+                  f"not)")
+        return (lambda: float(rng.uniform(lo, hi))), (hi - lo), "uniform"
+
+    zs = np.asarray(z_sample, dtype=float).ravel()
+    zs = zs[np.isfinite(zs)]
+    n_all = zs.size
+    if z_range is not None:
+        zs = zs[(zs >= float(z_range[0])) & (zs <= float(z_range[1]))]
+    if zs.size == 0:
+        raise ValueError("z_sample has no finite redshifts inside z_range")
+    if verbose and zs.size < n_all:
+        # Worth saying out loud: passing BOTH z_sample and z_range means the
+        # range wins, so the windows are the real sample's *clipped* by it and
+        # the hump weights move with the clip. That is a legitimate thing to
+        # want (keeping Lya off the ends of the VIRUS grid) but it is not the
+        # real n(z) any more, and the difference is invisible in the output.
+        print(f"    [!] z_range clips {n_all - zs.size}/{n_all} real "
+              f"redshifts; the windows below are the CLIPPED distribution, "
+              f"not the sample's own. Pass z_range=None to keep it intact.")
+
+    if mode == "bootstrap":
+        if verbose:
+            print(f"    z: bootstrapped from {zs.size} real redshifts "
+                  f"({zs.min():.3f}-{zs.max():.3f})")
+        return (lambda: float(rng.choice(zs))), float(zs.max() - zs.min()), \
+               "bootstrap"
+
+    if mode == "uniform":
+        lo, hi = (float(zs.min()), float(zs.max())) if z_range is None else \
+                 (float(z_range[0]), float(z_range[1]))
+        if verbose:
+            print(f"    z: uniform over {lo:.3f}-{hi:.3f}")
+        return (lambda: float(rng.uniform(lo, hi))), (hi - lo), "uniform"
+
+    if mode != "hump":
+        raise ValueError(f"z_mode must be 'hump', 'bootstrap' or 'uniform', "
+                         f"got {z_mode!r}")
+
+    humps = find_redshift_humps(zs, gap_dz=gap_dz, min_frac=min_frac,
+                                pad_dz=pad_dz, verbose=verbose)
+    lo_a = np.array([h[0] for h in humps])
+    hi_a = np.array([h[1] for h in humps])
+    w_a = np.array([h[3] for h in humps])
+    w_a = w_a / w_a.sum()
+    span = float(np.sum(hi_a - lo_a))
+
+    def draw():
+        k = int(rng.choice(lo_a.size, p=w_a))
+        return float(rng.uniform(lo_a[k], hi_a[k]))
+
+    return draw, span, "hump"
+
+
+def sample_redshifts(n, z_sample=None, *, mode="hump", seed=0, z_range=None,
+                     gap_dz=0.15, min_frac=0.02, pad_dz=0.0, verbose=True):
+    """Spec sec 2.4. Draw `n` redshifts matched to a real sample's n(z).
+
+    Standalone version of what `draw_injection_positions` does internally, for
+    plotting the drawn n(z) against the real one before committing 13 hr of
+    extraction to it.
+
+    mode
+      'hump'      (default) uniform inside each detected hump, weighted by the
+                  real counts. Reproduces WHICH wavelengths the survey reaches
+                  and in what proportion, while staying smooth inside each
+                  window -- so the randoms do not inherit the real sample's
+                  own small-number structure in z.
+      'bootstrap' resample the real redshifts with replacement. Matches n(z)
+                  exactly, including every spike; what spec sec 2.4 originally
+                  asked for.
+      'uniform'   legacy flat draw over `z_range`. Records what the pre-v8
+                  runs did; do not use for a null.
+    """
+    rng = np.random.default_rng(int(seed))
+    draw, _, _ = _make_z_sampler(rng, z_sample=z_sample, z_range=z_range,
+                                 z_mode=mode, gap_dz=gap_dz,
+                                 min_frac=min_frac, pad_dz=pad_dz,
+                                 verbose=verbose)
+    return np.array([draw() for _ in range(int(n))])
+
+
+def draw_injection_positions(vdfi, n, z_range=None, *, seed=0,
+                             min_sep_arcsec=50.0, min_dz=0.01,
+                             r_inner_arcsec=4.0, n_fib_inner_min=1,
+                             real_ra=None, real_dec=None,
+                             footprint=None, z_sample=None, z_mode=None,
+                             z_gap_dz=0.15, z_min_frac=0.02,
+                             max_tries_per_source=2000, strict=True,
+                             verbose=True):
+    """Spec sec 2, build-order item 5. Random (ra, dec, z) with an exclusion.
+
+    Rejection sampling, seeded and therefore reproducible from `seed` alone
+    -- which is what `inject_sources(placement_seed=...)` records, and the
+    reason that argument existed before anything filled it.
+
+    **v8 (Austin, 2026-08-25): draws are now matched to the REAL SAMPLE'S
+    SELECTION, not to the VDFI field.** Two changes, one on the sky and one
+    in redshift, and they are the same change: a random has to be somewhere a
+    real galaxy could have been.
+
+      `footprint` -- an alpha shape (`build_source_footprint`) around the real
+        catalog's positions, instead of the field's RA/Dec box. MOSDEF is a
+        slit-mask survey and its coverage is a few rectangular pointings with
+        concave notches between them; the bounding box interpolates straight
+        across every notch and drops randoms on sky nobody observed.
+      `z_sample` -- the real run table's redshifts, from which z is drawn
+        hump-by-hump (`z_mode`, see `find_redshift_humps`) instead of
+        uniformly. MOSDEF's n(z) is two clumps with an empty span between
+        them; a uniform draw puts a third of the randoms at observed
+        wavelengths the data never reaches, which averages away the
+        wavelength-dependent sky residual the null exists to size.
+
+    Both default to None, which reproduces the pre-v8 behaviour exactly --
+    every level 0-6 result stands. `footprint='auto'` builds the shape from
+    `real_ra`/`real_dec` with `build_source_footprint`'s defaults, which is
+    the intended call since those arrays are already being passed for
+    `REAL_DIST`.
+
+    THE EXCLUSION IS AN **AND**, AND THAT IS THE WHOLE DESIGN (Austin,
+    2026-08-20). A candidate is rejected only if an accepted source is
+    BOTH within `min_sep_arcsec` on the sky AND within `min_dz` in redshift.
+    Contamination requires spatial *and* spectral overlap: `total_flux_fid`
+    and the centroid integrate only `config.line_window` = +/-3 rest A, which
+    at z = 2.25 is +/-9.75 observed A = dz 0.0080, so a neighbour further
+    than that in redshift contributes NOTHING to either measurement however
+    close it sits on the sky. min_dz = 0.01 clears that window with ~25%
+    margin.
+
+    This is not a technicality -- it is what makes the experiment fit in the
+    field. The COSMOS footprint is ~20' across and a 2000 kpc aperture is
+    242" in radius, i.e. 13.1% of the field, so N sources put N x 0.131
+    neighbours inside EVERY aperture no matter how they are spaced. Spacing
+    alone cannot fix that; only 7-9 sources fit at the 484" true
+    zero-overlap separation. With z drawn over a range of 0.5, only ~3% of
+    sources are spectral neighbours of any given one, and the effective
+    contamination falls ~30x -- the outermost bin at N = 50 goes from ~10x
+    the signal to ~0.3x. Measured contamination ratios per bin are in the
+    2026-08-20 notes; re-derive them if the profile's gamma changes, because
+    gamma = 0.8 is what makes the surface brightness nearly flat from 100 to
+    1500 kpc and therefore makes a neighbour anywhere in the aperture
+    contribute at every radius.
+
+    **The v8 draws make that exclusion bite harder, in both coordinates.**
+    The footprint is smaller than the field, and hump-drawn z's are packed
+    into ~1.1 of redshift instead of spread over 1.5 -- so the fraction of
+    pairs that are spectral neighbours rises. `min_dz` is validated against
+    the SUMMED HUMP WIDTH rather than (z_hi - z_lo) for exactly this reason;
+    a two-hump sample with a wide nominal range can otherwise degenerate to a
+    purely spatial exclusion without any error being raised. If a run cannot
+    place its N, that is the real crowding budget speaking, not a bug --
+    lower `min_sep_arcsec` before touching `min_dz`, since the spectral half
+    is the part doing the physical work.
+
+    A candidate must also land on real fiber coverage: at least
+    `n_fib_inner_min` fibers (summed over exposures, as `N_FIB_INNER` is
+    everywhere else) within `r_inner_arcsec`. The fill factor is not 100%
+    and a draw in an IFU gap must be discarded, not extracted as NaN.
+
+    Returns
+    -------
+    dict with 'ra', 'dec', 'z', 'n_fib_inner', 'nn_dist', 'nn_dz',
+    'nn_dist_spec', 'real_dist', 'seed', 'n_tries', 'z_mode', 'footprint'.
+
+    `nn_dist` is the nearest projected neighbour at ANY redshift, which is
+    what sec 2.2's crowding panel bins on. `nn_dist_spec` is the nearest
+    neighbour among those inside `min_dz` -- the one that can actually
+    contaminate. Both are returned because they answer different questions
+    and conflating them is how a null crowding result gets believed.
+
+    'footprint' is the `SourceFootprint` actually used (None on the legacy
+    path), so the shape a run was drawn from can be recovered from its own
+    output rather than rebuilt and hoped to match.
+
+    strict=False returns fewer than `n` sources rather than raising. It still
+    PRINTS what it got: a silently short sample reads downstream as "the
+    field only holds this many", which is a different claim.
+    """
+    rng = np.random.default_rng(seed)
+
+    if z_range is not None:
+        z_lo, z_hi = (float(z_range[0]), float(z_range[1]))
+        if not (z_hi > z_lo):
+            raise ValueError("z_range must be (z_min, z_max) with z_max > z_min")
+    elif z_sample is None:
+        raise ValueError("pass z_range, or z_sample (the real run table's "
+                         "redshifts) to draw from the real n(z)")
+
+    ra_f = np.asarray(vdfi["RA"]).ravel()
+    dec_f = np.asarray(vdfi["DEC"]).ravel()
+    ok = np.isfinite(ra_f) & np.isfinite(dec_f)
+    ra_f, dec_f = ra_f[ok], dec_f[ok]
+    if ra_f.size == 0:
+        raise RuntimeError("no finite fiber positions in the field")
+    cs = float(np.cos(np.radians(float(np.median(dec_f)))))
+
+    # Coverage prefilter, same trick as _pick_covered_position: one pass over
+    # 4.6 M fibers to build a density map, then the exact count only for
+    # candidates whose cell is already populated. Testing every fiber against
+    # every candidate would be ~1e9 comparisons per accepted source.
+    cell = r_inner_arcsec / 3600.0
+    ra_lo, ra_hi = np.nanpercentile(ra_f, [1, 99])
+    dec_lo, dec_hi = np.nanpercentile(dec_f, [1, 99])
+    nx = max(int((ra_hi - ra_lo) * cs / cell), 1)
+    ny = max(int((dec_hi - dec_lo) / cell), 1)
+    Hc, xe, ye = np.histogram2d(ra_f, dec_f, bins=(nx, ny),
+                                range=((ra_lo, ra_hi), (dec_lo, dec_hi)))
+
+    # The candidate rectangle. With a footprint this is the footprint's bbox,
+    # NOT the fiber field's -- drawing in the larger box and rejecting would
+    # work but wastes most tries and makes max_tries_per_source mean something
+    # different. The fiber histogram above still does the coverage prefilter;
+    # the footprint and the fiber coverage are independent cuts and a
+    # candidate has to pass both.
+    fp = footprint
+    if isinstance(fp, str):
+        if fp != "auto":
+            raise ValueError(f"footprint must be a SourceFootprint, 'auto', "
+                             f"or None; got {fp!r}")
+        if real_ra is None or real_dec is None:
+            raise ValueError("footprint='auto' needs real_ra/real_dec (the "
+                             "real run table's positions) to build the shape")
+        fp = build_source_footprint(real_ra, real_dec, verbose=verbose)
+    if fp is not None:
+        draw_ra_lo, draw_ra_hi, draw_dec_lo, draw_dec_hi = fp.bbox
+    else:
+        draw_ra_lo, draw_ra_hi = ra_lo, ra_hi
+        draw_dec_lo, draw_dec_hi = dec_lo, dec_hi
+        if verbose:
+            print("    sky: uniform over the fiber field's 1-99 percentile "
+                  "box (no footprint -- randoms will land on sky the real "
+                  "sample never covered)")
+
+    draw_z, z_span, z_label = _make_z_sampler(
+        rng, z_sample=z_sample, z_range=z_range, z_mode=z_mode,
+        gap_dz=z_gap_dz, min_frac=z_min_frac, verbose=verbose)
+    if min_dz >= z_span:
+        raise ValueError(
+            f"min_dz = {min_dz} spans the whole reachable redshift measure "
+            f"({z_span:.4f}, summed over {z_label} windows); every pair would "
+            f"be a spectral neighbour and the AND exclusion degenerates to a "
+            f"pure spatial one.")
+
+    ra_s, dec_s, z_s, nin_s = [], [], [], []
+    n_tries = n_rej_cover = n_rej_excl = n_rej_fp = 0
+    box = r_inner_arcsec / 3600.0
+
+    while len(ra_s) < int(n):
+        tries = 0
+        while tries < int(max_tries_per_source):
+            tries += 1
+            n_tries += 1
+            ra_c = float(rng.uniform(draw_ra_lo, draw_ra_hi))
+            dec_c = float(rng.uniform(draw_dec_lo, draw_dec_hi))
+            z_c = draw_z()
+
+            if fp is not None and not bool(fp.contains(ra_c, dec_c)):
+                n_rej_fp += 1
+                continue
+
+            i = min(np.searchsorted(xe, ra_c) - 1, Hc.shape[0] - 1)
+            j = min(np.searchsorted(ye, dec_c) - 1, Hc.shape[1] - 1)
+            if i < 0 or j < 0 or Hc[i, j] <= 0:
+                n_rej_cover += 1
+                continue
+
+            # THE AND. Spatial proximity alone is not a rejection.
+            if ra_s:
+                d = np.hypot((np.asarray(ra_s) - ra_c) * cs,
+                             np.asarray(dec_s) - dec_c) * 3600.0
+                dz = np.abs(np.asarray(z_s) - z_c)
+                if np.any((d < min_sep_arcsec) & (dz < min_dz)):
+                    n_rej_excl += 1
+                    continue
+
+            m = ((np.abs(dec_f - dec_c) < box) & (np.abs(ra_f - ra_c) * cs < box))
+            if not m.any():
+                n_rej_cover += 1
+                continue
+            dd = np.hypot((ra_f[m] - ra_c) * cs, dec_f[m] - dec_c) * 3600.0
+            n_in = int(np.sum(dd < r_inner_arcsec))
+            if n_in < int(n_fib_inner_min):
+                n_rej_cover += 1
+                continue
+
+            ra_s.append(ra_c); dec_s.append(dec_c)
+            z_s.append(z_c); nin_s.append(n_in)
+            break
+        else:
+            msg = (f"placed only {len(ra_s)}/{n} sources: "
+                   f"{max_tries_per_source} consecutive draws failed "
+                   f"(min_sep={min_sep_arcsec}\", min_dz={min_dz}, "
+                   f"z {z_label} span={z_span:.3f}"
+                   + (f", footprint {fp.area_arcmin2:.0f} arcmin^2"
+                      if fp is not None else "")
+                   + "). The exclusion volume is full -- lower min_sep, or "
+                     "widen the redshift windows, or ask for fewer sources. "
+                     "Do NOT reach for min_dz first: the spectral half of the "
+                     "AND is the part doing the physical work.")
+            if strict:
+                raise RuntimeError(msg)
+            print(f"    [!] {msg}")
+            break
+
+    ra_s = np.asarray(ra_s); dec_s = np.asarray(dec_s)
+    z_s = np.asarray(z_s); nin_s = np.asarray(nin_s, dtype=int)
+    k = ra_s.size
+
+    sep = np.hypot((ra_s[:, None] - ra_s[None, :]) * cs,
+                   dec_s[:, None] - dec_s[None, :]) * 3600.0
+    dzm = np.abs(z_s[:, None] - z_s[None, :])
+    np.fill_diagonal(sep, np.inf)
+    np.fill_diagonal(dzm, np.inf)
+    nn_dist = sep.min(axis=1) if k > 1 else np.full(k, np.inf)
+    nn_dz = dzm.min(axis=1) if k > 1 else np.full(k, np.inf)
+    spec = np.where(dzm < min_dz, sep, np.inf)
+    nn_dist_spec = spec.min(axis=1) if k > 1 else np.full(k, np.inf)
+
+    if real_ra is not None and real_dec is not None:
+        rr = np.asarray(real_ra, dtype=float).ravel()
+        rd = np.asarray(real_dec, dtype=float).ravel()
+        real_dist = np.array([
+            float(np.min(np.hypot((rr - a) * cs, rd - d)) * 3600.0)
+            for a, d in zip(ra_s, dec_s)]) if rr.size else np.full(k, np.nan)
+    else:
+        real_dist = np.full(k, np.nan)
+
+    if verbose:
+        print(f"    placed {k}/{n} sources in {n_tries} draws "
+              f"({n_rej_fp} outside the footprint, {n_rej_cover} off "
+              f"coverage, {n_rej_excl} inside the exclusion)")
+        print(f"    z {z_s.min():.4f}-{z_s.max():.4f} | "
+              f"nn_dist {nn_dist.min():.0f}-{nn_dist.max():.0f}\" | "
+              f"nearest SPECTRAL neighbour "
+              + ("none within min_dz" if not np.isfinite(nn_dist_spec).any()
+                 else f"{np.nanmin(nn_dist_spec[np.isfinite(nn_dist_spec)]):.0f}\"")
+              + f" | inner fibers {nin_s.min()}-{nin_s.max()}")
+        if np.isfinite(real_dist).any():
+            print(f"    distance to nearest REAL source "
+                  f"{np.nanmin(real_dist):.0f}-{np.nanmax(real_dist):.0f}\"")
+
+    return {"ra": ra_s, "dec": dec_s, "z": z_s, "n_fib_inner": nin_s,
+            "nn_dist": nn_dist, "nn_dz": nn_dz, "nn_dist_spec": nn_dist_spec,
+            "real_dist": real_dist, "seed": int(seed), "n_tries": n_tries,
+            "z_mode": z_label, "footprint": fp}
+
+
 def check_level1(model, vdfi, z, bins_kpc, kpc_per_arcsec=None,
                  ra=None, dec=None, seeing_mode="field", plot=True,
                  verbose=True, rng_seed=7, tol_dv_kms=2.0,
@@ -1937,7 +2980,7 @@ def check_level1(model, vdfi, z, bins_kpc, kpc_per_arcsec=None,
     # give a 74-minute ETA for a 3-minute job (2026-08-16).
     t_tmpl = time.time()
 
-    lam0 = LYA_REST * (1.0 + z)
+    lam0 = observed_lya_wavelength(z)
     dv_pix = C_KMS * float(np.mean(np.diff(wave))) / lam0
     lines.append(f"           kpc/arcsec = {kpc_per_arcsec:.3f}; one pixel = "
                  f"{dv_pix:.1f} km/s (the floor on every velocity statement)")
@@ -2261,6 +3304,508 @@ def _plot_level1(data, bins_kpc, model=None):
     plt.tight_layout(); plt.show()
 
 
+def plot_injection_recovery(result, model, z, seeing_fwhm, kpc_per_arcsec,
+                            bins_kpc=None, truth=None, lsf_kms=None,
+                            n_fine=4000, real=None, rescale="median",
+                            label="recovered", verbose=True):
+    """The level-6 figure: WHAT I PUT IN vs WHAT SHOULD COME BACK vs WHAT DID.
+
+    Same three-curve convention as `_plot_level1`, but the third curve is an
+    actual EXTRACTION with error bars rather than a binned template. Keeping
+    the conventions identical is the point -- a level-1 figure and a level-6
+    figure of the same model should be readable side by side.
+
+      1. INTRINSIC (grey, smooth)  -- the source as DEFINED. Not measurable.
+         NOTHING should ever be compared against this curve; it is on the plot
+         so the gap between "what I injected" and "what a CORRECT pipeline
+         returns" is visible instead of held in your head. Most of that gap is
+         BINNING, not optics.
+      2. TRUTH GENERATOR (black step) -- `predict_binned_observables`: the
+         flux-weighted, PSF-convolved, bin-averaged prediction. THE TRUTH.
+      3. RECOVERED (red, with errors) -- the measured stack.
+
+    The test is 3 vs 2. The 1-vs-2 gap is the dilution the pipeline is
+    ENTITLED to; the 2-vs-3 gap is bias.
+
+    Parameters
+    ----------
+    result : the `run_measure` dict. Needs `total_flux_fid` (+ `_lo`/`_hi`)
+        and `centroid_v_fid` (+ `_lo`/`_hi`), and `r_edges` either here or in
+        `bins_kpc`.
+    real : optional (v, err) from the REAL run, overplotted in blue on the
+        velocity panel. This is the comparison the deconvolution is actually
+        about: adjust the injected dv(r) until the red curve lands on the blue
+        one, and the INTRINSIC grey curve is then your answer for the real
+        galaxies.
+    rescale : "median" (default) compares SHAPE ONLY, anchoring the recovered
+        profile to the truth by their median ratio -- and PRINTS that ratio.
+
+        SHAPE-ONLY IS NOT LAZINESS, IT IS THE ONLY HONEST DEFAULT RIGHT NOW.
+        `line_profile` has unit integral in VELOCITY and is written straight
+        into a per-Angstrom cube, so the injected flux is low by c/lambda_obs
+        -- 72.5x at z = 2.4, and z-dependent (2026-08-19; fix NOT applied).
+        Until that lands, an absolute flux comparison tests the unit bug and
+        nothing else.
+
+        WHICH MAKES THE PRINTED RATIO A DIAGNOSTIC, NOT A NUISANCE: if the
+        unit bug is the ONLY normalization error, the ratio must come out at
+        C_KMS / lambda_obs(z). It is printed next to that prediction. Agreement
+        confirms the diagnosis and gives the correction factor for free;
+        disagreement means there is a SECOND normalization error, which is
+        exactly what the 2026-07-22 PSF area-convention bug looked like.
+
+        Pass rescale=None to plot both on their raw scales instead.
+    """
+    import matplotlib.pyplot as plt
+
+    if bins_kpc is None:
+        bins_kpc = result["r_edges"]
+    bins_kpc = np.asarray(bins_kpc, dtype=float)
+
+    if truth is None:
+        truth = predict_binned_observables(model, z, bins_kpc, seeing_fwhm,
+                                           kpc_per_arcsec, lsf_kms=lsf_kms,
+                                           n_fine=n_fine)
+    r_mid = truth["r_mid"]
+
+    sb_rec = np.asarray(result["total_flux_fid"], dtype=float)
+    sb_err = 0.5 * (np.asarray(result["total_flux_hi"], dtype=float)
+                    - np.asarray(result["total_flux_lo"], dtype=float))
+    v_rec = np.asarray(result["centroid_v_fid"], dtype=float)
+    v_err = 0.5 * (np.asarray(result["centroid_v_hi"], dtype=float)
+                   - np.asarray(result["centroid_v_lo"], dtype=float))
+
+    scale = 1.0
+    if rescale == "median":
+        ok = np.isfinite(sb_rec) & np.isfinite(truth["sb"]) & (sb_rec != 0)
+        # MEDIAN RATIO, NOT A RATIO AT ONE BIN. Anchoring on the outermost bin
+        # (the r_trunc cut) or the innermost (PSF-dominated) tilts the whole
+        # comparison; _plot_level1 hit exactly that and it manufactured a 29%
+        # mid-radius gap that was not physical.
+        scale = float(np.nanmedian(truth["sb"][ok] / sb_rec[ok]))
+        lam_obs = observed_lya_wavelength(z)
+        if verbose:
+            print(f"  recovered -> truth scale : {scale:.4g}")
+            print(f"  c / lambda_obs(z={z:.3f})  : {C_KMS / lam_obs:.4g}"
+                  "   <- what the per-km/s-into-per-Angstrom bug predicts")
+            print(f"  residual after that      : "
+                  f"{scale / (C_KMS / lam_obs):.4g}   <- should be ~1")
+
+    sb_plot, sbe_plot = sb_rec * scale, sb_err * scale
+
+    fig, ax = plt.subplots(1, 3, figsize=(16.0, 4.4))
+    r_fine = np.logspace(np.log10(max(float(bins_kpc[1]) * 0.3, 1.0)),
+                         np.log10(float(bins_kpc[-1])), 600)
+
+    # ---- panel 0: surface brightness ---------------------------------
+    if model.profile != "point":
+        I_int = model.I(r_fine)
+        good = I_int > 0
+        anchor = np.nanmedian(truth["sb"] / np.interp(r_mid, r_fine, I_int))
+        ax[0].loglog(r_fine[good], I_int[good] * anchor, color="0.6", lw=1.5,
+                     label="intrinsic (not measurable)")
+    ax[0].loglog(r_mid, truth["sb"], "k-", marker="s", ms=4, lw=1.2,
+                 label="truth (PSF + binned)")
+    ax[0].errorbar(r_mid, sb_plot, yerr=sbe_plot, fmt="o", color="crimson",
+                   ms=4, lw=1.2, capsize=2, label=label)
+    ax[0].set_xlabel("r [kpc]")
+    ax[0].set_ylabel("surface brightness [arb.]")
+    ax[0].set_title("flux profile" + ("  (shape only)" if scale != 1.0 else ""))
+    ax[0].legend(fontsize=8)
+
+    # ---- panel 1: fractional residuals -------------------------------
+    # TWO curves, and the difference between them is the whole diagnostic:
+    # red is recovered/truth (BIAS, should be flat at 0), grey is
+    # truth/intrinsic (DILUTION, the pipeline is entitled to this).
+    with np.errstate(invalid="ignore", divide="ignore"):
+        res = sb_plot / truth["sb"] - 1.0
+        rese = sbe_plot / truth["sb"]
+    if model.profile != "point":
+        I_mid = np.interp(r_mid, r_fine, model.I(r_fine))
+        dil = truth["sb"] / (I_mid * np.nanmedian(truth["sb"] / I_mid)) - 1.0
+        ax[1].semilogx(r_mid, 100 * dil, color="0.6", ls="--", lw=1.5,
+                       label="truth / intrinsic  (dilution)")
+    ax[1].axhline(0, color="k", lw=0.8)
+    ax[1].errorbar(r_mid, 100 * res, yerr=100 * rese, fmt="o", color="crimson",
+                   ms=4, lw=1.2, capsize=2, label="recovered / truth  (bias)")
+    ax[1].set_xlabel("r [kpc]")
+    ax[1].set_ylabel("fractional deviation [%]")
+    ax[1].set_title("profile residuals")
+    ax[1].legend(fontsize=8)
+
+    # ---- panel 2: velocity -------------------------------------------
+    ax[2].semilogx(r_fine, model.velocity(r_fine), color="0.6", lw=1.5,
+                   label="intrinsic dv(r)")
+    ax[2].semilogx(r_mid, truth["dv"], "k-", marker="s", ms=4, lw=1.2,
+                   label="truth (blended)")
+    ax[2].errorbar(r_mid, v_rec, yerr=v_err, fmt="o", color="crimson", ms=4,
+                   lw=1.2, capsize=2, label=label)
+    if real is not None:
+        rv, re_ = np.asarray(real[0], dtype=float), np.asarray(real[1], dtype=float)
+        n = min(rv.size, r_mid.size)
+        ax[2].errorbar(r_mid[:n], rv[:n], yerr=re_[:n], fmt="^", color="tab:blue",
+                       ms=4, lw=1.2, capsize=2, alpha=0.8, label="REAL data")
+    ax[2].axhline(0, color="k", lw=0.8, ls=":")
+    ax[2].set_xlabel("r [kpc]")
+    ax[2].set_ylabel(r"$\Delta v$ [km s$^{-1}$]")
+    ax[2].set_title("centroid velocity")
+    ax[2].legend(fontsize=8)
+
+    fig.suptitle(f"{model!r}   z={z:.2f}, seeing={seeing_fwhm:.2f}\"", fontsize=9)
+    fig.tight_layout()
+
+    # ---- the numbers, because the eye cannot read a 4-sigma outlier off
+    #      a log axis (this is how [60,100] hid at level 2) -------------
+    pull = (v_rec - truth["dv"]) / np.where(v_err > 0, v_err, np.nan)
+    if verbose:
+        print(f"\n  {'bin':>12}  {'truth dv':>9}  {label[:9]:>9}  {'pull':>6}"
+              f"  {'SB res':>8}")
+        for i in range(r_mid.size):
+            print(f"  {bins_kpc[i]:5.0f}-{bins_kpc[i+1]:<6.0f} "
+                  f"{truth['dv'][i]:9.1f}  {v_rec[i]:9.1f}  {pull[i]:6.2f}"
+                  f"  {100*res[i]:7.1f}%")
+        ok = np.isfinite(pull)
+        print(f"\n  chi2(dv) = {np.nansum(pull[ok]**2):.1f} / {ok.sum()}"
+              f"    rms pull = {np.sqrt(np.nanmean(pull[ok]**2)):.2f}"
+              "   <- should be 1.0 if the error bars are honest")
+    return fig, {"truth": truth, "scale": scale, "pull": pull,
+                 "sb_residual": res}
+
+
+def plot_injection_recovery(boot, model, z, seeing_fwhm, kpc_per_arcsec,
+                            bins_kpc=None, truth=None, real=None,
+                            n_fine=4000, scale=None, figsize=(15.0, 4.6)):
+    """Recovered vs INTRINSIC vs TRUTH, for a real injected extraction.
+
+    `_plot_level1` does this for a noiseless template. This does it for the
+    thing that actually came out of extract -> stack -> measure, with error
+    bars, so it is the figure that answers "how well does what I measure
+    compare to what I put in".
+
+    THREE CURVES, and the distinction is the whole point (same convention as
+    `_plot_level1`, kept deliberately identical so the two figures read the
+    same way):
+
+      1. INTRINSIC (grey)  -- the source as DEFINED. Un-smeared, un-binned.
+         NOTHING should ever be compared against this, and the gap between it
+         and curve 2 is the honest visual answer to "how much does the
+         measurement flatten my input".
+      2. TRUTH (black)     -- `predict_binned_observables`: what a CORRECT
+         pipeline returns after the PSF smears the source and the light is
+         averaged into radial bins. This is the prediction of the MEASUREMENT.
+      3. RECOVERED (red)   -- what the extraction returned, with bootstrap
+         errors.
+
+    The test is 3 vs 2. Curve 1 is context, not a target.
+
+    Parameters
+    ----------
+    boot : the Stage-3 bootstrap summary -- `run_measure` /
+        `measure_all_bins` / `run_measurement_suite` output. Needs
+        `centroid_v_fid/_lo/_hi`; the flux panel additionally needs
+        `total_flux_fid/_lo/_hi`, which only exist if the bootstrap ran with
+        compute_side_ratio=True. `r_edges` is read from here when
+        `bins_kpc` is not passed.
+    model : the injected `SourceModel`.
+    real : optional (v, err) arrays of your REAL measured table, overplotted
+        in blue on the velocity panel. Same length as the bins, or shorter
+        (extra real bins beyond the injected binning are dropped).
+    scale : flux normalization. None = fit one scalar as the median ratio
+        recovered/truth. A number applies it. 1.0 compares absolutely.
+
+    ON THE FLUX NORMALIZATION -- read this before believing the left panel.
+    Absolute flux is NOT currently testable, for two independent reasons, so
+    the default is a one-parameter rescale and the panel tests SHAPE only:
+
+      * `L_INJ` is in the injector's own units against the pipeline's
+        `L_kpc2` (noted at level 2, still open), and
+      * the per-km/s vs per-Angstrom line-units bug (2026-08-19) is NOT yet
+        applied, so the injected flux is low by `C_KMS / lambda_obs` -- 72.5x
+        at z = 2.4.
+
+    That second one makes the fitted scale a DIAGNOSTIC rather than a
+    nuisance: if the line-units bug is the only normalization error left, the
+    fitted scale should come back at `C_KMS / observed_lya_wavelength(z)`.
+    The function prints both so you can read the ratio directly. A fitted
+    scale that matches predicts the bug is the whole story; one that does not
+    means something else is also wrong, and the residual factor is printed.
+
+    Returns
+    -------
+    (fig, diag) -- diag carries `scale`, `scale_expected`, `scale_residual`,
+    `dv_truth`, `dv_rec`, `dv_err`, `pull`, `chi2`, `ndof`, and
+    `sb_ratio`, so the numbers behind the figure are usable without
+    re-reading it off the axes.
+    """
+    import matplotlib.pyplot as plt
+
+    if bins_kpc is None:
+        if "r_edges" not in boot:
+            raise KeyError(
+                "no bins_kpc passed and boot has no 'r_edges' -- pass "
+                "bins_kpc=BINS explicitly."
+            )
+        bins_kpc = boot["r_edges"]
+    bins_kpc = np.asarray(bins_kpc, dtype=float)
+
+    if truth is None:
+        truth = predict_binned_observables(model, z, bins_kpc, seeing_fwhm,
+                                           kpc_per_arcsec, n_fine=n_fine)
+    r_mid = truth["r_mid"]
+    nb = r_mid.size
+
+    def _fid_err(stem):
+        if f"{stem}_fid" not in boot:
+            return None, None
+        fid = np.asarray(boot[f"{stem}_fid"], dtype=float)[:nb]
+        lo = np.asarray(boot.get(f"{stem}_lo", np.full(nb, np.nan)), float)[:nb]
+        hi = np.asarray(boot.get(f"{stem}_hi", np.full(nb, np.nan)), float)[:nb]
+        return fid, 0.5 * (hi - lo)
+
+    v_rec, v_err = _fid_err("centroid_v")
+    if v_rec is None:
+        raise KeyError("boot has no 'centroid_v_fid' -- is this the bootstrap "
+                       "summary, or did you pass the stacks dict?")
+    f_rec, f_err = _fid_err("total_flux")
+
+    fig, ax = plt.subplots(1, 3, figsize=figsize)
+    r_fine = np.logspace(np.log10(max(float(bins_kpc[1]) * 0.3, 1.0)),
+                         np.log10(float(bins_kpc[-1])), 800)
+    diag = {"r_mid": r_mid, "dv_truth": truth["dv"],
+            "dv_rec": v_rec, "dv_err": v_err}
+
+    # ---------------- panel 1+2: surface brightness -----------------------
+    sb_t = np.asarray(truth["sb"], dtype=float)
+    if f_rec is None:
+        for a in ax[:2]:
+            a.text(0.5, 0.5, "no total_flux_fid\n(bootstrap ran with\n"
+                             "compute_side_ratio=False)",
+                   ha="center", va="center", transform=a.transAxes,
+                   fontsize=9, color="0.4")
+            a.set_xticks([]); a.set_yticks([])
+        diag.update(scale=np.nan, scale_expected=np.nan,
+                    scale_residual=np.nan, sb_ratio=None)
+    else:
+        ok = np.isfinite(f_rec) & np.isfinite(sb_t) & (sb_t > 0)
+        if scale is None:
+            scale = float(np.median(f_rec[ok] / sb_t[ok])) if ok.any() else 1.0
+        lam_obs = observed_lya_wavelength(z)
+        scale_expected = C_KMS / float(lam_obs)
+        diag.update(scale=float(scale), scale_expected=scale_expected,
+                    scale_residual=float(scale) / scale_expected)
+
+        # curve 1: intrinsic, tied to truth by the MEDIAN bin ratio (never the
+        # outermost -- that one sits on the r_trunc cut, see _plot_level1)
+        if model.profile != "point":
+            I_int = model.I(r_fine)
+            I_at_bin = model.I(r_mid)
+            good = I_at_bin > 0
+            anchor_ = (np.median(sb_t[good] / I_at_bin[good])
+                       if good.any() else 1.0)
+            ax[0].plot(r_fine, I_int * anchor_ * scale, color="0.65", lw=1.6,
+                       label="intrinsic (no PSF, no binning)")
+
+        ax[0].step(r_mid, sb_t * scale, where="mid", color="k", lw=1.6,
+                   label="truth (PSF + binned)")
+        ax[0].errorbar(r_mid, f_rec, yerr=f_err, fmt="o", ms=4.5,
+                       color="crimson", lw=1.3, capsize=2.5,
+                       label="recovered")
+        ax[0].set_xscale("log"); ax[0].set_yscale("log")
+        ax[0].set_xlabel("r [kpc]"); ax[0].set_ylabel("surface brightness")
+        ax[0].set_title(f"flux profile  (x{scale:.3g} applied)", fontsize=10)
+        ax[0].legend(fontsize=8, frameon=False)
+
+        ratio = np.where(sb_t > 0, f_rec / (sb_t * scale), np.nan)
+        rerr = np.where(sb_t > 0, f_err / (sb_t * scale), np.nan)
+        diag["sb_ratio"] = ratio
+        ax[1].axhline(1.0, color="k", lw=1.2)
+        ax[1].errorbar(r_mid, ratio, yerr=rerr, fmt="o", ms=4.5,
+                       color="crimson", lw=1.3, capsize=2.5)
+        if model.profile != "point":
+            I_at_bin = model.I(r_mid)
+            good = I_at_bin > 0
+            anchor_ = (np.median(sb_t[good] / I_at_bin[good])
+                       if good.any() else 1.0)
+            ax[1].plot(r_mid[good], sb_t[good] / (I_at_bin[good] * anchor_),
+                       color="0.65", lw=1.5, ls="--",
+                       label="truth / intrinsic\n(= what the PSF+binning cost)")
+            ax[1].legend(fontsize=8, frameon=False, loc="lower right")
+        ax[1].set_xscale("log")
+        ax[1].set_xlabel("r [kpc]"); ax[1].set_ylabel("recovered / truth")
+        ax[1].set_title("flux residual", fontsize=10)
+
+    # ---------------- panel 3: velocity -----------------------------------
+    ax[2].axhline(0.0, color="0.8", lw=1.0)
+    ax[2].plot(r_fine, model.velocity(r_fine), color="0.65", lw=1.6,
+               label="intrinsic dv(r)")
+    ax[2].step(r_mid, truth["dv"], where="mid", color="k", lw=1.6,
+               label="truth (PSF + binned)")
+    ax[2].errorbar(r_mid, v_rec, yerr=v_err, fmt="o", ms=4.5, color="crimson",
+                   lw=1.3, capsize=2.5, label="recovered")
+    if real is not None:
+        rv, re_ = (np.asarray(a, dtype=float) for a in real)
+        m = min(rv.size, nb)
+        ax[2].errorbar(r_mid[:m], rv[:m], yerr=re_[:m], fmt="s", ms=4.0,
+                       color="tab:blue", lw=1.2, capsize=2.5, alpha=0.85,
+                       label="REAL data")
+    ax[2].set_xscale("log")
+    ax[2].set_xlabel("r [kpc]"); ax[2].set_ylabel("dv [km/s]")
+    ax[2].set_title("velocity", fontsize=10)
+    ax[2].legend(fontsize=8, frameon=False)
+
+    # ---------------- the numbers ----------------------------------------
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pull = (v_rec - truth["dv"]) / v_err
+    good = np.isfinite(pull)
+    diag["pull"] = pull
+    diag["chi2"] = float(np.nansum(pull[good] ** 2))
+    diag["ndof"] = int(good.sum())
+
+    print(f"{'bin':>12} {'truth':>8} {'recovered':>16} {'pull':>7}"
+          f"{'   flux rec/truth' if f_rec is not None else ''}")
+    print("-" * (46 + (18 if f_rec is not None else 0)))
+    for i in range(nb):
+        line = (f"{bins_kpc[i]:5.0f}-{bins_kpc[i+1]:<6.0f}"
+                f"{truth['dv'][i]:8.1f} {v_rec[i]:9.1f} +/-{v_err[i]:5.1f}"
+                f"{pull[i]:7.1f}")
+        if f_rec is not None and np.isfinite(diag["sb_ratio"][i]):
+            line += f"      {diag['sb_ratio'][i]:8.3f}"
+        print(line)
+    print(f"\nvelocity chi2 vs truth = {diag['chi2']:.1f} / {diag['ndof']}"
+          f"   (well-calibrated errors -> ~1 per bin)")
+    if f_rec is not None:
+        print(f"flux scale fitted      = {diag['scale']:.4g}")
+        print(f"  expected if the per-km/s line-units bug is the only "
+              f"normalization error (C_KMS/lambda_obs at z={z}) "
+              f"= {diag['scale_expected']:.4g}")
+        print(f"  residual factor      = {diag['scale_residual']:.4g}   "
+              f"(1.0 => that bug explains all of it)")
+    fig.tight_layout()
+    return fig, diag
+
+
+def build_velocity_response_matrix(model, z, bins_kpc, seeing_fwhm,
+                                   kpc_per_arcsec, amp=100.0, n_fine=4000,
+                                   progress=True, check=True):
+    """The PSF+binning operator M, with `truth = M @ dv_intrinsic`.
+
+    Binned truth dv is a FLUX-WEIGHTED AVERAGE of shell velocities, so the
+    truth generator is LINEAR in dv(r) at fixed spatial profile. That means
+    the deconvolution does not need an injection loop at all: build M once
+    from unit basis vectors, invert it against the measured table, done. The
+    injection's job is to prove `predict_binned_observables` is right (level 6,
+    2026-08-20, chi2 10.3/11); once it is, everything else is linear algebra.
+
+    Linearity is NOT exact -- the estimator is the median-50%-flux centroid of
+    a superposition, not the mean -- so `check=True` verifies it on a known
+    staircase and prints the worst discrepancy. Measured 2026-08-20: 1.16 km/s
+    on a 5 km/s velocity grid, i.e. sub-grid, so the linear treatment is good.
+
+    Rows sum to ~1 by construction. Measured deficits of a few 0.1% (0.994 in
+    the mid bins) are flux weight scattered outside the modelled radial range,
+    NOT an error -- do not renormalize without deciding what velocity you are
+    asserting for the missing light.
+
+    `amp` is the basis amplitude in km/s. It divides out, so it only sets how
+    far the (mildly) nonlinear estimator is probed from zero; keep it near the
+    amplitude you actually intend to measure.
+
+    Costs one `predict_binned_observables` call per bin, plus one for the
+    check. With `_TRUTH_KERNEL_CACHE` live that is ~1 kernel build total; if
+    you are running a module that predates the cache it is one build PER CALL
+    (measured: 52 min for 11 bins vs ~5 min cached). Reload the module.
+
+    Returns M, shape (nbin, nbin).
+    """
+    bins_kpc = np.asarray(bins_kpc, dtype=float)
+    nbin = bins_kpc.size - 1
+    M = np.zeros((nbin, nbin))
+
+    rng = range(nbin)
+    if progress:
+        try:
+            from tqdm.auto import tqdm
+            rng = tqdm(rng, desc="response matrix")
+        except ImportError:
+            pass
+
+    def _truth(dv_vec):
+        import copy
+        m = copy.copy(model)
+        m.velocity = BinnedVelocity(bins_kpc, np.asarray(dv_vec, float),
+                                    dv_out=0.0)
+        return predict_binned_observables(m, z, bins_kpc, seeing_fwhm,
+                                          kpc_per_arcsec, n_fine=n_fine)["dv"]
+
+    for j in rng:
+        e = np.zeros(nbin); e[j] = float(amp)
+        M[:, j] = _truth(e) / float(amp)
+
+    if check:
+        chk = np.linspace(float(amp), 0.0, nbin)
+        worst = float(np.nanmax(np.abs(M @ chk - _truth(chk))))
+        print(f"row sums (want ~1): {np.round(M.sum(1), 3)}")
+        print(f"cond(M)           : {np.linalg.cond(M):.4g}")
+        print(f"linearity, worst  : {worst:.2f} km/s"
+              f"   ({'OK -- linear inversion is valid' if worst < 5 else 'TOO LARGE -- fit numerically instead'})")
+    return M
+
+
+def deconvolve_velocity(M, v_meas, v_err, rcond=1e-10, merge=None):
+    """Invert `truth = M @ dv_intrinsic` for the intrinsic velocity profile.
+
+    THE POINT OF THE WHOLE INJECTION EXERCISE. `v_meas` is the measured
+    centroid table; the return is what the gas is actually doing, with the
+    measurement's PSF and radial binning divided out and the covariance
+    propagated properly.
+
+    The dilution is NOT a uniform shrinkage toward zero -- it is a
+    REDISTRIBUTION. In the 2026-08-20 level-6 run, intrinsic 300 read as a
+    truth of 251.8 in [0,10] while intrinsic 200 read as 232.2 in [10,16]:
+    light from the fast core leaks outward and pushes the SECOND bin up while
+    pulling the first down. A scalar correction factor gets the sign wrong.
+
+    `merge` : optional list of index lists to combine before inverting, e.g.
+        [[0],[1],[2],[3],[4],[5],[6],[7],[8,9,10]] to collapse the outer bins
+        into one. Use it when cond(M) is large -- the outer rows of M are
+        nearly identical because the PSF cannot separate 600-1000 from
+        1000-2000 kpc, and pinv will happily return huge anticorrelated
+        velocities there. Merging states the resolution limit honestly instead
+        of hiding it in the error bars.
+
+    Returns dict: dv, err, cov, cond, amplification (err_out/err_in per bin),
+    and `resid` = M @ dv - v_meas, which should be ~0 and is a bug check.
+    """
+    M = np.asarray(M, dtype=float)
+    v = np.asarray(v_meas, dtype=float)
+    e = np.asarray(v_err, dtype=float)
+    if v.size != M.shape[0]:
+        raise ValueError(f"v_meas has {v.size} bins but M is {M.shape}")
+
+    if merge is not None:
+        # average the measured bins in each group (inverse-variance), and sum
+        # the corresponding COLUMNS of M (the intrinsic velocities being
+        # merged are asserted equal, so their responses add)
+        rows, vv, ee = [], [], []
+        for g in merge:
+            g = list(g)
+            w = 1.0 / e[g] ** 2
+            vv.append(float((v[g] * w).sum() / w.sum()))
+            ee.append(float(1.0 / np.sqrt(w.sum())))
+            rows.append((M[g, :] * (w / w.sum())[:, None]).sum(0))
+        M = np.array([[r[list(g)].sum() for g in merge] for r in rows])
+        v, e = np.array(vv), np.array(ee)
+
+    Minv = np.linalg.pinv(M, rcond=rcond)
+    cov = Minv @ np.diag(e ** 2) @ Minv.T
+    dv = Minv @ v
+    err = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+    return {"dv": dv, "err": err, "cov": cov,
+            "cond": float(np.linalg.cond(M)),
+            "amplification": err / e,
+            "resid": M @ dv - v}
+
+
 def check_background_annulus_negligible(model, kpc_per_arcsec,
                                         bg_inner_arcsec=80.0,
                                         bg_outer_arcsec=90.0,
@@ -2328,3 +3873,911 @@ def shot_noise_ratio(L_median, sky_variance, verbose=True):
         verdict = "negligible" if ratio < 0.1 else "NOT negligible -- revisit sec 1.5"
         print(f"source shot noise / sky noise = {ratio:.3e}  ({verdict})")
     return ratio
+
+
+# =====================================================================
+# 7.  THE CUBE OVERLAY
+#     Spec sec 1.2. Build-order item 2, and the thing that gates ladder
+#     levels 2-7.
+# =====================================================================
+#
+# WHY A WRAPPER AT ALL. `load_vdfi_field` opens the flux and error FITS with
+# memmap=True and deliberately keeps the HDUList handles alive (_flux_hdul /
+# _error_hdul) so Stage 1 can read lazily over many hours. You cannot write
+# into vdfi['spectra'] in place, and a materialized copy is ~16 GB.
+#
+# You do not need one. Only fibers within roughly the outermost radial bin of
+# an injected source are modified -- a few hundred per source per exposure at
+# the 244" cut. At ~450 sources that is a few hundred MB of patch data against
+# a 16 GB cube.
+#
+# THE INDEXING AUDIT (spec sec 1.2, RE-RUN 2026-08-17 against the current
+# extract.py because the spec's line numbers had drifted). Every read of the
+# cube in the whole package:
+#
+#     extract.py:1041   spectra[e, bg_sel]      scalar + bool mask
+#     extract.py:1149   spectra[e, sel]         scalar + bool mask
+#     extract.py:812    spectra.shape[-1]       attribute
+#     extract.py:218    whole array -> make_spectral_continuum_mask
+#
+# That is the entire surface. core.py, plotting.py, background.py, analysis.py,
+# single.py, measure.py, validation.py, splits.py and multicat.py do not index
+# vdfi['spectra'] at all -- they receive already-extracted products. The
+# spec's v1 audit listed core.py and plotting.py sites; those are gone from
+# the current code. The wrapper is therefore SMALLER than the spec provisions
+# for, and option B (materialize the touched exposures) stays unbuilt.
+#
+# THE DESIGN RULE. Any indexing form outside that surface RAISES. A silent
+# fallthrough to the raw memmap would return un-injected data and nothing
+# downstream would notice -- the extraction would run to completion, the FITS
+# would be written, the profile would come back flat, and the only symptom
+# would be "the injection didn't work" with 7 hr of runtime already spent. A
+# wrapper that supports arbitrary indexing is just a slow, buggy ndarray.
+#
+# THE FULL-WIDTH STORE WAS THE WRONG SHAPE (2026-08-19, found by a dead
+# kernel at ladder level 6, n = 3). The spec's sizing -- "a few hundred
+# fibers per source per exposure, a few hundred MB at ~450 sources" -- is
+# wrong on BOTH factors. Measured on COSMOS at the 2000 kpc (242") cut:
+#
+#     4,593 fibers per source per exposure, not "a few hundred"
+#     x 132 exposures            =   606,308 fiber-exposures per source
+#     x 1036 px x 4 B (float32)  =      2.51 GB per source
+#
+# and it is exactly linear until it SATURATES at the whole cube:
+# 132 x 34944 x 1036 x 4 = 19.1 GB. Three sources already touch 39.4% of all
+# fiber-exposures, so ~8 sources reaches the 16 GB copy this class exists to
+# avoid -- arrived at from below, one patch at a time, with no error.
+#
+# The fix is not fewer fibers, it is fewer COLUMNS. An injected patch is a
+# pure emission line with no continuum: at z = 2.3 the line sits near
+# 4011 A with sigma_obs = 320 km/s = 4.3 A, and the axis is ~2 A/px, so
+# sigma is ~2.1 PIXELS out of 1036. A full-width patch is ~97% zeros.
+# Storing each patch on its own trimmed, aligned wavelength block cuts the
+# store by ~20-30x (7.5 GB -> ~300 MB at n = 3) with a discarded flux bound
+# of 1e-9 of the patch peak. It also removes the growth in per-exposure cost
+# late in a run, which was allocator pressure from repeatedly rebuilding
+# full-width merge buffers, not template work.
+
+# Relative trim threshold on a patch's own peak. 1e-9 is +/-6.4 sigma for a
+# Gaussian line -- far below float32's rounding on the base cube.
+PATCH_TRIM_REL = 1e-9
+
+# Stored blocks are snapped outward to a multiple of this many pixels, so
+# that patches from sources at the same redshift land on the SAME window and
+# merge into one block instead of accumulating one block per source. 32 px
+# is ~15 sigma at z = 2.3, i.e. wide enough that alignment rarely costs a
+# second block and narrow enough to keep the ~30x saving.
+PATCH_BLOCK_ALIGN = 32
+
+
+class InjectedSpectra:
+    """Read-only view of the memmapped cube with sparse additive patches.
+
+    Supports exactly the access pattern the extraction uses -- `spectra[e]`
+    and `spectra[e, bool_mask]` -- and raises on everything else.
+
+    Parameters
+    ----------
+    base : the memmapped (nexp, nfib, nwave) array from
+        `load_vdfi_field`, i.e. `vdfi["spectra"]`. Never modified.
+    zero_base : bool. If True, the base contributes `base * 0` rather than
+        `base` -- the ladder-levels-2-to-4 "zero cube" of spec sec 7.2.
+
+        THIS IS `base * 0`, NOT `np.zeros` (decision, Austin, 2026-08-17).
+        The distinction is load-bearing. `base * 0` propagates NaN, so the
+        real cube's dead- and masked-fiber pattern survives into the zero
+        run; `np.zeros` erases it. With a clean zero array the extraction
+        would exercise `combine_fibers`' finite-count logic, `_maybe_smooth`
+        and every nan-aware reduction in a regime the real run never sees,
+        and a masking bug would sail through levels 2-4 and first appear at
+        level 6 -- on real data, where it is expensive to find and where two
+        things changed at once.
+
+        It also costs nothing: the base slice is read either way, because
+        the NaN pattern IS the base.
+    dtype : output dtype. None -> the base's, which is float32. Patches are
+        cast to this on add.
+    align : block alignment in wavelength pixels (PATCH_BLOCK_ALIGN). Set
+        larger to force more merging at higher memory, or to 1 for the
+        tightest possible blocks and one block per distinct line position.
+
+    MEMORY -- read this before raising the source count
+    ---------------------------------------------------
+    The store is `sum over blocks of (fibers x block_width x 4 B)`. Patches
+    are trimmed to the line's own wavelength support, so block_width is
+    ~32-64 px against a 1036 px axis rather than the full width. See the
+    block comment above this class for the measurement that forced this and
+    for the 19 GB ceiling the full-width version walked into at ~8 sources.
+
+    `repr()` prints `width=<mean block px>/<nwave>`; if that ratio ever
+    approaches 1 the trim has stopped working -- most likely because
+    something with a continuum, rather than a pure line, is being injected.
+
+    Notes
+    -----
+    **This class does not enforce spec sec 1.4** (build the bad-fiber mask
+    on clean, un-injected data). It cannot: `make_spectral_continuum_mask`
+    consumes the cube through `spectra[i]`, which is a legitimate access
+    that `plot_fiber_overlay` also needs, so refusing it here would break a
+    supported caller to catch a sequencing error. The ordering is enforced
+    at the `inject_sources` call site instead, by requiring the mask as an
+    argument -- you cannot inject without already holding a mask, and a mask
+    you already hold was built before the injection existed.
+
+    `n_exposure_slice_reads` counts whole-exposure reads so that ordering
+    can still be audited after the fact: a nonzero count on a run whose mask
+    was passed in is fine (plotting), a nonzero count *before* the first
+    patch was added is the sec 1.4 violation.
+    """
+
+    __slots__ = ("_base", "_patches", "_zero", "_dtype", "_align",
+                 "n_exposure_slice_reads", "_frozen")
+
+    def __init__(self, base, zero_base=False, dtype=None,
+                 align=PATCH_BLOCK_ALIGN):
+        self._base = base
+        # {exposure: [ {"lam0": int, "lam1": int,
+        #               "idx": int64 (k,), "delta": dtype (k, lam1-lam0)}, ...]}
+        #
+        # A LIST OF WAVELENGTH BLOCKS, not one full-width array per exposure
+        # (2026-08-19). See the MEMORY note in the class docstring: an
+        # injected patch is a pure emission line ~2 px wide against a 1036 px
+        # axis, so a full-width store is ~97% zeros and the overlay saturates
+        # at the 19 GB full-cube copy it exists to avoid, at about 8 sources.
+        self._patches = {}
+        self._zero = bool(zero_base)
+        self._dtype = np.dtype(dtype) if dtype is not None else base.dtype
+        self._align = int(align)
+        self.n_exposure_slice_reads = 0
+        self._frozen = False
+
+    # ---- wavelength trimming -----------------------------------------
+
+    def _window(self, d):
+        """The aligned column span [lam0, lam1) worth storing for `delta`.
+
+        Trims at `PATCH_TRIM_REL` of the patch's OWN peak, which for a
+        Gaussian line is +/-6.4 sigma -- the discarded flux is bounded at
+        ~1e-9 of the peak per pixel, orders below float32's rounding on the
+        base cube, so this is lossless in every sense that matters. The
+        threshold is RELATIVE on purpose: an absolute one would depend on
+        L_INJ and would silently trim harder for a faint source than a
+        bright one.
+
+        Then snaps outward to a multiple of `self._align`. Alignment is what
+        makes blocks MERGE: two sources at the same redshift produce the
+        same aligned window and share one block, so the block count per
+        exposure stays at ~(number of distinct redshifts) rather than
+        (number of sources). Without it, 400 bootstrapped-z sources would
+        leave 400 blocks per exposure and the read path would loop all of
+        them.
+        """
+        nw = d.shape[1]
+        peak = float(np.max(d)) if d.size else 0.0
+        if not np.isfinite(peak) or peak <= 0.0:
+            return 0, 0                     # an all-zero patch stores nothing
+        cols = np.flatnonzero(np.max(d, axis=0) > peak * PATCH_TRIM_REL)
+        if cols.size == 0:
+            return 0, 0
+        lo, hi = int(cols[0]), int(cols[-1]) + 1
+        a = max(self._align, 1)
+        lo = (lo // a) * a
+        hi = min(int(np.ceil(hi / a)) * a, nw)
+        # A patch that is wide anyway gains nothing from blocking and loses
+        # the merge; store it whole rather than in a near-full-width block.
+        if (hi - lo) > nw // 2:
+            return 0, nw
+        return lo, hi
+
+    # ---- construction ------------------------------------------------
+
+    def add_patch(self, e, fiber_idx, delta):
+        """Accumulate flux to add to fibers `fiber_idx` of exposure `e`.
+
+        ACCUMULATE, not assign. Two injected sources whose outer bins
+        overlap must both deposit into the shared fibers -- overwriting
+        would silently delete one of them, and at the 244" cut with
+        min_sep = 30" (spec sec 2.2) overlap is the expected case, not the
+        edge case.
+
+        `delta` is (len(fiber_idx), nwave), the output of
+        `build_source_template` restricted to the fibers `select_nearby_
+        fibers` kept. Never negative, never NaN -- asserted, because a NaN
+        patch would propagate into the extraction's nan-aware reductions
+        and present as missing coverage rather than as a bug.
+        """
+        if self._frozen:
+            raise RuntimeError(
+                "this InjectedSpectra is frozen -- patches cannot be added "
+                "after an extraction has read from it. Build the full patch "
+                "set first, then extract; a mid-extraction add would make "
+                "the cube's contents depend on galaxy ordering."
+            )
+        e = int(e)
+        idx = np.ascontiguousarray(fiber_idx, dtype=np.int64).ravel()
+        d = np.ascontiguousarray(delta, dtype=self._dtype)
+        if d.ndim != 2 or d.shape[0] != idx.size:
+            raise ValueError(
+                f"delta must be (len(fiber_idx), nwave) = "
+                f"({idx.size}, {self._base.shape[-1]}), got {d.shape}")
+        if d.shape[1] != self._base.shape[-1]:
+            raise ValueError(
+                f"delta has {d.shape[1]} wavelength pixels, cube has "
+                f"{self._base.shape[-1]}")
+        if not np.all(np.isfinite(d)):
+            raise ValueError(
+                "delta contains non-finite values. An injected template is a "
+                "noiseless model and must be finite everywhere; a NaN here "
+                "would propagate into the extraction's nan-aware reductions "
+                "and look like missing fiber coverage, not like a bug.")
+        if np.any(d < 0):
+            raise ValueError(
+                "delta contains negative values. Lya emission is added, "
+                "never subtracted; a negative patch means a sign error in "
+                "the template or in the profile normalization.")
+
+        # TRIM IN WAVELENGTH BEFORE STORING. Everything below operates on the
+        # trimmed span only; `delta` itself is never retained at full width.
+        lam0, lam1 = self._window(d)
+        if lam1 <= lam0:
+            return                          # nothing above the trim threshold
+        d = np.ascontiguousarray(d[:, lam0:lam1])
+
+        # Duplicate fibers within a single add_patch call are summed rather
+        # than kept as duplicate rows, so the invariant "idx is sorted and
+        # unique" holds per block from the start and the read path can use
+        # searchsorted.
+        uniq, inv = np.unique(idx, return_inverse=True)
+        acc = np.zeros((uniq.size, d.shape[1]), dtype=self._dtype)
+        np.add.at(acc, inv, d)
+
+        blocks = self._patches.setdefault(e, [])
+        for blk in blocks:
+            if blk["lam0"] == lam0 and blk["lam1"] == lam1:
+                # Same aligned window -> merge into the existing sorted/unique
+                # index set, exactly as the pre-2026-08-19 single-array store
+                # did, but at block width instead of full width.
+                old_idx, old_d = blk["idx"], blk["delta"]
+                new_idx = np.union1d(old_idx, uniq)
+                merged = np.zeros((new_idx.size, d.shape[1]), dtype=self._dtype)
+                merged[np.searchsorted(new_idx, old_idx)] = old_d
+                np.add.at(merged, np.searchsorted(new_idx, uniq), acc)
+                blk["idx"], blk["delta"] = new_idx, merged
+                return
+        blocks.append({"lam0": lam0, "lam1": lam1, "idx": uniq, "delta": acc})
+
+    def freeze(self):
+        """Close the patch set. Called once, before extraction."""
+        self._frozen = True
+        return self
+
+    # ---- the supported read surface ----------------------------------
+
+    def __getitem__(self, key):
+        # ---- spectra[e, bool_mask] : extract.py:1041 and :1149 ----
+        if isinstance(key, tuple):
+            if len(key) != 2:
+                raise TypeError(
+                    f"InjectedSpectra supports spectra[e] and "
+                    f"spectra[e, bool_mask] only; got a {len(key)}-tuple. "
+                    f"See spec sec 1.2 -- if a new access pattern is genuinely "
+                    f"needed, widen the audit and this class deliberately "
+                    f"rather than adding a fallthrough.")
+            e, sel = key
+            if not np.isscalar(e) or isinstance(e, (bool, np.bool_)):
+                raise TypeError(
+                    f"the first index must be a scalar exposure number, got "
+                    f"{type(e).__name__}. Slicing across exposures is not "
+                    f"supported: the patch store is keyed by exposure and a "
+                    f"multi-exposure read would have to materialize the cube, "
+                    f"which is the 16 GB copy this class exists to avoid.")
+            sel = np.asarray(sel)
+            if sel.dtype != np.bool_ or sel.ndim != 1:
+                raise TypeError(
+                    f"the second index must be a 1-D boolean fiber mask, got "
+                    f"dtype={sel.dtype} ndim={sel.ndim}. Integer fancy "
+                    f"indexing is rejected on purpose -- it is the one form "
+                    f"whose row ORDER differs from the mask form, so "
+                    f"supporting both silently invites a patch applied to the "
+                    f"wrong fiber.")
+            if sel.size != self._base.shape[1]:
+                raise ValueError(
+                    f"fiber mask has {sel.size} entries, cube has "
+                    f"{self._base.shape[1]} fibers")
+
+            e = int(e)
+            out = np.asarray(self._base[e, sel], dtype=self._dtype)
+            if self._zero:
+                out = out * 0.0     # NaN survives; see the class docstring
+            blocks = self._patches.get(e)
+            if not blocks:
+                return out
+            # Map patched GLOBAL fiber indices onto ROW positions in `out`.
+            # out's rows are the selected fibers in ascending global order --
+            # np.flatnonzero(sel) -- so a patched fiber's row is its rank
+            # among the selected ones. cumsum-1 gives that rank in O(nfib)
+            # without materializing flatnonzero for a mask that may select
+            # tens of thousands of fibers. Computed ONCE and reused across
+            # blocks.
+            rank = None
+            for blk in blocks:
+                hit = sel[blk["idx"]]
+                if not hit.any():
+                    continue
+                if rank is None:
+                    rank = np.cumsum(sel) - 1              # (nfib,)
+                rows = rank[blk["idx"][hit]]
+                # rows is unique within a block (idx is unique), so this
+                # fancy-index += cannot double-accumulate.
+                out[rows, blk["lam0"]:blk["lam1"]] += blk["delta"][hit]
+            return out
+
+        # ---- spectra[e] : make_spectral_continuum_mask, plot_fiber_overlay ----
+        if np.isscalar(key) and not isinstance(key, (bool, np.bool_)):
+            e = int(key)
+            self.n_exposure_slice_reads += 1
+            # COPY, NOT asarray. `self._base[e]` is BASIC slicing, so it is a
+            # VIEW of the cube -- and `np.asarray(view, dtype=<same dtype>)`
+            # hands the view straight back. Adding patches into it therefore
+            # wrote INTO THE BASE, so a second read of the same exposure
+            # returned the patch twice and the un-injected cube was gone.
+            #
+            # Latent until 2026-08-19 for two reasons that both stop being
+            # true at ladder level 6: on the zero cube `out = out * 0.0`
+            # allocates a fresh array before any patch is applied, and the
+            # OTHER read form -- spectra[e, bool_mask], which is what the
+            # extraction actually calls (extract.py:1041, :1149) -- is
+            # ADVANCED indexing and so already copies. This branch is only
+            # reached by make_spectral_continuum_mask and plot_fiber_overlay,
+            # and sec 1.4 puts the former before injection. On a real
+            # read-only memmap it would have raised rather than corrupted;
+            # on anything writable it corrupts silently.
+            out = np.array(self._base[e], dtype=self._dtype, copy=True)
+            if self._zero:
+                out = out * 0.0
+            for blk in self._patches.get(e, ()):
+                out[blk["idx"], blk["lam0"]:blk["lam1"]] += blk["delta"]
+            return out
+
+        raise TypeError(
+            f"InjectedSpectra does not support indexing with "
+            f"{type(key).__name__}. The supported surface is spectra[e] and "
+            f"spectra[e, bool_mask] -- see spec sec 1.2 and the audit comment "
+            f"above this class. Raising here is the design: a fallthrough to "
+            f"the raw memmap would return UN-INJECTED data, the extraction "
+            f"would complete normally, and the only symptom would be a flat "
+            f"profile after hours of runtime.")
+
+    # ---- the attributes the extraction reads -------------------------
+
+    @property
+    def shape(self):
+        return self._base.shape
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @property
+    def ndim(self):
+        return self._base.ndim
+
+    # ---- diagnostics -------------------------------------------------
+
+    @property
+    def n_patched_fibers(self):
+        """Total patched (exposure, fiber) pairs.
+
+        DISTINCT fibers, deduplicated across blocks -- a fiber carrying two
+        sources at different redshifts lives in two blocks but is one
+        patched fiber. Kept as a distinct count so the number stays
+        comparable to the pre-blocking runs and to nfib in the extraction.
+        """
+        n = 0
+        for blocks in self._patches.values():
+            if len(blocks) == 1:
+                n += blocks[0]["idx"].size
+            elif blocks:
+                n += np.unique(np.concatenate([b["idx"] for b in blocks])).size
+        return int(n)
+
+    @property
+    def n_blocks(self):
+        """Wavelength blocks summed over exposures. ~(distinct redshifts) x
+        (exposures patched) once alignment has done its merging; a number
+        far above that means `align` is too fine for the z spread."""
+        return int(sum(len(b) for b in self._patches.values()))
+
+    @property
+    def patch_width(self):
+        """Mean stored columns per block, against the cube's nwave. This is
+        the compression ratio the wavelength trim is buying."""
+        widths = [b["lam1"] - b["lam0"]
+                  for blocks in self._patches.values() for b in blocks]
+        return float(np.mean(widths)) if widths else 0.0
+
+    @property
+    def nbytes(self):
+        """Patch-store footprint. The number this class exists to keep small."""
+        return int(sum(b["delta"].nbytes + b["idx"].nbytes
+                       for blocks in self._patches.values() for b in blocks))
+
+    def __repr__(self):
+        nw = self._base.shape[-1]
+        return (f"InjectedSpectra(shape={self.shape}, "
+                f"zero_base={self._zero}, "
+                f"exposures_patched={len(self._patches)}, "
+                f"fibers_patched={self.n_patched_fibers}, "
+                f"blocks={self.n_blocks}, "
+                f"width={self.patch_width:.0f}/{nw} px, "
+                f"patch_store={self.nbytes / 1e6:.1f} MB)")
+
+
+def check_overlay_identity(base, n_trials=3, rng_seed=11, verbose=True):
+    """Spec sec 7.4: an EMPTY overlay is bit-identical to the raw memmap.
+
+    **PASS A SMALL SLAB, NOT THE CUBE.** This is a test of indexing logic,
+    which does not care how big the array is, and every trial fancy-indexes
+    ~30% of the fibers across all wavelengths. Handed a real memmapped
+    exposure that is hundreds of MB pulled off disk per trial, and it was
+    minutes rather than seconds until n_trials dropped from 25 to 3
+    (2026-08-17). Do this:
+
+        small = np.asarray(vdfi["spectra"][:2, :3000])   # ~25 MB, in RAM
+        inj.check_overlay_identity(small)
+
+    `np.asarray` matters as much as the slice: basic slicing of a FITS
+    memmap returns a VIEW, so without it every read still goes to disk.
+
+    Cheap, and it is the only thing standing between "the overlay works" and
+    "the overlay silently drops a patch". Run it before any extraction goes
+    through the wrapper.
+
+    Four checks:
+
+      1. `spectra[e]` with zero patches -> bit-identical to `base[e]`.
+      2. `spectra[e, mask]` with zero patches -> bit-identical, over random
+         masks including the two that break naive index arithmetic: all-True
+         and all-False.
+      3. A patch applied to a KNOWN fiber lands on that fiber and NOWHERE
+         else -- checked through the mask path, which is where the global ->
+         row-position mapping happens and therefore where an off-by-one
+         would live. This is the check that matters: check 1 and 2 pass
+         trivially for a class that ignores its patches entirely.
+      4. The unsupported indexing forms raise rather than falling through.
+
+    `base` can be the real memmap or any (nexp, nfib, nwave) array; a small
+    synthetic one is enough and is what the test suite should use.
+    """
+    rng = np.random.default_rng(rng_seed)
+    nexp, nfib, nwave = base.shape
+    lines, ok = [], True
+
+    nbytes = int(np.prod(base.shape)) * 4
+    if nbytes > 200e6:
+        print(f"    [!] base is ~{nbytes/1e9:.1f} GB. This test only checks "
+              f"indexing logic -- pass a slab "
+              f"(np.asarray(spectra[:2, :3000])) instead, or it reads "
+              f"gigabytes off disk for no extra coverage.")
+
+    # ---- 1 + 2. empty overlay is a no-op --------------------------------
+    empty = InjectedSpectra(base)
+    same = True
+    for _ in range(n_trials):
+        e = int(rng.integers(nexp))
+        same &= bool(np.array_equal(empty[e], np.asarray(base[e]),
+                                    equal_nan=True))
+        for mask in (rng.random(nfib) < 0.3,
+                     np.ones(nfib, dtype=bool),
+                     np.zeros(nfib, dtype=bool)):
+            same &= bool(np.array_equal(empty[e, mask],
+                                        np.asarray(base[e, mask]),
+                                        equal_nan=True))
+    ok &= same
+    lines.append(f"[{'PASS' if same else 'FAIL'}] empty overlay is "
+                 f"bit-identical to the raw array "
+                 f"({n_trials} exposures x 3 mask forms, incl. all-True and "
+                 f"all-False)")
+
+    # ---- 3. a patch lands on exactly one fiber --------------------------
+    # THREE SEPARATE VERDICTS, not one. Collapsing them cost a debugging
+    # round on 2026-08-17: the combined line said "FAIL" and gave no way to
+    # tell whether the patch missed, leaked, or crossed exposures.
+    #
+    # The fiber is chosen FINITE. On the real cube a random fiber has a real
+    # chance of being dead, and nan + 3.5 = nan -- which fails the "+amp
+    # exactly" assertion while the class is behaving perfectly correctly
+    # (a dead fiber stays dead whether or not you inject into it, exactly as
+    # it does with real data).
+    e0 = int(rng.integers(nexp))
+    finite_rows = np.flatnonzero(np.isfinite(np.asarray(base[e0])).all(axis=1))
+    if finite_rows.size == 0:
+        lines.append(f"[SKIP] patch localization -- exposure {e0} has no "
+                     f"all-finite fiber to test on")
+    else:
+        f0 = int(rng.choice(finite_rows))
+        # Amplitude scaled to the data, so the check cannot fail on float32
+        # resolution when the cube's values are large.
+        scale = float(np.nanmedian(np.abs(np.asarray(base[e0, f0])))) or 1.0
+        amp = 1000.0 * scale
+        ov = InjectedSpectra(base)
+        ov.add_patch(e0, [f0], np.full((1, nwave), amp, dtype=np.float32))
+
+        # Through the MASK path, with a mask selecting f0 plus a scatter of
+        # others, so the global -> row-position mapping is genuinely
+        # exercised rather than being the identity.
+        mask = rng.random(nfib) < 0.4
+        mask[f0] = True
+        got = np.asarray(ov[e0, mask], dtype=np.float64)
+        ref = np.asarray(base[e0, mask], dtype=np.float64)
+        row = int(np.cumsum(mask)[f0] - 1)
+        delta = got - ref
+
+        hit = bool(np.allclose(delta[row], amp, rtol=1e-4))
+        ok &= hit
+        lines.append(f"[{'PASS' if hit else 'FAIL'}] patch LANDS: (exp {e0}, "
+                     f"fiber {f0}) -> row {row}, recovered "
+                     f"{np.nanmedian(delta[row]):.6g} vs injected {amp:.6g}")
+
+        # Leakage. Only FINITE rows can be compared numerically; rows that
+        # were NaN before must still be NaN, which is a separate assertion
+        # rather than something to nan_to_num away.
+        others = np.delete(np.arange(delta.shape[0]), row)
+        was_nan = ~np.isfinite(ref[others]).all(axis=1)
+        num_ok = bool(others.size == 0 or
+                      np.all(delta[others][~was_nan] == 0.0))
+        nan_ok = bool(others.size == 0 or
+                      np.all(~np.isfinite(got[others][was_nan]).all(axis=1)))
+        clean = num_ok and nan_ok
+        ok &= clean
+        lines.append(f"[{'PASS' if clean else 'FAIL'}] no LEAKAGE: "
+                     f"{int((~was_nan).sum())} finite rows unchanged "
+                     f"({num_ok}), {int(was_nan.sum())} NaN rows still NaN "
+                     f"({nan_ok})")
+
+        other_e = (e0 + 1) % nexp
+        iso = bool(nexp == 1 or np.array_equal(
+            ov[other_e, mask], np.asarray(base[other_e, mask]),
+            equal_nan=True))
+        ok &= iso
+        lines.append(f"[{'PASS' if iso else 'FAIL'}] EXPOSURE-ISOLATED: the "
+                     f"patch is absent from exposure {other_e}")
+
+    # ---- 4. unsupported forms raise -------------------------------------
+    bad = [
+        ("spectra[:]", lambda: empty[:]),
+        ("spectra[0:2]", lambda: empty[0:2]),
+        ("spectra[e, int_array]", lambda: empty[0, np.array([1, 2, 3])]),
+        ("spectra[e, slice]", lambda: empty[0, 0:5]),
+        ("spectra[e, mask, wave]", lambda: empty[0, np.ones(nfib, bool), 0]),
+    ]
+    raised = []
+    for name, fn in bad:
+        try:
+            fn()
+        except (TypeError, ValueError, IndexError):
+            raised.append(True)
+        else:
+            raised.append(False)
+            lines.append(f"           !! {name} did NOT raise -- it returned "
+                         f"data, which for a real run means UN-INJECTED data")
+    good = all(raised)
+    ok &= good
+    lines.append(f"[{'PASS' if good else 'FAIL'}] unsupported indexing raises "
+                 f"({sum(raised)}/{len(bad)} forms)")
+
+    if verbose:
+        print("--- overlay identity (spec sec 7.4)")
+        print("\n".join(lines))
+        print(f"--- overlay identity {'PASSED' if ok else 'FAILED'}")
+    return ok, lines
+
+
+# ---------------------------------------------------------------------
+# 7b.  inject_sources -- the one function between load_field and
+#      extract_fibers. Spec sec 1.1 and sec 1.6.
+# ---------------------------------------------------------------------
+
+INJ_REQUIRED_COLS = ("RA", "DEC", "L_INJ", "FIELD", "CATALOG", "FAMILY")
+
+
+def _mask_checksum(mask):
+    """Short content hash of the bad-fiber mask. Goes in the manifest so a
+    run whose mask was rebuilt AFTER injection stays identifiable."""
+    import hashlib
+    a = np.ascontiguousarray(np.asarray(mask, dtype=bool))
+    return hashlib.md5(a.tobytes()).hexdigest()[:10]
+
+
+def validate_inj_table(inj_table, config, verbose=True):
+    """Spec sec 1.6: the injection table IS the run table.
+
+    So it must carry everything `extract_fibers` reads (RA, DEC,
+    config.z_col, config.mass_col) AND everything `build_run_table`
+    filters on (FIELD, CATALOG), or the failure surfaces hundreds of
+    galaxies into an extraction as a KeyError with nothing to do with
+    injection.
+
+    Also checks the two diagnostic columns that are LOAD-BEARING rather
+    than nice-to-have: REAL_DIST, because sec 2.1 replaces the separate
+    `blank` extraction with a post-hoc slice on it (a run without it
+    cannot answer the placement question at all, and re-deriving it later
+    against a catalog that has since been re-cut is not the same number),
+    and NN_DIST, because sec 2.2 retires the whole crowding question with
+    one panel binned on it.
+    """
+    cols = set(inj_table.colnames)
+    need = set(INJ_REQUIRED_COLS) | {config.z_col, config.mass_col,
+                                     config.id_col}
+    missing = sorted(need - cols)
+    if missing:
+        raise ValueError(
+            f"inj_table is missing required columns {missing}. It is also the "
+            f"run table (spec sec 1.1), so it must carry every column "
+            f"extract_fibers reads. See spec sec 1.6 for the full schema.")
+
+    soft = sorted({"NN_DIST", "REAL_DIST", "N_FIB_INNER"} - cols)
+    if soft and verbose:
+        print(f"    [!] inj_table has no {soft}. These are diagnostic, so the "
+              f"extraction will run -- but REAL_DIST is LOAD-BEARING (spec "
+              f"sec 2.1 replaces the separate 'blank' pass with a post-hoc "
+              f"slice on it) and NN_DIST retires the crowding question "
+              f"(sec 2.2). Recompute them at DRAW time, not afterwards.")
+
+    ids = np.asarray(inj_table[config.id_col])
+    if np.unique(ids).size != ids.size:
+        raise ValueError(
+            f"inj_table[{config.id_col!r}] has duplicates. IDs must be unique "
+            f"ACROSS FIELDS -- the real prod_combined catalog has genuine "
+            f"cross-field ID collisions and they were a real bug once.")
+
+    fields = set(np.asarray(inj_table["FIELD"]).astype(str))
+    if fields != {config.normalized_field()}:
+        raise ValueError(
+            f"inj_table FIELD values {sorted(fields)} do not all match "
+            f"config.normalized_field() = {config.normalized_field()!r}. "
+            f"Fields are extracted separately and stay separate through the "
+            f"diagnostics (standing practice); one table per field.")
+    return True
+
+
+def inject_sources(config, vdfi, inj_table, bad_fiber_mask, model, *,
+                   zero_base=False, seeing_mode="field", placement_seed=-1,
+                   response=None, verbose=True):
+    """Add fake sources to the real fiber spectra. Spec sec 1.1 / 1.6.
+
+    Returns
+    -------
+    (config_inj, vdfi_inj)
+
+    **Both, and you must use both.** `config_inj` is `config` with
+    `inject=<meta>` set, which is what makes `extract_signature()` differ
+    from the fiducial one. Returning it rather than mutating the caller's
+    config is deliberate: it is not possible to run an injected extraction
+    against an un-injected signature, because the config you have to hand
+    `extract_fibers` is the one this function gave you. Spec sec 7.5 is the
+    single failure mode in the injection plan that would corrupt EXISTING
+    science products -- an injected result served from, or written over, a
+    fiducial cache -- and this return signature is what forecloses it.
+
+    `vdfi_inj` is a SHALLOW copy: only `spectra` is replaced (with a frozen
+    `InjectedSpectra`). Everything else, including the live `_flux_hdul` /
+    `_error_hdul` memmap handles, is passed through by reference and must
+    not be closed or re-opened.
+
+    Parameters
+    ----------
+    bad_fiber_mask : REQUIRED, and this is the whole mechanism enforcing
+        spec sec 1.4 ("build the fiber mask BEFORE injecting").
+
+        It is not used to place flux -- an injected source deposits into
+        masked fibers exactly as a real one does, and the mask is applied
+        downstream in the extraction as usual. It is required because
+        *holding* a mask proves it was built, and a mask built before this
+        call was built on clean data. `build_bad_fiber_mask` with a
+        spec_global/spec_local component consumes the WHOLE cube, so on
+        injected data the injected sources would enter the percentile
+        statistics that define the mask and change it for the REAL fibers
+        too -- a global perturbation from a local addition. The alternative
+        to a required argument is a comment saying "call this second", which
+        is how silent couplings get in.
+
+        Its checksum goes in the manifest, so a run whose mask was rebuilt
+        AFTER injection is still identifiable after the fact.
+    model : ONE SourceModel for the whole family, not one per row. Spec
+        sec 3.3: every injected source in a family gets identical profile
+        parameters and only (z, M*, L, position) vary, which is what gives
+        the family an unambiguous scalar truth. Per-row models are the
+        `profile_scatter` follow-on and are deliberately unsupported here.
+    zero_base : the ladder levels 2-4 zero cube. `base * 0`, NOT np.zeros --
+        see InjectedSpectra's docstring for why that distinction is
+        load-bearing.
+    seeing_mode : "field" (the field median, one scalar) or "exposure".
+        **"field" for every ladder rung, including level 6.** It is
+        tempting to switch to "exposure" once the cube is real, but every
+        rung compares against `predict_binned_observables`, which accepts
+        only a SCALAR seeing -- so matching the injector to it removes a
+        known discrepancy rather than adding realism. Measured cost at
+        seeing median 1.97" / sd 0.37": dv differs by <=0.06 km/s, profile
+        +3.1% in the innermost bin and <1% outside. "exposure" is a
+        production (level 7) setting.
+    placement_seed : the RNG seed `draw_injection_positions` used. Recorded
+        only; this function does not draw. -1 means "not recorded", which is
+        allowed but makes the run non-reproducible from the manifest alone.
+
+    Notes
+    -----
+    The error array is NOT injected (spec sec 1.5). VDFI is sky-dominated at
+    these fluxes, and noiseless signal on real noise is exactly what
+    isolates pipeline bias from source Poisson scatter. Quantify it once
+    with `shot_noise_ratio`.
+    """
+    import dataclasses
+    import time
+    from .core import _exposure_seeing, _offsets_with_dar
+    from astropy.cosmology import Planck18 as _cosmo
+    import astropy.units as _u
+
+    validate_inj_table(inj_table, config, verbose=verbose)
+    if seeing_mode not in ("field", "exposure"):
+        raise ValueError("seeing_mode must be 'field' or 'exposure'")
+    if config.injects():
+        raise ValueError(
+            "this config is ALREADY an injected config (config.inject is "
+            "set). Injecting twice would stack two source sets into one "
+            "signature and the manifest would describe only the second. "
+            "Start from the fiducial config.")
+    if getattr(config, "store_spec_nobg", False):
+        raise ValueError(
+            "store_spec_nobg must be OFF for injected runs (spec sec 7.3). "
+            "Its guard relies on the biweight being translation-equivariant "
+            "under a CONSTANT per-fiber offset, and an injected source is not "
+            "constant across fibers -- so the stored SPEC_NOBG would not "
+            "reconstruct. Closed by decision, 2026-08-01.")
+
+    wave = np.asarray(vdfi["wave"], dtype=float)
+    RA, DEC = np.asarray(vdfi["RA"]), np.asarray(vdfi["DEC"])
+    nexp = RA.shape[0]
+    seeing_field = float(np.nanmedian(vdfi["seeing"]))
+    r_max_kpc = float(np.asarray(config.bins, dtype=float)[-1])
+
+    # THE FIBER CUT IS bins[-1], NOT model.r_trunc. They are the same number
+    # today (both 2000 kpc) and the coincidence must not be relied on: the
+    # fiber cut is a MEASUREMENT aperture and r_trunc is a SOURCE definition.
+    # Warn rather than raise -- a deliberate mismatch is a legitimate
+    # diagnostic (it is how the outermost-bin truncation question was
+    # settled), but an accidental one means L is "flux inside a radius you
+    # never measure" and that is a silent truth-value error.
+    if verbose and abs(model.r_trunc - r_max_kpc) > 1e-6:
+        print(f"    [!] model.r_trunc = {model.r_trunc:.0f} kpc but bins end "
+              f"at {r_max_kpc:.0f}. L is defined inside r_trunc, so the two "
+              f"disagreeing means part of the injected luminosity is never "
+              f"measured. Intentional for a diagnostic; a bug otherwise "
+              f"(spec sec 3.2).")
+
+    overlay = InjectedSpectra(vdfi["spectra"], zero_base=zero_base)
+
+    n_src = len(inj_table)
+    n_injected = n_skipped = 0
+    t0 = time.time()
+
+    for si in range(n_src):
+        L = float(inj_table["L_INJ"][si])
+        if L == 0.0:
+            # Family Z. No flux, so no template -- building 400 all-zero
+            # patches would cost hours and add nothing. The run still goes
+            # THROUGH the overlay, with zero patches, which is exactly the
+            # sec 7.4 empty-overlay case exercised at production scale.
+            n_skipped += 1
+            continue
+
+        ra = float(inj_table["RA"][si])
+        dec = float(inj_table["DEC"][si])
+        z = float(inj_table[config.z_col][si])
+        kpc_per_arcsec = float(
+            _cosmo.angular_diameter_distance(z).to(_u.kpc).value / 206265.0)
+        cs = np.cos(np.radians(dec))
+
+        # PER-EXPOSURE PROGRESS ON THE FIRST SOURCE ONLY.
+        # Per-source progress alone is useless at n=1 -- the ladder rungs 2-6
+        # all inject ONE source, so the cell printed nothing at all for
+        # several minutes and was indistinguishable from a hang (2026-08-17).
+        # Reporting the first source per exposure also pays off at n=400: you
+        # get a warm rate and a whole-pass ETA within the first source instead
+        # of after it.
+        #
+        # The first EXPOSURE is not representative -- it pays the shared PSF
+        # table and ring-kernel setup, which is cached across every later
+        # exposure AND every later source. So the ETA is quoted from the warm
+        # cost, never from the average including the cold one.
+        first_src = (n_injected == 0)
+        t_src, t_cold = time.time(), 0.0
+
+        for e in range(nexp):
+            dra_1d = (RA[e] - ra) * cs * 3600.0
+            ddec_1d = (DEC[e] - dec) * 3600.0
+            keep = select_nearby_fibers(dra_1d, ddec_1d, r_max_kpc,
+                                        kpc_per_arcsec)
+            if not keep.any():
+                continue
+            dra, ddec = _offsets_with_dar(dra_1d[keep], ddec_1d[keep],
+                                          vdfi.get("dar_ra"),
+                                          vdfi.get("dar_dec"), e, wave.size)
+            s_e = (seeing_field if seeing_mode == "field"
+                   else _exposure_seeing(vdfi["seeing"], e))
+            # L multiplies the template rather than entering the build. The
+            # template is linear in L and build_source_template normalizes
+            # against model.L internally, so scaling here is exact and lets
+            # the PSF/ring caches be shared across every source in the pass.
+            patch = L * build_source_template(
+                model, z=z, dra=dra, ddec=ddec, seeing_fwhm=s_e, wave=wave,
+                kpc_per_arcsec=kpc_per_arcsec, response=response)
+            overlay.add_patch(e, np.flatnonzero(keep), patch)
+
+            if verbose and first_src and (e < 3 or (e + 1) % 20 == 0
+                                          or e == nexp - 1):
+                el = time.time() - t_src
+                if e == 0:
+                    t_cold = el
+                    print(f"    src 0 exp {e:3d}: {int(keep.sum())} fibers, "
+                          f"cold {el:.1f} s (PSF table + ring kernel, paid "
+                          f"once for the whole pass)", flush=True)
+                else:
+                    warm = (el - t_cold) / e
+                    left = warm * (nexp - e - 1)
+                    print(f"    src 0 exp {e:3d}: {el:6.1f} s elapsed, "
+                          f"{warm:.2f} s/exp warm -> {left/60:.1f} min left "
+                          f"on this source"
+                          + (f", ~{(t_cold + warm*nexp) * (n_src - 1) / 60:.0f} "
+                             f"min for the remaining {n_src - 1}"
+                             if n_src > 1 and e == nexp - 1 else ""),
+                          flush=True)
+
+        n_injected += 1
+        if verbose and (n_injected <= 2 or n_injected % 10 == 0
+                        or si == n_src - 1):
+            el = time.time() - t0
+            per = el / max(n_injected, 1)
+            print(f"    injected {n_injected}/{n_src - n_skipped}: "
+                  f"{el/60:.1f} min elapsed, {per:.1f} s/source, "
+                  f"store {overlay.nbytes/1e6:.0f} MB -> ETA "
+                  f"{per * (n_src - n_skipped - n_injected)/60:.1f} min",
+                  flush=True)
+
+    overlay.freeze()
+
+    meta = {
+        "family": str(np.asarray(inj_table["FAMILY"])[0]) if n_src else "",
+        "model": repr(model),
+        "n_sources": int(n_src),
+        "n_with_flux": int(n_injected),
+        "zero_base": bool(zero_base),
+        "seeing_mode": str(seeing_mode),
+        # The bin edges belong here even though they are already a config
+        # knob, because r_trunc TRACKS them (spec sec 3.2) -- a manifest that
+        # records the truncation radius without recording what it was
+        # tracking is not decodable months later.
+        "bins": [float(b) for b in config.bins],
+        "r_trunc_kpc": float(model.r_trunc),
+        "lsf_kms": float(model.lsf_kms),
+        "mask_checksum": _mask_checksum(bad_fiber_mask),
+        "placement_seed": int(placement_seed),
+    }
+    config_inj = dataclasses.replace(config, inject=meta)
+
+    if verbose:
+        print(f"    injected {n_injected} sources ({n_skipped} zero-flux) "
+              f"into {len(overlay._patches)}/{nexp} exposures; "
+              f"patch store {overlay.nbytes/1e6:.0f} MB")
+        print(f"    signature {config.extract_signature()} (fiducial) -> "
+              f"{config_inj.extract_signature()} (injected)")
+        if config.extract_signature() == config_inj.extract_signature():
+            raise RuntimeError(
+                "the injected config hashes to the SAME signature as the "
+                "fiducial one. This is spec sec 7.5 -- the injected run would "
+                "be served from, or written over, the fiducial cache. Check "
+                "that extract_signature_dict includes `inject` when "
+                "config.injects().")
+        print(f"    {overlay!r}")
+
+    return config_inj, {**vdfi, "spectra": overlay}
